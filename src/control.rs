@@ -1176,7 +1176,7 @@ mod tests {
         let socket = directory.path().join("control.sock");
         let listener = bind(&socket).await.unwrap();
         let config = test_config(directory.path());
-        let target = config.node_info.as_ref().unwrap().ipv4.unwrap().into();
+        let target = config.node_addresses[0].addr();
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_active_tx, active_rx) = watch::channel(config);
         let server = tokio::spawn(serve(

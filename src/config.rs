@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -60,10 +60,6 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct NodeInfo {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv4: Option<Ipv4Addr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv6: Option<Ipv6Addr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -242,6 +238,16 @@ impl Default for ObservabilityConfig {
 }
 
 impl Config {
+    /// Returns the first configured node address for the requested address
+    /// family. Configuration order is the stable selection rule when a node
+    /// has more than one address in the same family.
+    pub fn node_address(&self, is_ipv4: bool) -> Option<IpAddr> {
+        self.node_addresses
+            .iter()
+            .map(IpNet::addr)
+            .find(|address| address.is_ipv4() == is_ipv4)
+    }
+
     pub async fn load(path: &Path) -> Result<Self> {
         let raw = tokio::fs::read_to_string(path)
             .await
@@ -527,21 +533,9 @@ impl Config {
             "node_info.name cannot be empty"
         );
         ensure!(
-            node_info.ipv4.is_some() || node_info.ipv6.is_some(),
-            "node_info requires ipv4 and/or ipv6"
+            !self.node_addresses.is_empty(),
+            "node_info requires at least one node_addresses entry"
         );
-        let addresses = [
-            node_info.ipv4.map(IpAddr::V4),
-            node_info.ipv6.map(IpAddr::V6),
-        ];
-        for address in addresses.into_iter().flatten() {
-            ensure!(
-                self.node_addresses
-                    .iter()
-                    .any(|configured| configured.addr() == address),
-                "node_info address {address} must also be present in node_addresses"
-            );
-        }
         ensure!(
             node_info.metadata.keys().all(|key| !key.trim().is_empty()),
             "node_info metadata keys cannot be empty"
@@ -828,7 +822,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trace_addresses_must_be_configured_node_addresses() {
+    fn node_info_requires_a_node_address() {
         let config = Config {
             network_id: "example".into(),
             identity_file: "identity.key".into(),
@@ -838,12 +832,10 @@ mod tests {
             tun_mtu: 1280,
             max_frame_size: 1400,
             node_interface: "isw0".into(),
-            node_addresses: vec!["10.200.0.1/32".parse().unwrap()],
+            node_addresses: Vec::new(),
             advertised_prefixes: Vec::new(),
             node_info: Some(NodeInfo {
                 name: "branch-a".into(),
-                ipv4: Some("10.200.0.2".parse().unwrap()),
-                ipv6: None,
                 description: None,
                 metadata: BTreeMap::new(),
             }),
@@ -862,8 +854,22 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("must also be present in node_addresses")
+                .contains("requires at least one node_addresses entry")
         );
+    }
+
+    #[test]
+    fn node_address_uses_the_first_address_in_each_family() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.node_addresses = vec![
+            "21.0.0.9/32".parse().unwrap(),
+            "21::9/128".parse().unwrap(),
+            "21.0.0.1/32".parse().unwrap(),
+            "21::1/128".parse().unwrap(),
+        ];
+
+        assert_eq!(config.node_address(true), Some("21.0.0.9".parse().unwrap()));
+        assert_eq!(config.node_address(false), Some("21::9".parse().unwrap()));
     }
 
     #[test]

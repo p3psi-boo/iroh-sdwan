@@ -61,7 +61,6 @@ advertised_prefixes = []
 
 [node_info]
 name = "$node"
-ipv4 = "$overlay"
 description = "NAT and impaired WAN fixture"
 
 [node_info.metadata]

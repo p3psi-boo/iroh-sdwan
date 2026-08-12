@@ -37,8 +37,6 @@ advertised_prefixes = []
 
 [node_info]
 name = "$node"
-ipv4 = "$address_v4"
-ipv6 = "$address_v6"
 description = "$description"
 
 [node_info.metadata]

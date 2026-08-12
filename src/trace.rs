@@ -111,8 +111,8 @@ impl TraceResponder {
             return Ok(None);
         };
 
-        let ipv4_socket = bind_optional_response_socket(node_info.ipv4.map(IpAddr::V4)).await?;
-        let ipv6_socket = bind_optional_response_socket(node_info.ipv6.map(IpAddr::V6)).await?;
+        let ipv4_socket = bind_optional_response_socket(config.node_address(true)).await?;
+        let ipv6_socket = bind_optional_response_socket(config.node_address(false)).await?;
         let encoded_node_info = toml::to_string(&node_info)?.into_bytes();
         ensure!(
             RESPONSE_HEADER_LEN + encoded_node_info.len() <= MAX_RESPONSE_LEN,
@@ -423,16 +423,12 @@ fn probe_identity(config: &Config, target: IpAddr) -> Result<(&NodeInfo, IpAddr)
         .node_info
         .as_ref()
         .context("overlay probes require [node_info] in the local configuration")?;
-    let source = match target {
-        IpAddr::V4(_) => node_info
-            .ipv4
-            .map(IpAddr::V4)
-            .context("local node_info does not define an IPv4 probe address")?,
-        IpAddr::V6(_) => node_info
-            .ipv6
-            .map(IpAddr::V6)
-            .context("local node_info does not define an IPv6 probe address")?,
-    };
+    let source = config.node_address(target.is_ipv4()).with_context(|| {
+        format!(
+            "local node_addresses does not define a {} probe address",
+            if target.is_ipv4() { "IPv4" } else { "IPv6" }
+        )
+    })?;
     Ok((node_info, source))
 }
 
@@ -805,8 +801,6 @@ mod tests {
     fn response_round_trip_preserves_node_info() {
         let node_info = NodeInfo {
             name: "branch-b".into(),
-            ipv4: Some("10.200.0.2".parse().unwrap()),
-            ipv6: None,
             description: Some("branch router".into()),
             metadata: BTreeMap::from([("site".into(), "beijing".into())]),
         };
@@ -827,8 +821,6 @@ mod tests {
     fn malformed_probe_responses_are_rejected() {
         let node_info = NodeInfo {
             name: "branch-b".into(),
-            ipv4: Some("10.200.0.2".parse().unwrap()),
-            ipv6: None,
             description: None,
             metadata: BTreeMap::new(),
         };
@@ -854,8 +846,6 @@ mod tests {
         let forged_sender = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let node_info = NodeInfo {
             name: "target".into(),
-            ipv4: Some("127.0.0.1".parse().unwrap()),
-            ipv6: None,
             description: None,
             metadata: BTreeMap::new(),
         };
@@ -913,8 +903,6 @@ mod tests {
             true,
             toml::to_string(&NodeInfo {
                 name: "late".into(),
-                ipv4: Some("127.0.0.1".parse().unwrap()),
-                ipv6: None,
                 description: None,
                 metadata: BTreeMap::new(),
             })
@@ -953,8 +941,6 @@ mod tests {
                 destination: false,
                 node_info: Some(NodeInfo {
                     name: "vps-can0".into(),
-                    ipv4: Some("21.0.0.3".parse().unwrap()),
-                    ipv6: Some("21::3".parse().unwrap()),
                     description: None,
                     metadata: BTreeMap::new(),
                 }),
@@ -1027,7 +1013,9 @@ mod tests {
         .unwrap_err();
         assert!(count_error.to_string().contains("count must be between"));
 
-        config.node_info.as_mut().unwrap().ipv6 = None;
+        config
+            .node_addresses
+            .retain(|address| address.addr().is_ipv4());
         let family_error = ping(&config, "21::2".parse().unwrap(), 1, Duration::from_secs(1))
             .await
             .unwrap_err();

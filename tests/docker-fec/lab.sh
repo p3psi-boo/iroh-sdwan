@@ -27,7 +27,6 @@ node_addresses = ["$address/32"]
 advertised_prefixes = []
 [node_info]
 name = "$node"
-ipv4 = "$address"
 [relay]
 mode = "disabled"
 [routing]

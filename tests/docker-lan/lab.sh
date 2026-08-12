@@ -31,8 +31,6 @@ advertised_prefixes = ["$lan4", "$lan6"]
 
 [node_info]
 name = "$node"
-ipv4 = "$overlay4"
-ipv6 = "$overlay6"
 
 [relay]
 mode = "disabled"

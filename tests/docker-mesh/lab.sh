@@ -37,7 +37,6 @@ advertised_prefixes = []
 
 [node_info]
 name = "$node"
-ipv4 = "$address"
 
 [node_info.metadata]
 site = "netns-mesh"

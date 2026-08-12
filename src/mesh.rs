@@ -30,7 +30,7 @@ use crate::{
     derp::DerpPublicKey,
 };
 
-pub const PRESENCE_VERSION: u16 = 2;
+pub const PRESENCE_VERSION: u16 = 3;
 pub const DIRECTORY_CAPACITY: usize = 4_096;
 pub const MAX_ENDPOINT_CANDIDATES: usize = 8;
 pub const MAX_RELAY_URLS: usize = 4;
@@ -122,7 +122,7 @@ impl PresenceBody {
 
     fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1024);
-        field(&mut out, b"iroh-sdwan-presence-v2");
+        field(&mut out, b"iroh-sdwan-presence-v3");
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.network_fingerprint);
         out.extend_from_slice(self.owner.as_bytes());
@@ -153,8 +153,6 @@ impl PresenceBody {
             Some(info) => {
                 out.push(1);
                 field(&mut out, info.name.as_bytes());
-                option_field(&mut out, info.ipv4.map(|value| value.to_string()));
-                option_field(&mut out, info.ipv6.map(|value| value.to_string()));
                 option_field(&mut out, info.description.clone());
                 list_len(&mut out, info.metadata.len());
                 for (key, value) in &info.metadata {
@@ -279,18 +277,6 @@ impl SignedPresence {
                 serde_json::to_vec(info)?.len() <= 1_024,
                 "node_info exceeds presence limit"
             );
-            for address in [info.ipv4.map(IpAddr::V4), info.ipv6.map(IpAddr::V6)]
-                .into_iter()
-                .flatten()
-            {
-                ensure!(
-                    self.body
-                        .prefixes
-                        .iter()
-                        .any(|prefix| prefix.addr() == address),
-                    "node_info address is not owned by this presence"
-                );
-            }
         }
         Ok(())
     }
@@ -1583,7 +1569,7 @@ fn ewma(old: u64, sample: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, net::Ipv4Addr};
+    use std::collections::BTreeMap;
 
     use crate::config::{
         FecConfig, MeshConfig, ObservabilityConfig, PacketPolicyConfig, RelayConfig, RoutingConfig,
@@ -1605,8 +1591,6 @@ mod tests {
             advertised_prefixes: Vec::new(),
             node_info: Some(NodeInfo {
                 name: "node-a".into(),
-                ipv4: Some(Ipv4Addr::new(10, 200, 0, 1)),
-                ipv6: None,
                 description: None,
                 metadata: BTreeMap::from([("site".into(), "test".into())]),
             }),

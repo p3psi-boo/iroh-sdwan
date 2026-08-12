@@ -30,8 +30,6 @@ node_addresses = ["$overlay4/32", "$overlay6/128"]
 advertised_prefixes = []
 [node_info]
 name = "$node"
-ipv4 = "$overlay4"
-ipv6 = "$overlay6"
 [relay]
 mode = "disabled"
 [routing]

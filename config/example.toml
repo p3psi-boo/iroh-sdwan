@@ -30,12 +30,10 @@ advertised_prefixes = [
 ]
 
 # 容量按（目的所有者，首跳）测量；节点不声明上下行带宽。
-# 内置覆盖 trace 协议返回的元数据。trace 地址必须同时出现在 node_addresses 中，
-# CLI 会输出任意元数据。
+# 内置覆盖 trace 协议返回的元数据。trace 自动使用 node_addresses 中每个
+# 地址族的第一个地址；CLI 会输出任意元数据。
 [node_info]
 name = "branch-a"
-ipv4 = "21.0.0.1"
-ipv6 = "21::1"
 description = "Example branch router"
 
 [node_info.metadata]

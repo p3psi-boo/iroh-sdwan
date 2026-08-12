@@ -44,7 +44,6 @@ advertised_prefixes = []
 
 [node_info]
 name = "$node"
-ipv4 = "$address"
 description = "FlowRouter dual-transit fixture"
 
 [node_info.metadata]

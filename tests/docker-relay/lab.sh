@@ -36,8 +36,6 @@ advertised_prefixes = []
 
 [node_info]
 name = "$node"
-ipv4 = "$address4"
-ipv6 = "$address6"
 
 [relay]
 mode = "custom"

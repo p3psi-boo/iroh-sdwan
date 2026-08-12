@@ -1000,12 +1000,6 @@ async fn inspect(config_path: &Path) -> Result<()> {
     if let Some(node_info) = &config.node_info {
         println!("node_info:");
         println!("  name: {}", node_info.name);
-        if let Some(address) = node_info.ipv4 {
-            println!("  ipv4: {address}");
-        }
-        if let Some(address) = node_info.ipv6 {
-            println!("  ipv6: {address}");
-        }
         if let Some(description) = &node_info.description {
             println!("  description: {description}");
         }
@@ -1071,8 +1065,6 @@ mod tests {
                     elapsed_ms: Some(12.5),
                     node_info: Some(NodeInfo {
                         name: "remote\nnode".into(),
-                        ipv4: Some("21.0.0.2".parse().unwrap()),
-                        ipv6: None,
                         description: None,
                         metadata: Default::default(),
                     }),
