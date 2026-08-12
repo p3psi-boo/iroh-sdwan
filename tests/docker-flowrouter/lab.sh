@@ -49,9 +49,6 @@ description = "FlowRouter dual-transit fixture"
 [node_info.metadata]
 topology = "a-via-b-or-d-to-c"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = $transit

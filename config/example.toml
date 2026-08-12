@@ -40,9 +40,12 @@ description = "Example branch router"
 site = "example-site"
 
 [relay]
-# 默认不依赖公共 iroh relay。至少配置一个具有固定可达地址的 bootstrap
-# peer；签名 Presence、peer 辅助打洞和 overlay transit 会扩展其余 mesh。
-mode = "disabled"
+# DERP 能力默认可用；服务器列表为空时不建立 DERP 传输。至少配置一个具有固定
+# 可达地址的 bootstrap peer；签名 Presence、peer 辅助打洞和 overlay transit
+# 会扩展其余 mesh。
+# servers = ["https://derp-1.example.net/derp", "https://derp-2.example.net/derp"]
+# 可选的 iroh relay URL；设置后与 DERP 并行可用。
+# urls = ["https://relay-1.example.net", "https://relay-2.example.net"]
 
 [routing]
 isolate_overlay = true
@@ -88,7 +91,7 @@ report_interval_secs = 10
 # mesh 开启时，签名 Presence 提供动态前缀和中转信息。
 # transit_enabled = false
 # relay_urls = ["https://relay-a.example.com", "https://relay-b.example.com"]
-# 当 [relay].mode = "derp" 时，设置该 peer 单独生成的 DERP 密钥：
+# 当 relay.servers 非空时，设置该 peer 单独生成的 DERP 密钥：
 # derp_public_key = "REPLACE_WITH_64_HEX_DERP_PUBLIC_KEY"
 # direct_addresses = ["203.0.113.10:4433"]
 # mesh 开启时此静态源清单可省略：远端签名 Presence 会携带所有者前缀

@@ -707,12 +707,9 @@ async fn init(
         node_addresses: answers.node_addresses,
         advertised_prefixes: answers.advertised_prefixes,
         node_info: None,
-        relay: if answers.derp_servers.is_empty() {
-            RelayConfig::Disabled
-        } else {
-            RelayConfig::Derp {
-                servers: answers.derp_servers,
-            }
+        relay: RelayConfig {
+            urls: Vec::new(),
+            servers: answers.derp_servers,
         },
         peers: answers.peers,
         route_origins: Vec::new(),
@@ -728,7 +725,7 @@ async fn init(
     config.validate()?;
     let secret_key = identity::load_or_create(&identity_file)?;
     config.validate_local_id(secret_key.public())?;
-    let derp_public_key = if matches!(config.relay, RelayConfig::Derp { .. }) {
+    let derp_public_key = if config.relay.derp_enabled() {
         Some(iroh_sdwan::derp::identity::load_or_create(&config.derp_identity_file())?.public_key())
     } else {
         None
@@ -779,7 +776,7 @@ fn collect_init_answers<R: BufRead, W: Write>(
         prompt_strings(
             reader,
             writer,
-            "DERP server URLs, comma-separated (blank uses peer-assisted direct mesh): ",
+            "DERP server URLs, comma-separated (blank disables DERP): ",
         )?
     } else {
         derp_servers

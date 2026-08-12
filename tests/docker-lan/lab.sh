@@ -32,9 +32,6 @@ advertised_prefixes = ["$lan4", "$lan6"]
 [node_info]
 name = "$node"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = false

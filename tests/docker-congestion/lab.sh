@@ -34,9 +34,6 @@ advertised_prefixes = []
 name = "$node"
 description = "single-peer bulk and interactive congestion fixture"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = false

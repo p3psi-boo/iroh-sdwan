@@ -38,7 +38,6 @@ advertised_prefixes = []
 name = "$node"
 
 [relay]
-mode = "custom"
 urls = ["http://relay1:3340", "http://relay2:3340"]
 
 [routing]

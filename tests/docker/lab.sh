@@ -42,9 +42,6 @@ description = "$description"
 [node_info.metadata]
 topology = "netns-a-b-c"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = $transit

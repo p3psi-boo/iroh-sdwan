@@ -66,19 +66,27 @@ pub struct NodeInfo {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Optional underlay relay transports.
+///
+/// DERP is enabled whenever `servers` is non-empty.  There is deliberately no
+/// mode switch: an empty list means that the transport is unavailable, while
+/// a populated list configures it.  `urls` retains support for explicitly
+/// configured iroh relays and may be used alongside DERP.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
-pub enum RelayConfig {
-    Default,
-    #[default]
-    Disabled,
-    Custom {
-        urls: Vec<String>,
-    },
-    /// Tailscale DERP transport. Each URL is one independent relay region.
-    Derp {
-        servers: Vec<String>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Explicit iroh relay URLs inherited by peers without `relay_urls`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    /// Tailscale DERP transport servers. Each URL is one independent region.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<String>,
+}
+
+impl RelayConfig {
+    pub fn derp_enabled(&self) -> bool {
+        !self.servers.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,8 +478,8 @@ impl Config {
                 "default routes require discovery_enabled = false"
             );
             ensure!(
-                matches!(self.relay, RelayConfig::Disabled),
-                "default routes require relay mode disabled"
+                self.relay.urls.is_empty() && !self.relay.derp_enabled(),
+                "default routes require relay.urls and relay.servers to be empty"
             );
             ensure!(
                 self.peers
@@ -548,64 +556,54 @@ impl Config {
     }
 
     fn validate_relay(&self) -> Result<()> {
-        match &self.relay {
-            RelayConfig::Custom { urls } => {
-                ensure!(
-                    urls.len() >= 2,
-                    "custom relay mode requires at least two URLs for redundancy"
-                );
-                let mut unique = HashSet::new();
-                for url in urls {
-                    url.parse::<RelayUrl>()
-                        .context("invalid custom relay URL")?;
-                    ensure!(unique.insert(url), "duplicate custom relay URL {url}");
-                }
-                self.ensure_no_derp_peer_keys()
+        if !self.relay.urls.is_empty() {
+            ensure!(
+                self.relay.urls.len() >= 2,
+                "relay.urls requires at least two URLs for redundancy"
+            );
+            let mut unique = HashSet::new();
+            for url in &self.relay.urls {
+                url.parse::<RelayUrl>()
+                    .context("invalid relay.urls entry")?;
+                ensure!(unique.insert(url), "duplicate relay URL {url}");
             }
-            RelayConfig::Derp { servers } => {
-                ensure!(
-                    !servers.is_empty(),
-                    "DERP relay mode requires at least one server"
-                );
-                let mut urls = HashSet::new();
-                let mut regions = HashSet::new();
-                for value in servers {
-                    let server = DerpServer::parse(value)
-                        .with_context(|| format!("invalid DERP server URL {value}"))?;
-                    ensure!(
-                        urls.insert(server.url.clone()),
-                        "duplicate DERP server URL {}",
-                        server.url
-                    );
-                    ensure!(
-                        regions.insert(server.region_id),
-                        "DERP region ID collision for {}",
-                        server.url
-                    );
-                }
-                for peer in &self.peers {
-                    ensure!(
-                        peer.derp_public_key.is_some(),
-                        "peer {} requires derp_public_key in DERP relay mode",
-                        peer.name
-                    );
-                    ensure!(
-                        peer.relay_urls.is_empty(),
-                        "peer {} relay_urls cannot be combined with DERP relay mode",
-                        peer.name
-                    );
-                }
-                Ok(())
-            }
-            RelayConfig::Default | RelayConfig::Disabled => self.ensure_no_derp_peer_keys(),
         }
+
+        if !self.relay.derp_enabled() {
+            return self.ensure_no_derp_peer_keys();
+        }
+
+        let mut urls = HashSet::new();
+        let mut regions = HashSet::new();
+        for value in &self.relay.servers {
+            let server = DerpServer::parse(value)
+                .with_context(|| format!("invalid DERP server URL {value}"))?;
+            ensure!(
+                urls.insert(server.url.clone()),
+                "duplicate DERP server URL {}",
+                server.url
+            );
+            ensure!(
+                regions.insert(server.region_id),
+                "DERP region ID collision for {}",
+                server.url
+            );
+        }
+        for peer in &self.peers {
+            ensure!(
+                peer.derp_public_key.is_some(),
+                "peer {} requires derp_public_key when relay.servers is configured",
+                peer.name
+            );
+        }
+        Ok(())
     }
 
     fn ensure_no_derp_peer_keys(&self) -> Result<()> {
         for peer in &self.peers {
             ensure!(
                 peer.derp_public_key.is_none(),
-                "peer {} derp_public_key requires DERP relay mode",
+                "peer {} derp_public_key requires relay.servers",
                 peer.name
             );
         }
@@ -658,22 +656,19 @@ impl Config {
     }
 
     pub fn inherited_peer_relays(&self) -> Result<Vec<RelayUrl>> {
-        match &self.relay {
-            RelayConfig::Custom { urls } => urls
-                .iter()
-                .map(|url| url.parse().context("invalid custom relay URL"))
-                .collect(),
-            _ => Ok(Vec::new()),
-        }
+        self.relay
+            .urls
+            .iter()
+            .map(|url| url.parse().context("invalid relay.urls entry"))
+            .collect()
     }
 
     pub fn derp_servers(&self) -> Result<Vec<DerpServer>> {
-        match &self.relay {
-            RelayConfig::Derp { servers } => {
-                servers.iter().map(|url| DerpServer::parse(url)).collect()
-            }
-            _ => Ok(Vec::new()),
-        }
+        self.relay
+            .servers
+            .iter()
+            .map(|url| DerpServer::parse(url))
+            .collect()
     }
 
     pub fn derp_identity_file(&self) -> PathBuf {
@@ -839,7 +834,7 @@ mod tests {
                 description: None,
                 metadata: BTreeMap::new(),
             }),
-            relay: RelayConfig::Disabled,
+            relay: RelayConfig::default(),
             peers: Vec::new(),
             route_origins: Vec::new(),
             routing: RoutingConfig::default(),
@@ -876,12 +871,12 @@ mod tests {
     fn example_configuration_is_valid() {
         let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.relay, RelayConfig::Disabled);
+        assert_eq!(config.relay, RelayConfig::default());
         assert!(!config.routing.transit_enabled);
     }
 
     #[test]
-    fn omitted_relay_defaults_to_peer_assisted_direct_mode() {
+    fn omitted_relay_disables_derp_and_iroh_relays() {
         #[derive(Deserialize)]
         struct Wrapper {
             #[serde(default)]
@@ -889,7 +884,8 @@ mod tests {
         }
 
         let wrapper: Wrapper = toml::from_str("").unwrap();
-        assert_eq!(wrapper.relay, RelayConfig::Disabled);
+        assert!(wrapper.relay.urls.is_empty());
+        assert!(wrapper.relay.servers.is_empty());
     }
 
     #[test]
@@ -981,9 +977,10 @@ mod tests {
     }
 
     #[test]
-    fn derp_mode_derives_regions_and_requires_peer_keys() {
+    fn derp_servers_enable_transport_and_require_peer_keys() {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.relay = RelayConfig::Derp {
+        config.relay = RelayConfig {
+            urls: Vec::new(),
             servers: vec![
                 "https://derp-a.example.com".into(),
                 "https://derp-b.example.com/derp".into(),
@@ -1004,6 +1001,7 @@ mod tests {
             prefixes: vec!["10.200.0.2/32".parse().unwrap()],
         }];
         config.validate().unwrap();
+        assert!(config.relay.derp_enabled());
         let regions = config.derp_servers().unwrap();
         assert_eq!(regions.len(), 2);
         assert_ne!(regions[0].region_id, regions[1].region_id);
@@ -1015,6 +1013,44 @@ mod tests {
                 .to_string()
                 .contains("requires derp_public_key")
         );
+    }
+
+    #[test]
+    fn derp_and_iroh_relays_can_be_configured_together() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        let peer = PeerConfig {
+            name: "peer".into(),
+            endpoint_id: SecretKey::from_bytes(&[23; 32]).public(),
+            transit_enabled: false,
+            direct_addresses: Vec::new(),
+            relay_urls: vec![
+                "https://peer-relay-a.example.com".into(),
+                "https://peer-relay-b.example.com".into(),
+            ],
+            derp_public_key: Some(DerpPublicKey::from_bytes([24; 32])),
+            allowed_source_prefixes: vec!["10.201.0.2/32".parse().unwrap()],
+        };
+        config.relay = RelayConfig {
+            urls: vec![
+                "https://relay-a.example.com".into(),
+                "https://relay-b.example.com".into(),
+            ],
+            servers: vec!["https://derp.example.com".into()],
+        };
+        config.peers = vec![peer.clone()];
+        config.route_origins = vec![RouteOriginConfig {
+            endpoint_id: peer.endpoint_id,
+            prefixes: vec!["10.201.0.2/32".parse().unwrap()],
+        }];
+
+        config.validate().unwrap();
+        assert_eq!(config.inherited_peer_relays().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn relay_mode_is_not_a_supported_configuration_field() {
+        let error = toml::from_str::<RelayConfig>("mode = \"derp\"").unwrap_err();
+        assert!(error.to_string().contains("unknown field `mode`"));
     }
 
     #[test]

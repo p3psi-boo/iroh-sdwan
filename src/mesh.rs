@@ -478,7 +478,7 @@ struct RendezvousMessage {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum IncomingControlMessage {
-    Presence(ControlMessage),
+    Presence(Box<ControlMessage>),
     Rendezvous(RendezvousMessage),
 }
 
@@ -1862,7 +1862,7 @@ mod tests {
                 description: None,
                 metadata: BTreeMap::from([("site".into(), "test".into())]),
             }),
-            relay: RelayConfig::Disabled,
+            relay: RelayConfig::default(),
             peers: Vec::new(),
             route_origins: Vec::new(),
             routing: RoutingConfig::default(),

@@ -29,8 +29,6 @@ node_addresses = ["$address/32"]
 advertised_prefixes = []
 [node_info]
 name = "$node"
-[relay]
-mode = "disabled"
 [routing]
 isolate_overlay = true
 transit_enabled = false

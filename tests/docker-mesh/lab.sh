@@ -41,9 +41,6 @@ name = "$node"
 [node_info.metadata]
 site = "netns-mesh"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = $transit
@@ -111,6 +108,12 @@ echo "==> waiting for signed Presence and Public transit fallback"
 wait_until "Public directory" grep -q '"directory_entries": 2' /state/public/status.json
 wait_until "A directory" grep -q '"directory_entries": 2' /state/node-a/status.json
 wait_until "C directory" grep -q '"directory_entries": 2' /state/node-c/status.json
+wait_until "A received Public-observed C rendezvous candidate" jq -e \
+  '.mesh.nodes[] | select(.node_info.name == "node-c") | .assisted_addresses | length > 0' \
+  /state/node-a/status.json
+wait_until "C received Public-observed A rendezvous candidate" jq -e \
+  '.mesh.nodes[] | select(.node_info.name == "node-a") | .assisted_addresses | length > 0' \
+  /state/node-c/status.json
 if ip netns exec mesh-a ping -c 1 -W 1 172.31.3.3 >/dev/null 2>&1; then
   echo "A unexpectedly reached the blocked C direct underlay" >&2
   exit 1

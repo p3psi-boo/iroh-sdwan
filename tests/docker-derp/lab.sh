@@ -68,7 +68,6 @@ description = "DERP network-namespace fixture"
 topology = "two-isolated-netns"
 
 [relay]
-mode = "derp"
 servers = ["http://derp", "http://derp2"]
 
 [routing]

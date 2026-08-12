@@ -888,9 +888,11 @@ fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
         }
     }
     if messages.is_empty() {
-        let fec = (peer.fec_recovered_shards > 0)
-            .then(|| format!(" · FEC recovered {}", peer.fec_recovered_shards))
-            .unwrap_or_default();
+        let fec = if peer.fec_recovered_shards > 0 {
+            format!(" · FEC recovered {}", peer.fec_recovered_shards)
+        } else {
+            String::new()
+        };
         (format!("✓ healthy{fec}"), style)
     } else {
         (format!("! {}", messages.join(" · ")), style)

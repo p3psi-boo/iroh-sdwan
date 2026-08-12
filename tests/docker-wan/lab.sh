@@ -66,9 +66,6 @@ description = "NAT and impaired WAN fixture"
 [node_info.metadata]
 topology = "netns-dual-lan-nat"
 
-[relay]
-mode = "disabled"
-
 [routing]
 isolate_overlay = true
 transit_enabled = false

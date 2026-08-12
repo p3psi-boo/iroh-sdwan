@@ -2033,7 +2033,7 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 fn build_derp_transport(config: &Config) -> Result<Option<Arc<DerpTransport>>> {
-    if !matches!(config.relay, RelayConfig::Derp { .. }) {
+    if !config.relay.derp_enabled() {
         return Ok(None);
     }
     let identity_path = config.derp_identity_file();
@@ -2070,15 +2070,17 @@ async fn build_endpoint(
     probe_alpn: &[u8],
     derp_transport: Option<Arc<DerpTransport>>,
 ) -> Result<Endpoint> {
-    let relay_mode = match &config.relay {
-        RelayConfig::Default => RelayMode::Default,
-        RelayConfig::Disabled => RelayMode::Disabled,
-        RelayConfig::Custom { urls } => RelayMode::custom(
-            urls.iter()
+    let relay_mode = if config.relay.urls.is_empty() {
+        RelayMode::Disabled
+    } else {
+        RelayMode::custom(
+            config
+                .relay
+                .urls
+                .iter()
                 .map(|url| url.parse::<RelayUrl>())
                 .collect::<std::result::Result<Vec<_>, _>>()?,
-        ),
-        RelayConfig::Derp { .. } => RelayMode::Disabled,
+        )
     };
     // Retain BBR3's conservative, MTU-scaled initial window.  A fixed 64 KiB
     // window can inject roughly half a second of data on a 1 Mbit/s path
@@ -2844,7 +2846,7 @@ impl Peer {
             dial_outbound,
             connection_mode,
             relay_bootstrap_enabled: config.discovery_enabled
-                && !matches!(&config.relay, RelayConfig::Disabled),
+                && (!config.relay.urls.is_empty() || !peer.relay_urls.is_empty()),
             candidate_exchange_enabled: config.discovery_enabled,
             trace_responder: services.trace_responder,
             enforce_overlay_prefixes: config.packet_policy.enforce_overlay_prefixes,
@@ -4202,7 +4204,7 @@ fn is_derp_transport(address: &TransportAddr) -> bool {
 }
 
 fn quic_path_idle_timeout(relay: &RelayConfig) -> Duration {
-    if matches!(relay, RelayConfig::Derp { .. }) {
+    if relay.derp_enabled() {
         DERP_PATH_IDLE_TIMEOUT
     } else {
         QUIC_PATH_IDLE_TIMEOUT
@@ -4787,12 +4789,13 @@ mod tests {
 
     #[test]
     fn derp_uses_stream_tolerant_path_idle_timeout() {
-        let derp = RelayConfig::Derp {
+        let derp = RelayConfig {
+            urls: Vec::new(),
             servers: vec!["https://derp.example.com".into()],
         };
         assert_eq!(quic_path_idle_timeout(&derp), DERP_PATH_IDLE_TIMEOUT);
         assert_eq!(
-            quic_path_idle_timeout(&RelayConfig::Disabled),
+            quic_path_idle_timeout(&RelayConfig::default()),
             QUIC_PATH_IDLE_TIMEOUT
         );
     }
