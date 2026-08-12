@@ -12,7 +12,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, time};
 use tracing::debug;
 
-use crate::config::{Config, NodeInfo};
+use crate::{
+    config::{Config, NodeInfo},
+    display,
+};
 
 pub const TRACE_PORT: u16 = 49_091;
 pub const MAX_PING_COUNT: u16 = 20;
@@ -382,17 +385,19 @@ pub fn format_ping_human(result: &PingResult) -> String {
         ) {
             (true, Some(address), Some(elapsed_ms), Some(node_info)) => writeln!(
                 output,
-                "seq={} from={} name={} time={elapsed_ms:.3} ms",
+                "seq={} from={} name={} time={}",
                 sample.sequence,
                 address,
-                single_line(&node_info.name)
+                single_line(&node_info.name),
+                display::millis_f64(elapsed_ms),
             ),
             (false, Some(address), Some(elapsed_ms), Some(node_info)) => writeln!(
                 output,
-                "seq={} stopped_at={} name={} time={elapsed_ms:.3} ms",
+                "seq={} stopped_at={} name={} time={}",
                 sample.sequence,
                 address,
-                single_line(&node_info.name)
+                single_line(&node_info.name),
+                display::millis_f64(elapsed_ms),
             ),
             _ => writeln!(output, "seq={} timeout", sample.sequence),
         }
@@ -411,7 +416,10 @@ pub fn format_ping_human(result: &PingResult) -> String {
     {
         writeln!(
             output,
-            "rtt min/avg/max = {min_ms:.3}/{avg_ms:.3}/{max_ms:.3} ms"
+            "rtt min/avg/max = {}/{}/{}",
+            display::millis_f64(min_ms),
+            display::millis_f64(avg_ms),
+            display::millis_f64(max_ms),
         )
         .expect("writing to a String cannot fail");
     }
@@ -546,9 +554,9 @@ fn print_hop(hop: u8, address: IpAddr, elapsed_ms: f64, node_info: &NodeInfo) {
         format!("  [{}]", details.join(", "))
     };
     println!(
-        "{hop:>2}  {} ({address})  {:.3} ms{details}",
+        "{hop:>2}  {} ({address})  {}{details}",
         single_line(&node_info.name),
-        elapsed_ms
+        display::millis_f64(elapsed_ms),
     );
 }
 

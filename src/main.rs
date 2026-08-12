@@ -21,7 +21,7 @@ use iroh_sdwan::{
     control::{self, DEFAULT_CONTROL_SOCKET},
     deployment,
     derp::{DerpPublicKey, identity::DerpIdentity, probe_server, tls_config},
-    identity, logging,
+    display, identity, logging,
     observability::{PeerStatus, RuntimeStatus},
     top,
     trace::{self, PingResult},
@@ -303,18 +303,32 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<String>
         "endpoint_id: {}",
         single_line(&status.endpoint_id)
     )?;
-    writeln!(rendered, "uptime_seconds: {}", status.uptime_seconds)?;
+    writeln!(
+        rendered,
+        "started: {}",
+        display::unix_timestamp(status.started_unix)
+    )?;
+    writeln!(
+        rendered,
+        "updated: {}",
+        display::unix_timestamp(status.updated_unix)
+    )?;
+    writeln!(
+        rendered,
+        "uptime: {}",
+        display::duration(Duration::from_secs(status.uptime_seconds))
+    )?;
     writeln!(rendered, "routes_ready: {}", status.routes_ready)?;
     writeln!(
         rendered,
-        "capacity: table={}/{} probe_in_flight={} probe_budget_bytes={} probe_attempts={} probe_failures={} probe_bytes={}",
+        "capacity: table={}/{} probe_in_flight={} probe_budget={} probe_attempts={} probe_failures={} probe_transferred={}",
         status.capacity_table_entries,
         status.capacity_table_limit,
         status.capacity_probe_in_flight,
-        status.capacity_probe_budget_bytes,
+        display::bytes(status.capacity_probe_budget_bytes as u64),
         status.capacity_probe_attempts,
         status.capacity_probe_failures,
-        status.capacity_probe_bytes,
+        display::bytes(status.capacity_probe_bytes),
     )?;
     writeln!(
         rendered,
@@ -355,29 +369,28 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<String>
     for capacity in &status.capacities {
         writeln!(
             rendered,
-            "capacity destination={} first_hop={} effective_mbps={:.3} measured_mbps={} health={} freshness={} source={} age_ms={} rtt_ms={} switches={} probe_in_flight={} probe_next_due_ms={} probe_attempts={} probe_failures={}",
+            "capacity destination={} first_hop={} effective_rate={} measured_rate={} health={} freshness={} source={} age={} rtt={} switches={} probe_in_flight={} probe_next_due={} probe_attempts={} probe_failures={}",
             single_line(&capacity.destination),
             single_line(&capacity.first_hop),
-            capacity.effective_capacity_bps as f64 / 1_000_000.0,
+            display::bits_per_second(capacity.effective_capacity_bps),
             capacity
                 .measured_capacity_bps
-                .map(|value| format!("{:.3}", value as f64 / 1_000_000.0))
+                .map(display::bits_per_second)
                 .unwrap_or_else(|| "unknown".into()),
             capacity.health_per_mille,
             single_line(&capacity.freshness),
             capacity.sample_source.as_deref().unwrap_or("none"),
             capacity
                 .sample_age_millis
-                .map_or_else(|| "unknown".into(), |value| value.to_string()),
-            capacity.rtt_ewma_micros.map_or_else(
-                || "unknown".into(),
-                |value| format!("{:.3}", value as f64 / 1_000.0)
-            ),
+                .map_or_else(|| "unknown".into(), display::millis),
+            capacity
+                .rtt_ewma_micros
+                .map_or_else(|| "unknown".into(), display::micros),
             capacity.route_switches,
             capacity.probe_in_flight,
             capacity
                 .probe_next_due_millis
-                .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                .map_or_else(|| "unknown".into(), display::millis),
             capacity.probe_attempts,
             capacity.probe_failures,
         )?;
@@ -417,15 +430,15 @@ fn render_peers(peers: &[PeerStatus], output: OutputFormat) -> Result<String> {
                 for capacity in &peer.capacities {
                     writeln!(
                         rendered,
-                        "  route destination={} effective_mbps={:.3} health={} freshness={} source={} age_ms={} switches={}",
+                        "  route destination={} effective_rate={} health={} freshness={} source={} age={} switches={}",
                         single_line(&capacity.destination),
-                        capacity.effective_capacity_bps as f64 / 1_000_000.0,
+                        display::bits_per_second(capacity.effective_capacity_bps),
                         capacity.health_per_mille,
                         single_line(&capacity.freshness),
                         capacity.sample_source.as_deref().unwrap_or("none"),
                         capacity
                             .sample_age_millis
-                            .map_or_else(|| "unknown".into(), |value| value.to_string(),),
+                            .map_or_else(|| "unknown".into(), display::millis),
                         capacity.route_switches,
                     )?;
                 }
@@ -437,7 +450,7 @@ fn render_peers(peers: &[PeerStatus], output: OutputFormat) -> Result<String> {
 
 fn format_peer_human(peer: &PeerStatus) -> String {
     format!(
-        "peer {}: endpoint_id={} interface={} connected={} path={}:{} rtt_us={} jitter_us={} loss_ppm={} queue_bytes={} tx_packets={} tx_bytes={} rx_packets={} rx_bytes={} policy_drops={} connection_errors={} send_errors={}",
+        "peer {}: endpoint_id={} interface={} connected={} path={}:{} rtt={} jitter={} loss={} queue={} tx_packets={} tx={} rx_packets={} rx={} policy_drops={} connection_errors={} send_errors={}",
         single_line(&peer.name),
         single_line(&peer.endpoint_id),
         single_line(&peer.interface),
@@ -452,18 +465,30 @@ fn format_peer_human(peer: &PeerStatus) -> String {
         } else {
             single_line(&peer.selected_path_remote)
         },
-        peer.path_rtt_micros,
-        peer.path_jitter_micros,
-        peer.path_loss_ppm,
-        peer.queue_bytes,
+        human_micros(peer.path_rtt_micros),
+        human_micros(peer.path_jitter_micros),
+        format_loss(peer.path_loss_ppm),
+        display::bytes(peer.queue_bytes),
         peer.tx_packets,
-        peer.tx_bytes,
+        display::bytes(peer.tx_bytes),
         peer.rx_packets,
-        peer.rx_bytes,
+        display::bytes(peer.rx_bytes),
         peer.policy_drops,
         peer.connection_errors,
         peer.send_errors
     )
+}
+
+fn human_micros(value: u64) -> String {
+    if value == 0 {
+        "unknown".into()
+    } else {
+        display::micros(value)
+    }
+}
+
+fn format_loss(ppm: u64) -> String {
+    format!("{:.2}%", ppm as f64 / 10_000.0)
 }
 
 async fn ping(
@@ -683,7 +708,7 @@ async fn init(
         advertised_prefixes: answers.advertised_prefixes,
         node_info: None,
         relay: if answers.derp_servers.is_empty() {
-            RelayConfig::Default
+            RelayConfig::Disabled
         } else {
             RelayConfig::Derp {
                 servers: answers.derp_servers,
@@ -754,7 +779,7 @@ fn collect_init_answers<R: BufRead, W: Write>(
         prompt_strings(
             reader,
             writer,
-            "DERP server URLs, comma-separated (blank uses default relay/discovery): ",
+            "DERP server URLs, comma-separated (blank uses peer-assisted direct mesh): ",
         )?
     } else {
         derp_servers
@@ -969,7 +994,10 @@ async fn inspect(config_path: &Path) -> Result<()> {
     println!("mesh_enabled: {}", config.mesh.enabled);
     println!("mesh_max_peers: {}", config.mesh.max_peers);
     if let Some(max_egress_mbps) = config.routing.max_egress_mbps {
-        println!("max_egress_mbps: {max_egress_mbps}");
+        println!(
+            "max_egress: {}",
+            display::bits_per_second(max_egress_mbps.saturating_mul(1_000_000))
+        );
     }
     println!(
         "alpn: {}",
@@ -1178,7 +1206,7 @@ mod tests {
         let human = render_peers(std::slice::from_ref(&peer), OutputFormat::Human).unwrap();
         assert_eq!(
             human,
-            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=isw0 connected=true path=unknown:unknown rtt_us=0 jitter_us=0 loss_ppm=0 queue_bytes=0 tx_packets=2 tx_bytes=3 rx_packets=4 rx_bytes=5 policy_drops=8 connection_errors=0 send_errors=9\n"
+            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=isw0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
         );
         assert!(!human.contains("bad\nname"));
 
@@ -1199,7 +1227,7 @@ mod tests {
         let ping = sample_ping();
         assert_eq!(
             render_ping(&ping, OutputFormat::Human).unwrap(),
-            "overlay ping to 21.0.0.2 from local (21.0.0.1)\nseq=1 from=21.0.0.2 name=remote node time=12.500 ms\nseq=2 timeout\n2 transmitted, 1 received, 50.0% loss\nrtt min/avg/max = 12.500/12.500/12.500 ms\n"
+            "overlay ping to 21.0.0.2 from local (21.0.0.1)\nseq=1 from=21.0.0.2 name=remote node time=12.5ms\nseq=2 timeout\n2 transmitted, 1 received, 50.0% loss\nrtt min/avg/max = 12.5ms/12.5ms/12.5ms\n"
         );
 
         let json = render_ping(&ping, OutputFormat::Json).unwrap();
@@ -1239,9 +1267,12 @@ mod tests {
             flow_router: Default::default(),
         };
         let human = render_status(&status, OutputFormat::Human).unwrap();
-        assert!(human.starts_with(
-            "ready: false\nendpoint_id: local endpoint\nuptime_seconds: 3\nroutes_ready: false\n"
-        ));
+        let expected_prefix = format!(
+            "ready: false\nendpoint_id: local endpoint\nstarted: {}\nupdated: {}\nuptime: 3s\nroutes_ready: false\n",
+            display::unix_timestamp(1),
+            display::unix_timestamp(2),
+        );
+        assert!(human.starts_with(&expected_prefix));
         assert!(human.contains("missing_route: 21.0.0.0/24\n"));
         assert!(human.contains("peer bad name:"));
 

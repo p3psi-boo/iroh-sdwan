@@ -40,7 +40,9 @@ description = "Example branch router"
 site = "example-site"
 
 [relay]
-mode = "default"
+# 默认不依赖公共 iroh relay。至少配置一个具有固定可达地址的 bootstrap
+# peer；签名 Presence、peer 辅助打洞和 overlay transit 会扩展其余 mesh。
+mode = "disabled"
 
 [routing]
 isolate_overlay = true

@@ -66,11 +66,11 @@ pub struct NodeInfo {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum RelayConfig {
-    #[default]
     Default,
+    #[default]
     Disabled,
     Custom {
         urls: Vec<String>,
@@ -876,7 +876,20 @@ mod tests {
     fn example_configuration_is_valid() {
         let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
         config.validate().unwrap();
+        assert_eq!(config.relay, RelayConfig::Disabled);
         assert!(!config.routing.transit_enabled);
+    }
+
+    #[test]
+    fn omitted_relay_defaults_to_peer_assisted_direct_mode() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            relay: RelayConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str("").unwrap();
+        assert_eq!(wrapper.relay, RelayConfig::Disabled);
     }
 
     #[test]

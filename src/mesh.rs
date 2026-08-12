@@ -22,7 +22,7 @@ use iroh::{
 };
 use iroh_base::Signature;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{debug, warn};
 
 use crate::{
@@ -52,11 +52,14 @@ const REPLACEMENT_IMPROVEMENT_PERCENT: u64 = 20;
 const REPLACEMENT_IMPROVEMENT_MICROS: u64 = 10_000;
 const GOSSIP_INTERVAL: Duration = Duration::from_secs(15);
 const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const CONTROL_STREAMS_PER_MINUTE: usize = 128;
+const CONTROL_STREAMS_PER_MINUTE: usize = 256;
 const PROBES_PER_MINUTE: usize = 128;
 const CONTROL_MAGIC: &str = "iroh-sdwan-mesh-presence-v2";
+const RENDEZVOUS_MAGIC: &str = "iroh-sdwan-mesh-rendezvous-v1";
 const PROBE_MAGIC: &str = "iroh-sdwan-mesh-probe-v1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const RENDEZVOUS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
+const MAX_RENDEZVOUS_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -464,6 +467,30 @@ struct ControlMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RendezvousMessage {
+    protocol: String,
+    owner: EndpointId,
+    address: SocketAddr,
+    observed_unix_secs: u64,
+    expires_unix_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IncomingControlMessage {
+    Presence(ControlMessage),
+    Rendezvous(RendezvousMessage),
+}
+
+#[derive(Debug, Clone)]
+struct RendezvousCandidate {
+    address: SocketAddr,
+    observer: EndpointId,
+    expires_unix_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProbeRequest {
     protocol: String,
     owner: EndpointId,
@@ -485,6 +512,7 @@ pub struct MeshNodeStatus {
     pub sequence: u64,
     pub expires_unix_secs: u64,
     pub direct_addresses: Vec<SocketAddr>,
+    pub assisted_addresses: Vec<SocketAddr>,
     pub relay_urls: Vec<String>,
     pub prefixes: Vec<IpNet>,
     pub node_info: Option<NodeInfo>,
@@ -514,6 +542,15 @@ pub struct MeshRuntime {
     sequence_file: PathBuf,
     local_presence: RwLock<SignedPresence>,
     directory: Mutex<Directory>,
+    /// Direct socket addresses observed on authenticated peer connections.
+    /// Only locally observed records are forwarded, so rendezvous data is
+    /// never amplified recursively through the mesh.
+    connection_observations: Mutex<HashMap<EndpointId, RendezvousCandidate>>,
+    /// Short-lived candidates reported by the authenticated peer currently
+    /// carrying the control stream.
+    assisted_candidates: Mutex<HashMap<EndpointId, Vec<RendezvousCandidate>>>,
+    candidate_updates: Notify,
+    rendezvous_updates: watch::Sender<u64>,
     hidden_underlay_prefixes: Vec<IpNet>,
     policy: StdRwLock<MeshPolicySnapshot>,
     probe_window: Mutex<ProbeWindow>,
@@ -554,6 +591,7 @@ impl MeshRuntime {
             now,
             &hidden_underlay_prefixes,
         )?;
+        let (rendezvous_updates, _) = watch::channel(0);
         Ok(Arc::new(Self {
             config: config.clone(),
             secret_key,
@@ -567,6 +605,10 @@ impl MeshRuntime {
                 owner,
                 config.all_advertised_prefixes(),
             )),
+            connection_observations: Mutex::new(HashMap::new()),
+            assisted_candidates: Mutex::new(HashMap::new()),
+            candidate_updates: Notify::new(),
+            rendezvous_updates,
             hidden_underlay_prefixes,
             policy: StdRwLock::new(MeshPolicySnapshot {
                 local_prefixes: config.all_advertised_prefixes().collect(),
@@ -618,6 +660,8 @@ impl MeshRuntime {
         connection: Connection,
         remote_id: EndpointId,
     ) -> Result<()> {
+        self.refresh_connection_observation(remote_id, &connection)
+            .await;
         let sender = self.clone().send_loop(connection.clone(), remote_id);
         let receiver = self.clone().receive_loop(connection.clone(), remote_id);
         tokio::select! {
@@ -632,6 +676,8 @@ impl MeshRuntime {
 
     pub async fn snapshot(&self) -> MeshStatus {
         let directory = self.directory.lock().await;
+        let now = unix_secs(SystemTime::now()).unwrap_or_default();
+        let assisted = self.assisted_candidates.lock().await;
         let mut nodes = directory
             .presences()
             .map(|presence| MeshNodeStatus {
@@ -639,6 +685,13 @@ impl MeshRuntime {
                 sequence: presence.body.sequence,
                 expires_unix_secs: presence.body.expires_unix_secs,
                 direct_addresses: presence.body.direct_addresses.clone(),
+                assisted_addresses: assisted
+                    .get(&presence.body.owner)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.expires_unix_secs > now)
+                    .map(|candidate| candidate.address)
+                    .collect(),
                 relay_urls: presence.body.relay_urls.clone(),
                 prefixes: presence.body.prefixes.clone(),
                 node_info: presence.body.node_info.clone(),
@@ -658,6 +711,31 @@ impl MeshRuntime {
 
     pub async fn eligible_presences(&self) -> Vec<SignedPresence> {
         self.directory.lock().await.eligible().cloned().collect()
+    }
+
+    /// Merge owner-signed candidates with short-lived addresses observed by
+    /// connected peers. Endpoint authentication still proves the remote
+    /// identity, so a bad rendezvous hint can waste a probe but cannot
+    /// impersonate the advertised owner.
+    pub async fn direct_candidates(&self, presence: &SignedPresence) -> Vec<SocketAddr> {
+        let now = unix_secs(SystemTime::now()).unwrap_or_default();
+        let mut assisted = self.assisted_candidates.lock().await;
+        assisted.retain(|_, candidates| {
+            candidates.retain(|candidate| candidate.expires_unix_secs > now);
+            !candidates.is_empty()
+        });
+        merge_direct_candidates(
+            &presence.body.direct_addresses,
+            assisted.get(&presence.body.owner).into_iter().flatten(),
+        )
+    }
+
+    pub async fn candidate_update_notified(&self) {
+        self.candidate_updates.notified().await;
+    }
+
+    pub async fn add_connection_observation(&self, remote_id: EndpointId, address: SocketAddr) {
+        self.store_connection_observation(remote_id, address).await;
     }
 
     pub fn overlay_address_known(&self, address: IpAddr) -> bool {
@@ -916,30 +994,63 @@ impl MeshRuntime {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(GOSSIP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rendezvous_updates = self.rendezvous_updates.subscribe();
         let mut cursor = 0_usize;
+        let mut rendezvous_cursor = 0_usize;
         loop {
-            interval.tick().await;
-            let local = self.local_presence.read().await.clone();
-            send_presence(&connection, &local).await?;
+            let gossip = tokio::select! {
+                _ = interval.tick() => true,
+                update = rendezvous_updates.changed() => {
+                    update.context("rendezvous update channel closed")?;
+                    false
+                }
+            };
+            if gossip {
+                self.refresh_connection_observation(remote_id, &connection)
+                    .await;
+                let local = self.local_presence.read().await.clone();
+                send_presence(&connection, &local).await?;
 
-            let mut records = self
-                .directory
+                let mut records = self
+                    .directory
+                    .lock()
+                    .await
+                    .presences()
+                    .filter(|presence| presence.body.owner != remote_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                records.sort_by_key(|presence| presence.body.owner);
+                if !records.is_empty() {
+                    cursor %= records.len();
+                    for offset in 0..records.len().min(CANDIDATES_PER_ROUND) {
+                        let index = (cursor + offset) % records.len();
+                        send_presence(&connection, &records[index]).await?;
+                    }
+                    cursor = (cursor + CANDIDATES_PER_ROUND) % records.len();
+                }
+            }
+
+            let now = unix_secs(SystemTime::now())?;
+            let mut observations = self
+                .connection_observations
                 .lock()
                 .await
-                .presences()
-                .filter(|presence| presence.body.owner != remote_id)
+                .values()
+                .filter(|candidate| {
+                    candidate.observer != remote_id && candidate.expires_unix_secs > now
+                })
                 .cloned()
                 .collect::<Vec<_>>();
-            records.sort_by_key(|presence| presence.body.owner);
-            if records.is_empty() {
-                continue;
+            observations.sort_by_key(|candidate| candidate.observer);
+            if !observations.is_empty() {
+                rendezvous_cursor %= observations.len();
+                for offset in 0..observations.len().min(CANDIDATES_PER_ROUND) {
+                    let candidate =
+                        &observations[(rendezvous_cursor + offset) % observations.len()];
+                    send_rendezvous_candidate(&connection, candidate, now).await?;
+                }
+                rendezvous_cursor = (rendezvous_cursor + CANDIDATES_PER_ROUND) % observations.len();
             }
-            cursor %= records.len();
-            for offset in 0..records.len().min(CANDIDATES_PER_ROUND) {
-                let index = (cursor + offset) % records.len();
-                send_presence(&connection, &records[index]).await?;
-            }
-            cursor = (cursor + CANDIDATES_PER_ROUND) % records.len();
         }
     }
 
@@ -968,35 +1079,153 @@ impl MeshRuntime {
                 .read_to_end(MAX_PRESENCE_BYTES + 512)
                 .await
                 .context("failed reading mesh control stream")?;
-            let message: ControlMessage =
+            let message: IncomingControlMessage =
                 serde_json::from_slice(&bytes).context("invalid mesh control message")?;
-            ensure!(
-                message.protocol == CONTROL_MAGIC,
-                "invalid mesh control protocol"
-            );
-            if message.presence.body.owner == self.secret_key.public() {
-                continue;
-            }
-            if let Some((address, prefix)) = self.forbidden_underlay_candidate(&message.presence) {
-                warn!(endpoint_id = %remote_id, owner = %message.presence.body.owner, %address, %prefix, "discarding presence with forbidden underlay candidate");
-                continue;
-            }
-            let mut directory = self.directory.lock().await;
-            match directory.insert(
-                message.presence,
-                &self.config.network_id,
-                SystemTime::now(),
-                Instant::now(),
-            ) {
-                Ok(InsertOutcome::Inserted | InsertOutcome::Updated) => {
-                    self.update_policy(&directory);
+            match message {
+                IncomingControlMessage::Presence(message) => {
+                    ensure!(
+                        message.protocol == CONTROL_MAGIC,
+                        "invalid mesh control protocol"
+                    );
+                    if message.presence.body.owner == self.secret_key.public() {
+                        continue;
+                    }
+                    if let Some((address, prefix)) =
+                        self.forbidden_underlay_candidate(&message.presence)
+                    {
+                        warn!(endpoint_id = %remote_id, owner = %message.presence.body.owner, %address, %prefix, "discarding presence with forbidden underlay candidate");
+                        continue;
+                    }
+                    let mut directory = self.directory.lock().await;
+                    match directory.insert(
+                        message.presence,
+                        &self.config.network_id,
+                        SystemTime::now(),
+                        Instant::now(),
+                    ) {
+                        Ok(InsertOutcome::Inserted | InsertOutcome::Updated) => {
+                            self.update_policy(&directory);
+                        }
+                        Ok(InsertOutcome::Refreshed | InsertOutcome::Stale) => {}
+                        Err(error) => {
+                            warn!(endpoint_id = %remote_id, %error, "discarding invalid mesh presence");
+                        }
+                    }
                 }
-                Ok(InsertOutcome::Refreshed | InsertOutcome::Stale) => {}
-                Err(error) => {
-                    warn!(endpoint_id = %remote_id, %error, "discarding invalid mesh presence");
+                IncomingControlMessage::Rendezvous(message) => {
+                    if let Err(error) = self.learn_rendezvous_candidate(remote_id, message).await {
+                        warn!(endpoint_id = %remote_id, %error, "discarding invalid rendezvous candidate");
+                    }
                 }
             }
         }
+    }
+
+    async fn refresh_connection_observation(&self, remote_id: EndpointId, connection: &Connection) {
+        let Some(address) = connection.paths().iter().find_map(|path| {
+            (path.is_selected())
+                .then_some(path.remote_addr())
+                .and_then(|address| {
+                    if let TransportAddr::Ip(address) = address {
+                        Some(*address)
+                    } else {
+                        None
+                    }
+                })
+        }) else {
+            return;
+        };
+        self.store_connection_observation(remote_id, address).await;
+    }
+
+    async fn store_connection_observation(&self, remote_id: EndpointId, address: SocketAddr) {
+        if !safe_underlay_ip(address.ip())
+            || self
+                .hidden_underlay_prefixes
+                .iter()
+                .any(|prefix| prefix.contains(&address.ip()))
+        {
+            return;
+        }
+        let now = unix_secs(SystemTime::now()).unwrap_or_default();
+        let candidate = RendezvousCandidate {
+            address,
+            observer: remote_id,
+            expires_unix_secs: now + RENDEZVOUS_CANDIDATE_TTL.as_secs(),
+        };
+        let changed = self
+            .connection_observations
+            .lock()
+            .await
+            .insert(remote_id, candidate)
+            .is_none_or(|previous| previous.address != address);
+        if changed {
+            self.rendezvous_updates.send_modify(|epoch| *epoch += 1);
+        }
+    }
+
+    async fn learn_rendezvous_candidate(
+        &self,
+        observer: EndpointId,
+        message: RendezvousMessage,
+    ) -> Result<()> {
+        ensure!(
+            message.protocol == RENDEZVOUS_MAGIC,
+            "invalid rendezvous protocol"
+        );
+        ensure!(
+            message.owner != self.secret_key.public(),
+            "rendezvous candidate points back to the local endpoint"
+        );
+        ensure!(message.owner != observer, "observer reported itself");
+        {
+            let directory = self.directory.lock().await;
+            ensure!(
+                directory.get(message.owner).is_some() && !directory.is_quarantined(message.owner),
+                "candidate owner has no eligible signed Presence"
+            );
+        }
+        ensure!(message.address.port() != 0, "candidate has zero port");
+        ensure!(
+            safe_underlay_ip(message.address.ip()),
+            "candidate address is unsafe"
+        );
+        ensure!(
+            !self
+                .hidden_underlay_prefixes
+                .iter()
+                .any(|prefix| prefix.contains(&message.address.ip())),
+            "candidate address is inside a forbidden underlay prefix"
+        );
+        let now = unix_secs(SystemTime::now())?;
+        ensure!(
+            message.observed_unix_secs <= now.saturating_add(CLOCK_SKEW.as_secs()),
+            "candidate observation is in the future"
+        );
+        ensure!(message.expires_unix_secs > now, "candidate has expired");
+        ensure!(
+            message.expires_unix_secs >= message.observed_unix_secs
+                && message.expires_unix_secs - message.observed_unix_secs
+                    <= MAX_RENDEZVOUS_TTL.as_secs(),
+            "candidate TTL exceeds limit"
+        );
+        let candidate = RendezvousCandidate {
+            address: message.address,
+            observer,
+            expires_unix_secs: message.expires_unix_secs,
+        };
+        let mut learned = self.assisted_candidates.lock().await;
+        let candidates = learned.entry(message.owner).or_default();
+        candidates.retain(|existing| {
+            existing.expires_unix_secs > now
+                && !(existing.observer == observer && existing.address == candidate.address)
+        });
+        candidates.push(candidate);
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.expires_unix_secs));
+        candidates.truncate(MAX_ENDPOINT_CANDIDATES);
+        drop(learned);
+        self.candidate_updates.notify_one();
+        Ok(())
     }
 
     fn update_policy(&self, directory: &Directory) {
@@ -1102,6 +1331,45 @@ async fn send_presence(connection: &Connection, presence: &SignedPresence) -> Re
     send.finish()
         .context("failed finishing mesh control stream")?;
     Ok(())
+}
+
+async fn send_rendezvous_candidate(
+    connection: &Connection,
+    candidate: &RendezvousCandidate,
+    now: u64,
+) -> Result<()> {
+    let message = RendezvousMessage {
+        protocol: RENDEZVOUS_MAGIC.into(),
+        owner: candidate.observer,
+        address: candidate.address,
+        observed_unix_secs: now,
+        expires_unix_secs: now + RENDEZVOUS_CANDIDATE_TTL.as_secs(),
+    };
+    let bytes = serde_json::to_vec(&message).context("failed encoding rendezvous candidate")?;
+    let mut send = connection
+        .open_uni()
+        .await
+        .context("failed opening rendezvous control stream")?;
+    send.write_all(&bytes)
+        .await
+        .context("failed writing rendezvous candidate")?;
+    send.finish()
+        .context("failed finishing rendezvous candidate")?;
+    Ok(())
+}
+
+fn merge_direct_candidates<'a>(
+    signed: &[SocketAddr],
+    assisted: impl IntoIterator<Item = &'a RendezvousCandidate>,
+) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    signed
+        .iter()
+        .copied()
+        .chain(assisted.into_iter().map(|candidate| candidate.address))
+        .filter(|address| seen.insert(*address))
+        .take(MAX_ENDPOINT_CANDIDATES)
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -1654,6 +1922,33 @@ mod tests {
             signed
                 .verify(&config.network_id, SystemTime::now())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn peer_assisted_candidates_extend_signed_presence_without_duplicates() {
+        let signed = vec![
+            "198.51.100.10:4000".parse().unwrap(),
+            "[2001:db8::10]:4000".parse().unwrap(),
+        ];
+        let observer_a = SecretKey::from_bytes(&[31; 32]).public();
+        let observer_b = SecretKey::from_bytes(&[32; 32]).public();
+        let assisted = vec![
+            RendezvousCandidate {
+                address: signed[0],
+                observer: observer_a,
+                expires_unix_secs: 10,
+            },
+            RendezvousCandidate {
+                address: "203.0.113.10:50123".parse().unwrap(),
+                observer: observer_b,
+                expires_unix_secs: 10,
+            },
+        ];
+
+        assert_eq!(
+            merge_direct_candidates(&signed, &assisted),
+            vec![signed[0], signed[1], "203.0.113.10:50123".parse().unwrap(),]
         );
     }
 

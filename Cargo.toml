@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0.104"
 blake3 = "1.8.6"
 bytes = "1.11.1"
+chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 crypto_box = { version = "0.9.1", features = ["rand_core", "std"] }
 hex = "0.4.3"

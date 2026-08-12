@@ -2243,7 +2243,10 @@ impl DynamicMeshManager {
         let mut interval = tokio::time::interval(EVALUATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.mesh.candidate_update_notified() => {}
+            }
             if let Err(error) = self.evaluate().await {
                 warn!(%error, "bounded mesh evaluation failed");
             }
@@ -2251,7 +2254,13 @@ impl DynamicMeshManager {
     }
 
     async fn evaluate(&self) -> Result<()> {
-        let presences = self.mesh.eligible_presences().await;
+        let mut presences = self.mesh.eligible_presences().await;
+        // Peer-observed NAT mappings are deliberately kept outside the
+        // owner-signed Presence. Merge them only into this local planner view;
+        // the original signed records remain unchanged when gossiped.
+        for presence in &mut presences {
+            presence.body.direct_addresses = self.mesh.direct_candidates(presence).await;
+        }
         let now = Instant::now();
         let (active_observations, unhealthy_ids) = {
             let mut dynamic = self.dynamic.lock().await;
@@ -2344,7 +2353,9 @@ impl DynamicMeshManager {
             .collect::<HashSet<_>>();
         let mut candidates = presences
             .iter()
-            .filter(|presence| self.local_id < presence.body.owner)
+            // Both endpoints probe. Coordinated outbound traffic is required
+            // to open two NAT mappings; only the canonical lower EndpointId
+            // will later activate the durable adjacency.
             .filter(|presence| !dynamic_ids.contains(&presence.body.owner))
             .filter(|presence| !pinned.contains(&presence.body.owner))
             .filter(|presence| presence_path(presence).is_some())
@@ -2449,6 +2460,17 @@ impl DynamicMeshManager {
 
     async fn accept_unknown(&self, connection: Connection) -> Result<()> {
         let endpoint_id = connection.remote_id();
+        if let Some(address) = connection.paths().iter().find_map(|path| {
+            if let TransportAddr::Ip(address) = path.remote_addr() {
+                Some(*address)
+            } else {
+                None
+            }
+        }) {
+            self.mesh
+                .add_connection_observation(endpoint_id, address)
+                .await;
+        }
         let presence = match self.mesh.presence(endpoint_id).await {
             Some(presence) => presence,
             None => {
@@ -2457,6 +2479,8 @@ impl DynamicMeshManager {
                     .await?
             }
         };
+        let mut presence = presence;
+        presence.body.direct_addresses = self.mesh.direct_candidates(&presence).await;
         ensure!(
             presence_path(&presence).is_some(),
             "dynamic endpoint has no usable direct candidate"

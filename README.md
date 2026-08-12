@@ -10,7 +10,8 @@
 - 节点使用签名 Presence 传播节点地址、前缀归属和转发能力；固定 peer 用于引导连接。
 - 同一流在短租约内固定到一条路径；租约到期后可根据延迟、抖动、丢包、队列压力和实测容量重新选择路径。
 - 容量以 `(目的节点所有者, 首跳节点)` 为键，分别维护两个方向的测量值。主动探测和接收端确认的业务交付样本共同参与估计。
-- 直连 UDP、iroh relay 和 DERP 都是节点邻接的底层传输；覆盖层的转发和选路仍由 FlowRouter 处理。
+- 默认通过固定 bootstrap peer 交换签名 Presence 和 peer 观察到的 NAT 地址候选，优先建立直连 UDP；失败时由普通 transit peer 做覆盖层转发，不依赖公共 iroh relay。
+- 直连 UDP、可选 iroh relay 和 DERP 都是节点邻接的底层传输；覆盖层的转发和选路仍由 FlowRouter 处理。
 - 守护进程以 `CAP_NET_ADMIN` 运行；操作命令通过 Unix 控制套接字访问守护进程。
 
 当前约束：仅支持 Linux；每个节点按单一互联网出口建模；每条流在一个租约内只使用一条覆盖路径；未实现多路径发送。
@@ -97,7 +98,7 @@ sudo iroh-sdwan trace 21.0.0.3
 sudo iroh-sdwan reload
 ```
 
-`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。`top` 从守护进程的内存快照读取实时状态；按 `j`/`k` 选择 peer，`s` 切换排序，`c` 筛选已连接 peer，`p` 暂停，`r` 刷新，`q` 退出。
+`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`top` 从守护进程的内存快照读取实时状态；按 `j`/`k` 选择 peer，`s` 切换排序，`c` 筛选已连接 peer，`p` 暂停，`r` 刷新，`q` 退出。
 
 服务、监控、配置更新、备份与排障命令见 [运行与运维](docs/运行与运维.md)。
 

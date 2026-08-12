@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::{
-    control,
+    control, display,
     observability::{PeerStatus, RouteCapacityStatus, RuntimeStatus},
 };
 
@@ -517,12 +517,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard, inter
         Span::raw("  "),
         state,
         Span::raw(format!(
-            "  up {}  peers {}/{}  snapshot {}s  interval {:.1}s",
+            "  up {}  peers {}/{}  snapshot {} ago  interval {}",
             human_duration(status.uptime_seconds),
             status.peers.iter().filter(|peer| peer.connected).count(),
             status.peers.len(),
-            age,
-            interval.as_secs_f64(),
+            human_duration(age),
+            display::duration(interval),
         )),
     ];
     if let Some(paused) = paused {
@@ -827,7 +827,7 @@ fn compact_capacity(capacity: Option<&RouteCapacityStatus>) -> (String, Style) {
             (
                 format!(
                     "Capacity {} · {:.0}%",
-                    human_rate(route.effective_capacity_bps / 8),
+                    display::bits_per_second(route.effective_capacity_bps),
                     health
                 ),
                 capacity_health_style(route.health_per_mille),
@@ -842,11 +842,11 @@ fn detailed_capacity(capacity: Option<&RouteCapacityStatus>) -> String {
         |route| {
             format!(
                 "capacity={} health={:.1}% age={} source={} probe={}",
-                human_rate(route.effective_capacity_bps / 8),
+                display::bits_per_second(route.effective_capacity_bps),
                 f64::from(route.health_per_mille) / 10.0,
                 route
                     .sample_age_millis
-                    .map_or_else(|| "?".into(), |age| format!("{}ms", age)),
+                    .map_or_else(|| "?".into(), display::millis),
                 route.sample_source.as_deref().unwrap_or("none"),
                 if route.probe_in_flight {
                     "active"
@@ -1086,37 +1086,18 @@ fn short(value: &str, width: usize) -> String {
 }
 
 fn human_bytes(bytes: u64) -> String {
-    human_unit(bytes, "B")
+    display::bytes(bytes)
 }
 
 fn human_rate(bytes_per_second: u64) -> String {
-    format!("{}/s", human_unit(bytes_per_second, "B"))
-}
-
-fn human_unit(value: u64, unit: &str) -> String {
-    const UNITS: [&str; 4] = ["", "K", "M", "G"];
-    let mut value = value as f64;
-    let mut index = 0;
-    while value >= 1000.0 && index + 1 < UNITS.len() {
-        value /= 1000.0;
-        index += 1;
-    }
-    if index == 0 {
-        format!("{}{}{}", value as u64, UNITS[index], unit)
-    } else if value >= 100.0 {
-        format!("{value:.0}{}{}", UNITS[index], unit)
-    } else {
-        format!("{value:.1}{}{}", UNITS[index], unit)
-    }
+    display::bytes_per_second(bytes_per_second)
 }
 
 fn format_micros(micros: u64) -> String {
     if micros == 0 {
         "?".into()
-    } else if micros < 1000 {
-        format!("{}us", micros)
     } else {
-        format!("{:.1}ms", micros as f64 / 1000.0)
+        display::micros(micros)
     }
 }
 
@@ -1129,16 +1110,7 @@ fn format_loss(ppm: u64) -> String {
 }
 
 fn human_duration(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let hours = seconds % 86_400 / 3_600;
-    let minutes = seconds % 3_600 / 60;
-    if days > 0 {
-        format!("{days}d{hours:02}h")
-    } else if hours > 0 {
-        format!("{hours}h{minutes:02}m")
-    } else {
-        format!("{minutes}m{:02}s", seconds % 60)
-    }
+    display::duration(Duration::from_secs(seconds))
 }
 
 fn pressure_style(bytes: u64) -> Style {
