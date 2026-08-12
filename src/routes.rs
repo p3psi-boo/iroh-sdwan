@@ -10,7 +10,10 @@ use ipnet::IpNet;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::{config::RouteOriginConfig, deployment};
+use crate::{
+    config::{Config, RouteOriginConfig},
+    deployment, identity,
+};
 
 const ROUTE_FILE_VERSION: u8 = 1;
 
@@ -217,6 +220,12 @@ pub fn registry_path(identity_file: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("routes.toml")
+}
+
+pub async fn validate_for_config(config_path: &Path, registry: &RouteRegistry) -> Result<()> {
+    let config = Config::load_with_route_origins(config_path, registry.routes.clone()).await?;
+    let secret_key = identity::load(&config.identity_file)?;
+    config.validate_local_id(secret_key.public())
 }
 
 fn route_file_version() -> u8 {

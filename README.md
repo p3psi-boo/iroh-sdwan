@@ -92,7 +92,7 @@ sudo systemctl enable --now iroh-sdwan
 sudo iroh-sdwan health
 sudo iroh-sdwan status
 sudo iroh-sdwan peers
-sudo iroh-sdwan top
+sudo iroh-sdwan tui
 sudo iroh-sdwan ping 21.0.0.3
 sudo iroh-sdwan trace 21.0.0.3
 sudo iroh-sdwan route add 192.168.30.0/24 --owner branch-c
@@ -107,7 +107,7 @@ sudo iroh-sdwan reload
 在守护进程运行时会自动 reload；`--dry-run` 可预览，维护窗口可加 `--defer`
 延后应用。
 
-`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`top` 从守护进程的内存快照读取实时状态；按 `j`/`k` 选择 peer，`s` 切换排序，`c` 筛选已连接 peer，`p` 暂停，`r` 刷新，`q` 退出。
+`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`tui` 是交互式运维台，`Tab` 可切换 Peer、Routes、Diagnostics 三个视图：查看实时链路，在 Routes 中按 `a` 接受或按两次 `x` 移除持久路由，在 Diagnostics 中直接对所选节点执行 ping/trace；任意视图按两次 `R` 可校验并 reload 守护进程。原 `top` 命令保留为兼容别名。
 
 服务、监控、配置更新、备份与排障命令见 [运行与运维](docs/运行与运维.md)。
 

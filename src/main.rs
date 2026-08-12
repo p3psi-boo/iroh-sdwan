@@ -25,8 +25,8 @@ use iroh_sdwan::{
     display, identity, logging,
     observability::{PeerStatus, RuntimeStatus},
     routes::RouteRegistry,
-    top,
     trace::{self, PingResult},
+    tui,
 };
 
 #[derive(Debug, Parser)]
@@ -124,8 +124,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Continuously inspect live peers, paths, queues, traffic classes, and errors.
-    Top {
+    /// Open the interactive operations console for peers, routes, and diagnostics.
+    #[command(visible_alias = "top")]
+    Tui {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(200..=60_000))]
         interval_ms: u64,
@@ -277,7 +278,9 @@ async fn main() -> Result<()> {
         Command::Status { output, json } => {
             status(&socket, if json { OutputFormat::Json } else { output }).await
         }
-        Command::Top { interval_ms } => top::run(&socket, Duration::from_millis(interval_ms)).await,
+        Command::Tui { interval_ms } => {
+            tui::run(&config, &socket, Duration::from_millis(interval_ms)).await
+        }
         Command::Health => health(&socket, cli.quiet).await,
         Command::Reload => {
             let ack = control::reload(&socket).await?;
@@ -527,9 +530,7 @@ async fn apply_route_change(
 }
 
 async fn validate_route_registry(config_path: &Path, registry: &RouteRegistry) -> Result<()> {
-    let config = Config::load_with_route_origins(config_path, registry.routes.clone()).await?;
-    let secret_key = identity::load(&config.identity_file)?;
-    config.validate_local_id(secret_key.public())
+    iroh_sdwan::routes::validate_for_config(config_path, registry).await
 }
 
 enum RouteReload {
@@ -1561,14 +1562,15 @@ mod tests {
     }
 
     #[test]
-    fn top_accepts_bounded_refresh_interval() {
-        let cli = Cli::try_parse_from(["iroh-sdwan", "top", "--interval-ms", "500"]).unwrap();
+    fn tui_accepts_bounded_refresh_interval_and_top_alias() {
+        let cli = Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "500"]).unwrap();
         match cli.command {
-            Command::Top { interval_ms } => assert_eq!(interval_ms, 500),
-            command => panic!("expected top command, got {command:?}"),
+            Command::Tui { interval_ms } => assert_eq!(interval_ms, 500),
+            command => panic!("expected tui command, got {command:?}"),
         }
-        assert!(Cli::try_parse_from(["iroh-sdwan", "top", "--interval-ms", "199"]).is_err());
-        assert!(Cli::try_parse_from(["iroh-sdwan", "top", "--interval-ms", "60001"]).is_err());
+        assert!(Cli::try_parse_from(["iroh-sdwan", "top"]).is_ok());
+        assert!(Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "199"]).is_err());
+        assert!(Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "60001"]).is_err());
     }
 
     #[test]

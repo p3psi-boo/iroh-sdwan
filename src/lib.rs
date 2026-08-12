@@ -20,9 +20,9 @@ pub mod path_selection;
 pub mod routes;
 pub mod runtime;
 pub mod system;
-pub mod top;
 pub mod trace;
 pub mod transport;
+pub mod tui;
 pub mod tunnel;
 pub mod wire;
 
