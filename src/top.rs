@@ -116,6 +116,7 @@ struct Dashboard {
     filter_connected: bool,
     paused: bool,
     show_help: bool,
+    detail_expanded: bool,
     last_error: Option<String>,
     last_refresh: Option<Instant>,
 }
@@ -351,6 +352,19 @@ impl Dashboard {
             .selected
             .min(self.visible_peers().len().saturating_sub(1));
     }
+
+    fn attention_active(&self) -> bool {
+        self.last_error.is_some()
+            || self.status.as_ref().is_some_and(|status| !status.ready)
+            || self
+                .rates
+                .values()
+                .any(|rate| rate.drop_ps > 0 || rate.error_ps > 0)
+            || self.events.iter().any(|event| {
+                event.when_unix.saturating_add(30) >= unix_now()
+                    && matches!(event.severity, Color::Red | Color::Yellow)
+            })
+    }
 }
 
 struct TerminalGuard;
@@ -417,6 +431,9 @@ async fn run_loop(
                         dashboard.clamp_selection();
                     }
                     KeyCode::Char('r') => next_refresh = Instant::now(),
+                    KeyCode::Enter | KeyCode::Char('d') => {
+                        dashboard.detail_expanded = !dashboard.detail_expanded;
+                    }
                     KeyCode::Down | KeyCode::Char('j') => dashboard.move_selection(1),
                     KeyCode::Up | KeyCode::Char('k') => dashboard.move_selection(-1),
                     _ => {}
@@ -455,7 +472,7 @@ fn render(frame: &mut Frame<'_>, dashboard: &Dashboard, interval: Duration) {
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(8),
-        Constraint::Length(9),
+        Constraint::Length(if dashboard.detail_expanded { 9 } else { 5 }),
         Constraint::Length(1),
     ])
     .split(area);
@@ -669,8 +686,12 @@ fn render_peers(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
 }
 
 fn render_bottom(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
-    let columns =
-        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
+    let detail_width = if dashboard.attention_active() { 50 } else { 65 };
+    let columns = Layout::horizontal([
+        Constraint::Percentage(detail_width),
+        Constraint::Percentage(100 - detail_width),
+    ])
+    .split(area);
     render_detail(frame, columns[0], dashboard);
     render_events(frame, columns[1], dashboard);
 }
@@ -688,30 +709,27 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         .get(&peer.endpoint_id)
         .copied()
         .unwrap_or_default();
-    let capacity = best_capacity(&peer.capacities);
-    let cap = capacity.map_or_else(
-        || "capacity unknown".to_string(),
-        |route| {
-            format!(
-                "capacity={} health={:.1}% age={} source={} probe={}",
-                human_rate(route.effective_capacity_bps / 8),
-                f64::from(route.health_per_mille) / 10.0,
-                route
-                    .sample_age_millis
-                    .map_or_else(|| "?".into(), |age| format!("{}ms", age)),
-                route.sample_source.as_deref().unwrap_or("none"),
-                if route.probe_in_flight {
-                    "active"
-                } else {
-                    "idle"
-                }
-            )
+    let title = format!(
+        " {} · {} · {} {}",
+        short(&peer.name, 18),
+        short(nonempty(&peer.selected_path_transport, "unknown"), 10),
+        if peer.connected { "UP" } else { "DOWN" },
+        if dashboard.detail_expanded {
+            "[d close]"
+        } else {
+            "[Enter details]"
         },
     );
+    if !dashboard.detail_expanded {
+        render_compact_detail(frame, area, peer, rate, &title);
+        return;
+    }
+
+    let capacity = best_capacity(&peer.capacities);
+    let cap = detailed_capacity(capacity);
     let text = vec![
         Line::from(format!(
-            "{}  endpoint={}  remote={}",
-            peer.name,
+            "endpoint={}  remote={}",
             short(&peer.endpoint_id, 16),
             nonempty(&peer.selected_path_remote, "unknown")
         )),
@@ -745,33 +763,194 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
             peer.path_lost_packets,
             peer.mtu_reframes,
         )),
-        Line::from(format!(
-            "errors: conn={} send={} invalid={} policy={} frame={} queue={} expired={} reassembly={}",
-            peer.connection_errors,
-            peer.send_errors,
-            peer.invalid_packets,
-            peer.policy_drops,
-            peer.frame_drops,
-            peer.queue_drops,
-            peer.queue_expired_drops,
-            peer.reassembly_evictions,
-        )),
-        Line::from(format!(
-            "fec: tx={} rx={} recovered={} unprotected={} expired={} overhead={}",
-            peer.fec_tx_recovery_shards,
-            peer.fec_rx_recovery_shards,
-            peer.fec_recovered_shards,
-            peer.fec_unprotected_shards,
-            peer.fec_expired_blocks,
-            human_bytes(peer.fec_overhead_bytes),
-        )),
+        Line::from(format!("errors: {}", error_detail(peer))),
+        Line::from(format!("fec: {}", fec_detail(peer))),
     ];
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::bordered().title(" selected path / queue / errors "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn render_compact_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    peer: &PeerStatus,
+    rate: PeerRate,
+    title: &str,
+) {
+    let capacity = best_capacity(&peer.capacities);
+    let (capacity_text, capacity_style) = compact_capacity(capacity);
+    let (health_text, health_style) = peer_health(peer, rate);
+    let text = vec![
+        Line::from(vec![
+            Span::styled("TX ", Style::new().fg(Color::DarkGray)),
+            Span::styled(human_rate(rate.tx_bps), Style::new().fg(Color::Cyan).bold()),
+            Span::raw("   RX "),
+            Span::styled(human_rate(rate.rx_bps), Style::new().fg(Color::Cyan).bold()),
+            Span::raw("   Queue "),
+            Span::styled(
+                format!(
+                    "{} / {} pkt",
+                    human_bytes(peer.queue_bytes),
+                    peer.queue_packets
+                ),
+                pressure_style(peer.queue_bytes),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw(format!(
+                "RTT {} ±{}   Loss {}   ",
+                format_micros(peer.path_rtt_micros),
+                format_micros(peer.path_jitter_micros),
+                format_loss(peer.path_loss_ppm),
+            )),
+            Span::styled(capacity_text, capacity_style),
+        ]),
+        Line::from(Span::styled(health_text, health_style)),
+    ];
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn compact_capacity(capacity: Option<&RouteCapacityStatus>) -> (String, Style) {
+    capacity.map_or_else(
+        || ("Capacity unknown".into(), Style::new().fg(Color::DarkGray)),
+        |route| {
+            let health = f64::from(route.health_per_mille) / 10.0;
+            (
+                format!(
+                    "Capacity {} · {:.0}%",
+                    human_rate(route.effective_capacity_bps / 8),
+                    health
+                ),
+                capacity_health_style(route.health_per_mille),
+            )
+        },
+    )
+}
+
+fn detailed_capacity(capacity: Option<&RouteCapacityStatus>) -> String {
+    capacity.map_or_else(
+        || "capacity unknown".to_string(),
+        |route| {
+            format!(
+                "capacity={} health={:.1}% age={} source={} probe={}",
+                human_rate(route.effective_capacity_bps / 8),
+                f64::from(route.health_per_mille) / 10.0,
+                route
+                    .sample_age_millis
+                    .map_or_else(|| "?".into(), |age| format!("{}ms", age)),
+                route.sample_source.as_deref().unwrap_or("none"),
+                if route.probe_in_flight {
+                    "active"
+                } else {
+                    "idle"
+                }
+            )
+        },
+    )
+}
+
+fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
+    let mut messages = Vec::new();
+    let mut style = Style::new().fg(Color::Green);
+    if !peer.connected {
+        messages.push("DOWN".to_string());
+        style = Style::new().fg(Color::Red).bold();
+    }
+    if rate.error_ps > 0 {
+        messages.push(format!("errors {}/s", rate.error_ps));
+        style = Style::new().fg(Color::Red).bold();
+    }
+    if rate.drop_ps > 0 {
+        messages.push(format!("drops {}/s", rate.drop_ps));
+        if rate.error_ps == 0 {
+            style = Style::new().fg(Color::Yellow).bold();
+        }
+    }
+    if peer.path_loss_ppm >= 1_000 {
+        messages.push(format!("loss {}", format_loss(peer.path_loss_ppm)));
+        if rate.error_ps == 0 {
+            style = Style::new().fg(Color::Yellow).bold();
+        }
+    }
+    if peer.queue_bytes >= 4 * 1024 * 1024 {
+        messages.push(format!("queue {}", human_bytes(peer.queue_bytes)));
+        if rate.error_ps == 0 {
+            style = Style::new().fg(Color::Yellow).bold();
+        }
+    }
+    if messages.is_empty() {
+        let fec = (peer.fec_recovered_shards > 0)
+            .then(|| format!(" · FEC recovered {}", peer.fec_recovered_shards))
+            .unwrap_or_default();
+        (format!("✓ healthy{fec}"), style)
+    } else {
+        (format!("! {}", messages.join(" · ")), style)
+    }
+}
+
+fn capacity_health_style(health_per_mille: u16) -> Style {
+    if health_per_mille >= 900 {
+        Style::new().fg(Color::Green)
+    } else if health_per_mille >= 700 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::Red).bold()
+    }
+}
+
+fn error_detail(peer: &PeerStatus) -> String {
+    let mut errors = Vec::new();
+    for (label, count) in [
+        ("conn", peer.connection_errors),
+        ("send", peer.send_errors),
+        ("invalid", peer.invalid_packets),
+        ("policy", peer.policy_drops),
+        ("frame", peer.frame_drops),
+        ("queue", peer.queue_drops),
+        ("expired", peer.queue_expired_drops),
+        ("reassembly", peer.reassembly_evictions),
+    ] {
+        if count > 0 {
+            errors.push(format!("{label}={count}"));
+        }
+    }
+    if errors.is_empty() {
+        "none".into()
+    } else {
+        errors.join(" ")
+    }
+}
+
+fn fec_detail(peer: &PeerStatus) -> String {
+    let mut fields = Vec::new();
+    for (label, count) in [
+        ("tx", peer.fec_tx_recovery_shards),
+        ("rx", peer.fec_rx_recovery_shards),
+        ("recovered", peer.fec_recovered_shards),
+        ("unprotected", peer.fec_unprotected_shards),
+        ("expired", peer.fec_expired_blocks),
+    ] {
+        if count > 0 {
+            fields.push(format!("{label}={count}"));
+        }
+    }
+    if peer.fec_overhead_bytes > 0 {
+        fields.push(format!("overhead={}", human_bytes(peer.fec_overhead_bytes)));
+    }
+    if fields.is_empty() {
+        "none".into()
+    } else {
+        fields.join(" ")
+    }
 }
 
 fn render_events(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
@@ -800,7 +979,7 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
     let text = format!(
-        " q quit  j/k select  s sort  c connected  p pause  r refresh  ? help   traffic:{}",
+        " q quit  j/k select  Enter/d details  s sort  c connected  p pause  r refresh  ? help   traffic:{}",
         tiny_history(&dashboard.total_history)
     );
     frame.render_widget(
@@ -822,6 +1001,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("c           show all / connected peers"),
         Line::from("p / Space   pause snapshots"),
         Line::from("r           refresh immediately"),
+        Line::from("Enter / d   show / hide selected-peer details"),
         Line::from("?           close this help"),
         Line::from("q / Esc     quit"),
         Line::from(""),
@@ -1089,5 +1269,32 @@ mod tests {
         assert_eq!(human_rate(2_000_000), "2.0MB/s");
         assert_eq!(format_micros(12_500), "12.5ms");
         assert_eq!(format_loss(10_000), "1.00%");
+    }
+
+    #[test]
+    fn compact_detail_prioritizes_health_and_hides_zero_counters() {
+        let healthy = peer(1_000, 1);
+        let (summary, style) = peer_health(&healthy, PeerRate::default());
+        assert_eq!(summary, "✓ healthy");
+        assert_eq!(style.fg, Some(Color::Green));
+        assert_eq!(error_detail(&healthy), "none");
+        assert_eq!(fec_detail(&healthy), "none");
+
+        let mut impaired = peer(1_000, 1);
+        impaired.send_errors = 3;
+        impaired.queue_drops = 4;
+        impaired.fec_recovered_shards = 5;
+        impaired.fec_overhead_bytes = 1_500;
+        let (summary, style) = peer_health(
+            &impaired,
+            PeerRate {
+                error_ps: 2,
+                ..PeerRate::default()
+            },
+        );
+        assert_eq!(summary, "! errors 2/s");
+        assert_eq!(style.fg, Some(Color::Red));
+        assert_eq!(error_detail(&impaired), "send=3 queue=4");
+        assert_eq!(fec_detail(&impaired), "recovered=5 overhead=1.5KB");
     }
 }
