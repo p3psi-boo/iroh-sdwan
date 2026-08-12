@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::{Display, Write as _},
     io::{BufRead, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
@@ -23,6 +24,7 @@ use iroh_sdwan::{
     derp::{DerpPublicKey, identity::DerpIdentity, probe_server, tls_config},
     display, identity, logging,
     observability::{PeerStatus, RuntimeStatus},
+    routes::RouteRegistry,
     top,
     trace::{self, PingResult},
 };
@@ -157,6 +159,61 @@ enum Command {
     },
     /// Check host prerequisites and underlay reachability without changing state.
     Doctor,
+    /// Manage the independent static route registry.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    /// Add one or more prefixes for a configured peer name or endpoint ID.
+    Add {
+        #[arg(required = true, value_name = "PREFIX")]
+        prefixes: Vec<IpNet>,
+        /// Final owner of these prefixes: a configured peer name or endpoint ID.
+        #[arg(long, value_name = "PEER_OR_ENDPOINT_ID")]
+        owner: String,
+        /// Validate and preview the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save now and apply on the next daemon reload.
+        #[arg(long, visible_alias = "no-reload")]
+        defer: bool,
+    },
+    /// Merge routes from TOML or `<endpoint-id> <prefix>...` text.
+    Import {
+        /// Import file, or `-` to read from standard input.
+        source: PathBuf,
+        /// Replace the registry instead of merging it.
+        #[arg(long)]
+        replace: bool,
+        /// Validate and preview the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save now and apply on the next daemon reload.
+        #[arg(long, visible_alias = "no-reload")]
+        defer: bool,
+    },
+    /// List routes from routes.toml.
+    #[command(visible_alias = "ls")]
+    List {
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Remove prefixes or all routes owned by a configured peer/endpoint ID.
+    #[command(visible_alias = "rm")]
+    Remove {
+        #[arg(required = true, value_name = "PREFIX_OR_OWNER")]
+        selectors: Vec<String>,
+        /// Validate and preview the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save now and apply on the next daemon reload.
+        #[arg(long, visible_alias = "no-reload")]
+        defer: bool,
+    },
 }
 
 #[tokio::main]
@@ -242,7 +299,254 @@ async fn main() -> Result<()> {
             identity_file,
         } => restore_identity(&source, &identity_file),
         Command::Doctor => doctor(&config).await,
+        Command::Route { command } => route(&config, &socket, command).await,
     }
+}
+
+async fn route(config_path: &Path, socket_path: &Path, command: RouteCommand) -> Result<()> {
+    let registry_path = Config::route_registry_path_for(config_path).await?;
+    match command {
+        RouteCommand::Add {
+            prefixes,
+            owner,
+            dry_run,
+            defer,
+        } => {
+            let config = Config::load(config_path).await?;
+            let endpoint_id = resolve_route_owner(&config, &owner)?;
+            let previous = RouteRegistry::load(&registry_path).await?;
+            let mut candidate = previous.clone();
+            candidate.merge(RouteRegistry {
+                version: 1,
+                routes: vec![iroh_sdwan::config::RouteOriginConfig {
+                    endpoint_id,
+                    prefixes,
+                }],
+            })?;
+            apply_route_change(
+                config_path,
+                socket_path,
+                &registry_path,
+                previous,
+                candidate,
+                dry_run,
+                defer,
+            )
+            .await
+        }
+        RouteCommand::Import {
+            source,
+            replace,
+            dry_run,
+            defer,
+        } => {
+            let imported = RouteRegistry::import(&source).await?;
+            ensure!(imported.prefix_count() > 0, "route import is empty");
+            let previous = RouteRegistry::load(&registry_path).await?;
+            let mut candidate = if replace {
+                RouteRegistry::default()
+            } else {
+                previous.clone()
+            };
+            candidate.merge(imported)?;
+            apply_route_change(
+                config_path,
+                socket_path,
+                &registry_path,
+                previous,
+                candidate,
+                dry_run,
+                defer,
+            )
+            .await
+        }
+        RouteCommand::List { output } => {
+            let config = Config::load(config_path).await?;
+            let registry = RouteRegistry::load(&registry_path).await?;
+            let entries = registry.flattened();
+            match output {
+                OutputFormat::Human => {
+                    if entries.is_empty() {
+                        println!("No static routes.");
+                        println!("Add one with: iroh-sdwan route add PREFIX --owner PEER");
+                    } else {
+                        println!("{:<22}  {:<20}  ENDPOINT ID", "PREFIX", "OWNER");
+                        for (prefix, endpoint_id) in entries {
+                            let prefix = prefix.to_string();
+                            println!(
+                                "{prefix:<22}  {:<20}  {endpoint_id}",
+                                route_owner_name(&config, endpoint_id).unwrap_or("-")
+                            );
+                        }
+                    }
+                    println!("\nRoute file: {}", registry_path.display());
+                }
+                OutputFormat::Json => {
+                    let entries = entries
+                        .into_iter()
+                        .map(|(prefix, endpoint_id)| {
+                            serde_json::json!({
+                                "prefix": prefix,
+                                "endpoint_id": endpoint_id,
+                                "owner_name": route_owner_name(&config, endpoint_id),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "route_file": registry_path,
+                            "routes": entries,
+                        }))?
+                    );
+                }
+                OutputFormat::Jsonl => {
+                    for (prefix, endpoint_id) in entries {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "prefix": prefix,
+                                "endpoint_id": endpoint_id,
+                                "owner_name": route_owner_name(&config, endpoint_id),
+                            }))?
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        RouteCommand::Remove {
+            selectors,
+            dry_run,
+            defer,
+        } => {
+            let config = Config::load(config_path).await?;
+            let previous = RouteRegistry::load(&registry_path).await?;
+            let mut candidate = previous.clone();
+            for original in &selectors {
+                let selector = normalize_route_selector(&config, original)?;
+                let count = candidate.remove(&selector)?;
+                ensure!(count > 0, "route not found: {original}");
+            }
+            apply_route_change(
+                config_path,
+                socket_path,
+                &registry_path,
+                previous,
+                candidate,
+                dry_run,
+                defer,
+            )
+            .await
+        }
+    }
+}
+
+fn resolve_route_owner(config: &Config, owner: &str) -> Result<EndpointId> {
+    if let Ok(endpoint_id) = owner.parse::<EndpointId>() {
+        return Ok(endpoint_id);
+    }
+    config
+        .peers
+        .iter()
+        .find(|peer| peer.name == owner)
+        .map(|peer| peer.endpoint_id)
+        .with_context(|| {
+            format!("unknown route owner {owner:?}; use a configured peer name or full endpoint ID")
+        })
+}
+
+fn normalize_route_selector(config: &Config, selector: &str) -> Result<String> {
+    if selector.parse::<IpNet>().is_ok() || selector.parse::<EndpointId>().is_ok() {
+        return Ok(selector.to_owned());
+    }
+    Ok(resolve_route_owner(config, selector)?.to_string())
+}
+
+fn route_owner_name(config: &Config, endpoint_id: EndpointId) -> Option<&str> {
+    config
+        .peers
+        .iter()
+        .find(|peer| peer.endpoint_id == endpoint_id)
+        .map(|peer| peer.name.as_str())
+}
+
+async fn apply_route_change(
+    config_path: &Path,
+    socket_path: &Path,
+    registry_path: &Path,
+    previous: RouteRegistry,
+    candidate: RouteRegistry,
+    dry_run: bool,
+    defer: bool,
+) -> Result<()> {
+    validate_route_registry(config_path, &candidate).await?;
+    let before = previous.flattened().into_iter().collect::<HashSet<_>>();
+    let after = candidate.flattened().into_iter().collect::<HashSet<_>>();
+    let added = after.difference(&before).count();
+    let removed = before.difference(&after).count();
+    let unchanged = before.intersection(&after).count();
+
+    if dry_run {
+        println!(
+            "Dry run: would add {added}, remove {removed}, keep {unchanged}; total {}.",
+            after.len()
+        );
+        println!("Route file: {}", registry_path.display());
+        return Ok(());
+    }
+    if added == 0 && removed == 0 {
+        println!("No changes; {} routes already match.", after.len());
+        println!("Route file: {}", registry_path.display());
+        return Ok(());
+    }
+
+    candidate.write(registry_path)?;
+    let reload = match reload_routes(socket_path, defer).await {
+        Ok(reload) => reload,
+        Err(error) => {
+            previous.write(registry_path).context(
+                "daemon rejected routes and the previous registry could not be restored",
+            )?;
+            return Err(error.context("daemon rejected routes; restored the previous registry"));
+        }
+    };
+    println!(
+        "Routes updated: +{added}, -{removed}, unchanged {unchanged}; total {}.",
+        after.len()
+    );
+    println!("Route file: {}", registry_path.display());
+    match reload {
+        RouteReload::Deferred => println!("Apply: deferred until the next daemon reload."),
+        RouteReload::Pending => println!("Apply: pending; the daemon is not running."),
+        RouteReload::Reloaded(generation) => {
+            println!("Applied: daemon reloaded to generation {generation}.")
+        }
+    }
+    Ok(())
+}
+
+async fn validate_route_registry(config_path: &Path, registry: &RouteRegistry) -> Result<()> {
+    let config = Config::load_with_route_origins(config_path, registry.routes.clone()).await?;
+    let secret_key = identity::load(&config.identity_file)?;
+    config.validate_local_id(secret_key.public())
+}
+
+enum RouteReload {
+    Deferred,
+    Pending,
+    Reloaded(u64),
+}
+
+async fn reload_routes(socket_path: &Path, defer: bool) -> Result<RouteReload> {
+    if defer {
+        return Ok(RouteReload::Deferred);
+    }
+    if !socket_path.exists() {
+        return Ok(RouteReload::Pending);
+    }
+    let ack = control::reload(socket_path).await?;
+    Ok(RouteReload::Reloaded(ack.generation))
 }
 
 async fn backup_identity(config_path: &Path, output: &Path) -> Result<()> {
@@ -549,7 +853,8 @@ async fn validate(config_path: &Path) -> Result<()> {
     println!("network_id = {}", config.network_id);
     println!("endpoint_id = {endpoint_id}");
     println!("overlay_table = {}", config.routing.table);
-    println!("route_origins = {}", config.route_origins.len());
+    println!("static_route_owners = {}", config.route_origins.len());
+    println!("route_file = {}", config.route_registry_path().display());
     println!("transit_enabled = {}", config.routing.transit_enabled);
     Ok(())
 }
@@ -722,6 +1027,10 @@ async fn init(
         fec: FecConfig::default(),
         observability: ObservabilityConfig::default(),
     };
+    let route_file = config.route_registry_path();
+    if route_file.exists() {
+        bail!("route registry already exists at {}", route_file.display());
+    }
     config.validate()?;
     let secret_key = identity::load_or_create(&identity_file)?;
     config.validate_local_id(secret_key.public())?;
@@ -737,6 +1046,7 @@ async fn init(
     }
     let encoded = toml::to_string_pretty(&config)?;
     deployment::atomic_write(config_path, encoded.as_bytes(), 0o600)?;
+    RouteRegistry::default().write(&route_file)?;
     deployment::seal(config_path).await?;
     println!("network_id = {}", config.network_id);
     println!("endpoint_id = {}", secret_key.public());
@@ -745,6 +1055,7 @@ async fn init(
         println!("derp_public_key = {key}");
     }
     println!("config = {}", config_path.display());
+    println!("route_file = {}", route_file.display());
     Ok(())
 }
 
@@ -1171,6 +1482,82 @@ mod tests {
             Command::Peers { output } => assert_eq!(output, OutputFormat::Jsonl),
             command => panic!("expected peers command, got {command:?}"),
         }
+    }
+
+    #[test]
+    fn route_subcommands_match_the_operational_cli() {
+        let cli = Cli::try_parse_from([
+            "iroh-sdwan",
+            "route",
+            "import",
+            "site.routes",
+            "--replace",
+            "--no-reload",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Route {
+                command:
+                    RouteCommand::Import {
+                        source,
+                        replace,
+                        dry_run,
+                        defer,
+                    },
+            } => {
+                assert_eq!(source, PathBuf::from("site.routes"));
+                assert!(replace);
+                assert!(!dry_run);
+                assert!(defer);
+            }
+            command => panic!("expected route import, got {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "iroh-sdwan",
+            "route",
+            "remove",
+            "10.0.0.0/24",
+            "10.1.0.0/24",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Route {
+                command: RouteCommand::Remove { selectors, .. },
+            } => assert_eq!(selectors, ["10.0.0.0/24", "10.1.0.0/24"]),
+            command => panic!("expected route remove, got {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "iroh-sdwan",
+            "route",
+            "add",
+            "10.2.0.0/24",
+            "fd42::/64",
+            "--owner",
+            "branch-b",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Route {
+                command:
+                    RouteCommand::Add {
+                        prefixes,
+                        owner,
+                        dry_run,
+                        ..
+                    },
+            } => {
+                assert_eq!(prefixes.len(), 2);
+                assert_eq!(owner, "branch-b");
+                assert!(dry_run);
+            }
+            command => panic!("expected route add, got {command:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["iroh-sdwan", "route", "ls"]).is_ok());
+        assert!(Cli::try_parse_from(["iroh-sdwan", "route", "rm", "10.2.0.0/24"]).is_ok());
     }
 
     #[test]

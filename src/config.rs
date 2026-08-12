@@ -22,37 +22,48 @@ pub struct Config {
     /// remote address of an IP path are covered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_underlay_prefixes: Vec<IpNet>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub discovery_enabled: bool,
-    #[serde(default = "default_tun_mtu")]
+    #[serde(
+        default = "default_tun_mtu",
+        skip_serializing_if = "is_default_tun_mtu"
+    )]
     pub tun_mtu: u16,
-    #[serde(default = "default_max_frame_size")]
+    #[serde(
+        default = "default_max_frame_size",
+        skip_serializing_if = "is_default_max_frame_size"
+    )]
     pub max_frame_size: u16,
-    #[serde(default = "default_node_interface")]
+    #[serde(
+        default = "default_node_interface",
+        skip_serializing_if = "is_default_node_interface"
+    )]
     pub node_interface: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_addresses: Vec<IpNet>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advertised_prefixes: Vec<IpNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_info: Option<NodeInfo>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub relay: RelayConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Resolved static routes. New configurations keep these in the sibling
+    /// routes.toml registry; deserializing this field remains migration-only.
+    #[serde(default, skip_serializing)]
     pub route_origins: Vec<RouteOriginConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub routing: RoutingConfig,
     /// Opportunistic peer discovery and bounded direct-mesh policy. Normal
     /// deployments only need the defaults; configured peers remain pinned.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub mesh: MeshConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub packet_policy: PacketPolicyConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub fec: FecConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub observability: ObservabilityConfig,
 }
 
@@ -95,18 +106,18 @@ pub struct PeerConfig {
     pub name: String,
     pub endpoint_id: EndpointId,
     /// Whether this peer may be used as a next hop for prefixes it does not own.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub transit_enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_addresses: Vec<SocketAddr>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_urls: Vec<String>,
     /// X25519 public key used to address this peer on DERP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derp_public_key: Option<DerpPublicKey>,
     /// Overlay source prefixes this adjacency may deliver, including prefixes
     /// legitimately transited by this Peer.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_source_prefixes: Vec<IpNet>,
 }
 
@@ -117,22 +128,28 @@ pub struct RouteOriginConfig {
     pub prefixes: Vec<IpNet>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub isolate_overlay: bool,
     /// Permit packets received from one Overlay Peer to be forwarded to
     /// another Overlay Peer. Peer-to-local-node and Peer-to-LAN forwarding is
     /// independent of this setting.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub transit_enabled: bool,
-    #[serde(default = "default_rule_priority")]
+    #[serde(
+        default = "default_rule_priority",
+        skip_serializing_if = "is_default_rule_priority"
+    )]
     pub rule_priority: u32,
     /// Dedicated Linux policy-routing table owned by FlowRouter.
-    #[serde(default = "default_routing_table")]
+    #[serde(
+        default = "default_routing_table",
+        skip_serializing_if = "is_default_routing_table"
+    )]
     pub table: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_default_routes: bool,
     /// Optional local policy cap for this node's single overlay egress. This
     /// is never advertised to peers and is not a capacity measurement.
@@ -140,16 +157,19 @@ pub struct RoutingConfig {
     pub max_egress_mbps: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     /// Exchange signed node presence through authenticated peers and establish
     /// a bounded number of useful direct adjacencies.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     /// Hard limit for configured and automatically selected peer adjacencies
     /// combined. Presence records do not consume an adjacency slot.
-    #[serde(default = "default_mesh_max_peers")]
+    #[serde(
+        default = "default_mesh_max_peers",
+        skip_serializing_if = "is_default_mesh_max_peers"
+    )]
     pub max_peers: usize,
 }
 
@@ -182,10 +202,10 @@ impl RoutingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacketPolicyConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enforce_overlay_prefixes: bool,
 }
 
@@ -197,18 +217,30 @@ impl Default for PacketPolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FecConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
-    #[serde(default = "default_fec_data_shards")]
+    #[serde(
+        default = "default_fec_data_shards",
+        skip_serializing_if = "is_default_fec_data_shards"
+    )]
     pub data_shards: u8,
-    #[serde(default = "default_fec_recovery_shards")]
+    #[serde(
+        default = "default_fec_recovery_shards",
+        skip_serializing_if = "is_default_fec_recovery_shards"
+    )]
     pub recovery_shards: u8,
-    #[serde(default = "default_fec_block_timeout")]
+    #[serde(
+        default = "default_fec_block_timeout",
+        skip_serializing_if = "is_default_fec_block_timeout"
+    )]
     pub block_timeout_millis: u64,
-    #[serde(default = "default_fec_decoder_ttl")]
+    #[serde(
+        default = "default_fec_decoder_ttl",
+        skip_serializing_if = "is_default_fec_decoder_ttl"
+    )]
     pub decoder_ttl_millis: u64,
 }
 
@@ -224,14 +256,23 @@ impl Default for FecConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    #[serde(default = "default_status_file")]
+    #[serde(
+        default = "default_status_file",
+        skip_serializing_if = "is_default_status_file"
+    )]
     pub status_file: PathBuf,
-    #[serde(default = "default_metrics_file")]
+    #[serde(
+        default = "default_metrics_file",
+        skip_serializing_if = "is_default_metrics_file"
+    )]
     pub metrics_file: PathBuf,
-    #[serde(default = "default_report_interval")]
+    #[serde(
+        default = "default_report_interval",
+        skip_serializing_if = "is_default_report_interval"
+    )]
     pub report_interval_secs: u64,
 }
 
@@ -261,21 +302,64 @@ impl Config {
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
         verify_config_digest(path, raw.as_bytes()).await?;
-        Self::parse(path, &raw)
+        let config = Self::decode(path, &raw)?;
+        let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
+        Self::resolve_routes(config, routes.routes)
     }
 
     pub async fn load_unsealed(path: &Path) -> Result<Self> {
         let raw = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
-        Self::parse(path, &raw)
+        let config = Self::decode(path, &raw)?;
+        let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
+        Self::resolve_routes(config, routes.routes)
     }
 
-    fn parse(path: &Path, raw: &str) -> Result<Self> {
-        let config: Self =
-            toml::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    /// Load a sealed main configuration against an in-memory candidate route
+    /// registry. Route CLI mutations use this before replacing routes.toml.
+    pub async fn load_with_route_origins(
+        path: &Path,
+        route_origins: Vec<RouteOriginConfig>,
+    ) -> Result<Self> {
+        let raw = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        verify_config_digest(path, raw.as_bytes()).await?;
+        let config = Self::decode(path, &raw)?;
+        Self::resolve_routes(config, route_origins)
+    }
+
+    /// Resolve the mutable route registry from a sealed main configuration
+    /// without requiring the current registry contents to be valid.
+    pub async fn route_registry_path_for(path: &Path) -> Result<PathBuf> {
+        let raw = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        verify_config_digest(path, raw.as_bytes()).await?;
+        Ok(Self::decode(path, &raw)?.route_registry_path())
+    }
+
+    fn decode(path: &Path, raw: &str) -> Result<Self> {
+        toml::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    fn resolve_routes(mut config: Self, external_routes: Vec<RouteOriginConfig>) -> Result<Self> {
+        if !external_routes.is_empty() {
+            let mut combined = crate::routes::RouteRegistry {
+                version: 1,
+                routes: std::mem::take(&mut config.route_origins),
+            };
+            combined.routes.extend(external_routes);
+            combined.normalize()?;
+            config.route_origins = combined.routes;
+        }
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn route_registry_path(&self) -> PathBuf {
+        crate::routes::registry_path(&self.identity_file)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -399,7 +483,7 @@ impl Config {
                 || self.mesh.enabled
                 || self.peers.is_empty()
                 || !self.route_origins.is_empty(),
-            "packet source enforcement requires mesh discovery or at least one [[route_origins]] entry"
+            "packet source enforcement requires mesh discovery or at least one imported static route"
         );
 
         let mut origin_ids = HashSet::new();
@@ -626,7 +710,7 @@ impl Config {
             .iter()
             .any(|origin| origin.endpoint_id == local_id)
         {
-            bail!("route_origins contains this node's own endpoint ID");
+            bail!("static route registry contains this node's own endpoint ID");
         }
         Ok(())
     }
@@ -721,53 +805,113 @@ fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
+}
+
 fn default_tun_mtu() -> u16 {
     u16::MAX
+}
+
+fn is_default_tun_mtu(value: &u16) -> bool {
+    *value == default_tun_mtu()
 }
 
 fn default_max_frame_size() -> u16 {
     1400
 }
 
+fn is_default_max_frame_size(value: &u16) -> bool {
+    *value == default_max_frame_size()
+}
+
 fn default_node_interface() -> String {
     "isw0".into()
+}
+
+fn is_default_node_interface(value: &str) -> bool {
+    value == default_node_interface()
 }
 
 fn default_routing_table() -> u32 {
     100
 }
 
+fn is_default_routing_table(value: &u32) -> bool {
+    *value == default_routing_table()
+}
+
 fn default_rule_priority() -> u32 {
     10_000
+}
+
+fn is_default_rule_priority(value: &u32) -> bool {
+    *value == default_rule_priority()
 }
 
 fn default_status_file() -> PathBuf {
     "/run/iroh-sdwan/status.json".into()
 }
 
+fn is_default_status_file(value: &Path) -> bool {
+    value == default_status_file()
+}
+
 fn default_metrics_file() -> PathBuf {
     "/run/iroh-sdwan/metrics.prom".into()
+}
+
+fn is_default_metrics_file(value: &Path) -> bool {
+    value == default_metrics_file()
 }
 
 fn default_report_interval() -> u64 {
     10
 }
 
+fn is_default_report_interval(value: &u64) -> bool {
+    *value == default_report_interval()
+}
+
 fn default_mesh_max_peers() -> usize {
     12
+}
+
+fn is_default_mesh_max_peers(value: &usize) -> bool {
+    *value == default_mesh_max_peers()
 }
 
 fn default_fec_data_shards() -> u8 {
     8
 }
+fn is_default_fec_data_shards(value: &u8) -> bool {
+    *value == default_fec_data_shards()
+}
 fn default_fec_recovery_shards() -> u8 {
     2
+}
+fn is_default_fec_recovery_shards(value: &u8) -> bool {
+    *value == default_fec_recovery_shards()
 }
 fn default_fec_block_timeout() -> u64 {
     20
 }
+fn is_default_fec_block_timeout(value: &u64) -> bool {
+    *value == default_fec_block_timeout()
+}
 fn default_fec_decoder_ttl() -> u64 {
     2_000
+}
+fn is_default_fec_decoder_ttl(value: &u64) -> bool {
+    *value == default_fec_decoder_ttl()
 }
 
 fn validate_overlay_prefix(prefix: IpNet, allow_default_routes: bool) -> Result<()> {
@@ -873,6 +1017,56 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.relay, RelayConfig::default());
         assert!(!config.routing.transit_enabled);
+    }
+
+    #[test]
+    fn default_sections_and_resolved_routes_are_omitted_when_serializing() {
+        let remote = SecretKey::from_bytes(&[31; 32]).public();
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.node_info = None;
+        config.route_origins = vec![RouteOriginConfig {
+            endpoint_id: remote,
+            prefixes: vec!["10.31.0.0/16".parse().unwrap()],
+        }];
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert!(!encoded.contains("route_origins"));
+        assert!(!encoded.contains("[routing]"));
+        assert!(!encoded.contains("[mesh]"));
+        assert!(!encoded.contains("[packet_policy]"));
+        assert!(!encoded.contains("[fec]"));
+        assert!(!encoded.contains("[observability]"));
+    }
+
+    #[tokio::test]
+    async fn sealed_config_loads_state_route_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut source: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        source.identity_file = dir.path().join("state/identity.key");
+        let contents = toml::to_string_pretty(&source).unwrap().into_bytes();
+        std::fs::write(&config_path, &contents).unwrap();
+        std::fs::write(
+            config_digest_path(&config_path),
+            format!("{}\n", blake3::hash(&contents).to_hex()),
+        )
+        .unwrap();
+        let remote = SecretKey::from_bytes(&[32; 32]).public();
+        crate::routes::RouteRegistry {
+            version: 1,
+            routes: vec![RouteOriginConfig {
+                endpoint_id: remote,
+                prefixes: vec!["10.32.0.0/16".parse().unwrap()],
+            }],
+        }
+        .write(&source.route_registry_path())
+        .unwrap();
+
+        let config = Config::load(&config_path).await.unwrap();
+        assert_eq!(config.route_origins.len(), 1);
+        assert_eq!(
+            config.all_remote_prefixes().collect::<Vec<_>>(),
+            vec!["10.32.0.0/16".parse().unwrap()]
+        );
     }
 
     #[test]
@@ -1208,11 +1402,13 @@ mod tests {
     async fn detects_configuration_tampering() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let contents = include_bytes!("../config/example.toml");
-        std::fs::write(&path, contents).unwrap();
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.identity_file = dir.path().join("state/identity.key");
+        let contents = toml::to_string_pretty(&config).unwrap().into_bytes();
+        std::fs::write(&path, &contents).unwrap();
         std::fs::write(
             config_digest_path(&path),
-            format!("{}\n", blake3::hash(contents).to_hex()),
+            format!("{}\n", blake3::hash(&contents).to_hex()),
         )
         .unwrap();
         Config::load(&path).await.unwrap();

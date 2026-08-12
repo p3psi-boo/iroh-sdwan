@@ -98,8 +98,5 @@ report_interval_secs = 10
 # 和中转能力。
 # allowed_source_prefixes = ["21.0.0.2/32", "21::2/128"]
 
-# 仅静态模式（`mesh.enabled = false`）可显式声明每个远端所有者
-# 和每个邻接允许的源前缀。
-# [[route_origins]]
-# endpoint_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
-# prefixes = ["21.0.0.2/32", "21::2/128", "192.168.20.0/24"]
+# 静态远端路由不写入本文件。使用 `iroh-sdwan route add/import` 管理
+# identity_file 同目录的 routes.toml；`route list/remove` 可查询和删除。

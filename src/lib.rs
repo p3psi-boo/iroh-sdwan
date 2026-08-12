@@ -17,6 +17,7 @@ pub mod mesh;
 pub mod observability;
 pub mod packet;
 pub mod path_selection;
+pub mod routes;
 pub mod runtime;
 pub mod system;
 pub mod top;

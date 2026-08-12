@@ -95,8 +95,17 @@ sudo iroh-sdwan peers
 sudo iroh-sdwan top
 sudo iroh-sdwan ping 21.0.0.3
 sudo iroh-sdwan trace 21.0.0.3
+sudo iroh-sdwan route add 192.168.30.0/24 --owner branch-c
+sudo iroh-sdwan route import ./site-routes.txt
+sudo iroh-sdwan route list
+sudo iroh-sdwan route remove 192.168.30.0/24
 sudo iroh-sdwan reload
 ```
+
+静态远端路由由 CLI 原子写入 `identity_file` 同目录的 `routes.toml`（默认
+`/var/lib/iroh-sdwan/routes.toml`），不会混入或重写 `config.toml`。导入和删除
+在守护进程运行时会自动 reload；`--dry-run` 可预览，维护窗口可加 `--defer`
+延后应用。
 
 `status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`top` 从守护进程的内存快照读取实时状态；按 `j`/`k` 选择 peer，`s` 切换排序，`c` 筛选已连接 peer，`p` 暂停，`r` 刷新，`q` 退出。
 
