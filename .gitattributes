@@ -1,0 +1,8 @@
+# 统一文本文件的换行符，二进制发布物不参与文本转换。
+* text=auto eol=lf
+
+*.deb binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

@@ -1,0 +1,102 @@
+# `iroh-sdwan init` 输出的共享网络加入密钥。所有节点使用同一值，
+# 不要将其提交到公开配置仓库。
+network_id = "REPLACE_WITH_RANDOM_NETWORK_ID"
+identity_file = "/var/lib/iroh-sdwan/identity.key"
+# 可选的固定 iroh UDP 监听地址，适用于静态直连地址部署。
+# bind_addresses = ["0.0.0.0:4000"]
+# 当直连底层路径任一端点落入这些前缀时拒绝该路径。
+# Yggdrasil 使用 200::/7；配置非 Ygg 路径或 relay 后可取消下一行注释。
+# forbidden_underlay_prefixes = ["200::/7"]
+# 所有 peer 都有固定直连地址且不需要外部发现时，设为 false。
+discovery_enabled = true
+# 这是虚拟接口自动调整的上限，不是启动 MTU 或底层 MTU。接口从 1280
+# 起步，只会在持续稳定的 LAN 路径上升高；遇到 WAN RTT、丢包或队列过期时
+# 回到 1280。
+tun_mtu = 65535
+# 自动帧大小的安全上限。QUIC 从 1400 字节 UDP 负载开始；检测到 MTU 黑洞时，
+# 自动回退到 1200 字节的安全下限。
+max_frame_size = 1400
+node_interface = "isw0"
+
+# 配置到 isw0 虚拟接口的稳定节点/管理地址。
+node_addresses = [
+  "21.0.0.1/32",
+  "21::1/128",
+]
+
+# 由当前路由器发布的 LAN 或服务前缀。
+advertised_prefixes = [
+  "192.168.10.0/24",
+]
+
+# 容量按（目的所有者，首跳）测量；节点不声明上下行带宽。
+# 内置覆盖 trace 协议返回的元数据。trace 地址必须同时出现在 node_addresses 中，
+# CLI 会输出任意元数据。
+[node_info]
+name = "branch-a"
+ipv4 = "21.0.0.1"
+ipv6 = "21::1"
+description = "Example branch router"
+
+[node_info.metadata]
+site = "example-site"
+
+[relay]
+mode = "default"
+
+[routing]
+isolate_overlay = true
+# 允许在覆盖 peer 之间转发。它不控制 peer 访问本节点，
+# 也不控制 peer 访问本节点发布的 LAN/服务前缀。
+transit_enabled = false
+rule_priority = 10000
+table = 100
+allow_default_routes = false
+# 可选的仅本机策略上限，不会通过 Presence 传播。
+# max_egress_mbps = 80
+
+# 从配置的引导 peer 学到的签名 Presence 会填充节点目录。已配置和自动
+# 建立的活动邻接总数不超过 max_peers；其余条目仅保留为低成本目录记录，
+# 并按直连可达性、RTT EWMA、丢包、稳定性和路径多样性筛选。
+[mesh]
+enabled = true
+max_peers = 12
+
+[packet_policy]
+enforce_overlay_prefixes = true
+
+# 可选的系统化 Reed-Solomon 数据报保护。即使本端发送 FEC 已关闭，
+# 接收端也可以解析该封装。
+[fec]
+enabled = false
+data_shards = 8
+recovery_shards = 2
+block_timeout_millis = 20
+decoder_ttl_millis = 2000
+
+[observability]
+status_file = "/run/iroh-sdwan/status.json"
+metrics_file = "/run/iroh-sdwan/metrics.prom"
+report_interval_secs = 10
+
+# 只添加引导/固定邻居（例如一个或两个公共节点）。其他成员通过签名
+# Presence gossip 学习，并可能自动成为受限数量的直连 mesh 邻居。
+#
+# [[peers]]
+# name = "branch-b"
+# endpoint_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
+# mesh 开启时，签名 Presence 提供动态前缀和中转信息。
+# transit_enabled = false
+# relay_urls = ["https://relay-a.example.com", "https://relay-b.example.com"]
+# 当 [relay].mode = "derp" 时，设置该 peer 单独生成的 DERP 密钥：
+# derp_public_key = "REPLACE_WITH_64_HEX_DERP_PUBLIC_KEY"
+# direct_addresses = ["203.0.113.10:4433"]
+# mesh 开启时此静态源清单可省略：远端签名 Presence 会携带所有者前缀
+# 和中转能力。
+# allowed_source_prefixes = ["21.0.0.2/32", "21::2/128"]
+
+# 仅静态模式（`mesh.enabled = false`）可显式声明每个远端所有者
+# 和每个邻接允许的源前缀。
+# [[route_origins]]
+# endpoint_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
+# prefixes = ["21.0.0.2/32", "21::2/128", "192.168.20.0/24"]

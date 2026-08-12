@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: docker
+    steps:
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl dpkg-dev file musl-tools pkg-config python3 systemd
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+            https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >>"$FORGEJO_PATH"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.91.0 \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --target x86_64-unknown-linux-musl
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check documentation links
+        run: python3 scripts/check-doc-links.py
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build static musl Debian package
+        run: scripts/build-deb.sh
+
+      - name: Verify package and binary
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+          for binary in iroh-sdwan iroh-sdwand; do
+            file "target/x86_64-unknown-linux-musl/release/$binary"
+            if readelf -l "target/x86_64-unknown-linux-musl/release/$binary" \
+              | grep -q 'Requesting program interpreter'; then
+              echo "$binary is dynamically linked" >&2
+              exit 1
+            fi
+          done
+          sha256sum dist/*.deb >dist/SHA256SUMS
+
+      - name: Test package layout, permissions, and systemd unit
+        run: tests/deployment/package.sh dist/*.deb
+
+      - name: Upload CI artifacts
+        uses: https://data.forgejo.org/actions/upload-artifact@v4
+        with:
+          name: iroh-sdwan-musl-deb
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  integration-netns:
+    runs-on: netns
+    steps:
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Verify privileged runner prerequisites
+        run: |
+          test -c /dev/net/tun
+          docker info >/dev/null
+
+      - name: Run all Linux network-namespace scenarios
+        env:
+          SOAK_SECONDS: 60
+        run: tests/netns/run-all.sh

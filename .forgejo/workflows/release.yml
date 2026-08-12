@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: docker
+    steps:
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install build and release dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl dpkg-dev file jq musl-tools pkg-config
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+            https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >>"$FORGEJO_PATH"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.91.0 \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --target x86_64-unknown-linux-musl
+
+      - name: Verify, test, and lint
+        run: |
+          test "$FORGEJO_REF_NAME" = "v$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          cargo fmt --check
+          python3 scripts/check-doc-links.py
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build static musl Debian package
+        run: |
+          scripts/build-deb.sh
+          sha256sum dist/*.deb >dist/SHA256SUMS
+
+      - name: Verify package and binary
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+          for binary in iroh-sdwan iroh-sdwand; do
+            file "target/x86_64-unknown-linux-musl/release/$binary"
+            if readelf -l "target/x86_64-unknown-linux-musl/release/$binary" \
+              | grep -q 'Requesting program interpreter'; then
+              echo "$binary is dynamically linked" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload workflow artifacts
+        uses: https://data.forgejo.org/actions/upload-artifact@v4
+        with:
+          name: iroh-sdwan-${{ forgejo.ref_name }}-musl-deb
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish Forgejo release
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: scripts/publish-forgejo-release.sh dist/*.deb dist/SHA256SUMS

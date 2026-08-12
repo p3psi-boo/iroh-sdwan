@@ -1,0 +1,1277 @@
+use std::{
+    io,
+    net::IpAddr,
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
+    sync::{Semaphore, mpsc, oneshot, watch},
+    time,
+};
+use tracing::{info, warn};
+
+use crate::{
+    config::Config,
+    observability::{PeerStatus, RuntimeStatus, read_status},
+    trace::{self, PingResult, PingSample, TraceHop, TraceResult},
+};
+
+pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/iroh-sdwan/control.sock";
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTROL_CONNECTIONS: usize = 64;
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TRACE_HOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadAck {
+    pub generation: u64,
+    pub endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: String,
+    pub message: String,
+}
+
+impl RpcError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+pub enum DaemonCommand {
+    Reload {
+        reply: oneshot::Sender<std::result::Result<ReloadAck, RpcError>>,
+    },
+    #[doc(hidden)]
+    Stop { reply: oneshot::Sender<()> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Request {
+    version: u16,
+    id: u64,
+    #[serde(flatten)]
+    method: Method,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+enum Method {
+    Snapshot,
+    Status,
+    Peers,
+    Health,
+    Ping {
+        target: IpAddr,
+        count: u16,
+        timeout_ms: u64,
+    },
+    Trace {
+        target: IpAddr,
+        max_hops: u8,
+        timeout_ms: u64,
+    },
+    Reload,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum ServerMessage {
+    Result {
+        version: u16,
+        id: u64,
+        result: Value,
+    },
+    Error {
+        version: u16,
+        id: u64,
+        error: RpcError,
+    },
+    PingSample {
+        version: u16,
+        id: u64,
+        sample: PingSample,
+    },
+    PingDone {
+        version: u16,
+        id: u64,
+        result: PingResult,
+    },
+    TraceHop {
+        version: u16,
+        id: u64,
+        hop: TraceHop,
+    },
+    TraceDone {
+        version: u16,
+        id: u64,
+        result: TraceResult,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerIdentity {
+    pid: Option<i32>,
+    uid: u32,
+    gid: u32,
+}
+
+pub async fn bind(path: &Path) -> Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed creating control directory {}", parent.display()))?;
+    }
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_socket(),
+                "refusing to replace non-socket control path {}",
+                path.display()
+            );
+            tokio::fs::remove_file(path)
+                .await
+                .with_context(|| format!("failed removing stale socket {}", path.display()))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed inspecting control socket {}", path.display()));
+        }
+    }
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("failed binding control socket {}", path.display()))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .await
+        .with_context(|| format!("failed setting control socket mode on {}", path.display()))?;
+    Ok(listener)
+}
+
+pub async fn serve(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    active_config: watch::Receiver<Config>,
+    command_tx: mpsc::Sender<DaemonCommand>,
+    runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+) -> Result<()> {
+    let owner_uid = tokio::fs::metadata(&socket_path)
+        .await
+        .with_context(|| format!("failed reading metadata for {}", socket_path.display()))?
+        .uid();
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    info!(socket = %socket_path.display(), mode = "0660", "control socket ready");
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed accepting control connection")?;
+        let slot = connection_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("control connection limiter closed")?;
+        let credentials = stream
+            .peer_cred()
+            .context("failed reading Unix peer credentials")?;
+        let peer = PeerIdentity {
+            pid: credentials.pid(),
+            uid: credentials.uid(),
+            gid: credentials.gid(),
+        };
+        let active_config = active_config.clone();
+        let command_tx = command_tx.clone();
+        let runtime_state = runtime_state.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            if let Err(error) = handle_connection(
+                stream,
+                peer,
+                owner_uid,
+                active_config,
+                command_tx,
+                runtime_state,
+            )
+            .await
+            {
+                warn!(
+                    peer_pid = ?peer.pid,
+                    peer_uid = peer.uid,
+                    peer_gid = peer.gid,
+                    %error,
+                    "control request failed"
+                );
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    stream: UnixStream,
+    peer: PeerIdentity,
+    owner_uid: u32,
+    active_config: watch::Receiver<Config>,
+    command_tx: mpsc::Sender<DaemonCommand>,
+    runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let line = time::timeout(
+        REQUEST_READ_TIMEOUT,
+        read_bounded_line(&mut reader, MAX_REQUEST_BYTES),
+    )
+    .await
+    .context("timed out reading control request")??;
+    ensure!(!line.is_empty(), "empty control request");
+    let request: Request = match serde_json::from_slice(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(
+                &mut writer,
+                0,
+                RpcError::new("invalid_request", format!("invalid JSON request: {error}")),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if request.version != CONTROL_PROTOCOL_VERSION {
+        send_error(
+            &mut writer,
+            request.id,
+            RpcError::new(
+                "unsupported_version",
+                format!(
+                    "control protocol {} is unsupported; expected {}",
+                    request.version, CONTROL_PROTOCOL_VERSION
+                ),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    info!(
+        peer_pid = ?peer.pid,
+        peer_uid = peer.uid,
+        peer_gid = peer.gid,
+        request_id = request.id,
+        method = method_name(&request.method),
+        "control request"
+    );
+    match request.method {
+        Method::Snapshot => {
+            let state = runtime_state.borrow().clone();
+            match state {
+                Some(state) => match state.live_snapshot().await {
+                    Ok(status) => send_result(&mut writer, request.id, &status).await?,
+                    Err(error) => {
+                        send_error(
+                            &mut writer,
+                            request.id,
+                            RpcError::new("snapshot_failed", error.to_string()),
+                        )
+                        .await?
+                    }
+                },
+                None => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("runtime_unavailable", "data plane is not active"),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Status => {
+            let config = active_config.borrow().clone();
+            match load_status(&config).await {
+                Ok(status) => send_result(&mut writer, request.id, &status).await?,
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("status_unavailable", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Peers => {
+            let config = active_config.borrow().clone();
+            match load_status(&config).await {
+                Ok(status) => send_result(&mut writer, request.id, &status.peers).await?,
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("status_unavailable", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Health => {
+            let config = active_config.borrow().clone();
+            match load_status(&config).await {
+                Ok(status) => match ensure_healthy(&config, &status) {
+                    Ok(()) => send_result(&mut writer, request.id, &status).await?,
+                    Err(error) => {
+                        send_error(
+                            &mut writer,
+                            request.id,
+                            RpcError::new("unhealthy", error.to_string()),
+                        )
+                        .await?
+                    }
+                },
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("status_unavailable", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Ping {
+            target,
+            count,
+            timeout_ms,
+        } => {
+            let timeout = Duration::from_millis(timeout_ms);
+            if !(1..=trace::MAX_PING_COUNT).contains(&count)
+                || timeout.is_zero()
+                || timeout > MAX_TRACE_HOP_TIMEOUT
+            {
+                send_error(
+                    &mut writer,
+                    request.id,
+                    RpcError::new(
+                        "invalid_params",
+                        format!(
+                            "ping requires 1-{} probes and a timeout of 1-60000 ms",
+                            trace::MAX_PING_COUNT
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let config = active_config.borrow().clone();
+            let (sample_tx, mut sample_rx) = mpsc::channel(1);
+            let ping_task = tokio::spawn(async move {
+                trace::ping_streaming(&config, target, count, timeout, Some(sample_tx)).await
+            });
+            while let Some(sample) = sample_rx.recv().await {
+                if let Err(error) = send_message(
+                    &mut writer,
+                    &ServerMessage::PingSample {
+                        version: CONTROL_PROTOCOL_VERSION,
+                        id: request.id,
+                        sample,
+                    },
+                )
+                .await
+                {
+                    ping_task.abort();
+                    let _ = ping_task.await;
+                    return Err(error);
+                }
+            }
+            match ping_task.await.context("ping task panicked")? {
+                Ok(result) => {
+                    send_message(
+                        &mut writer,
+                        &ServerMessage::PingDone {
+                            version: CONTROL_PROTOCOL_VERSION,
+                            id: request.id,
+                            result,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("ping_failed", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Trace {
+            target,
+            max_hops,
+            timeout_ms,
+        } => {
+            let timeout = Duration::from_millis(timeout_ms);
+            if max_hops == 0 || timeout.is_zero() || timeout > MAX_TRACE_HOP_TIMEOUT {
+                send_error(
+                    &mut writer,
+                    request.id,
+                    RpcError::new(
+                        "invalid_params",
+                        "trace requires 1-255 hops and a per-hop timeout of 1-60000 ms",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let config = active_config.borrow().clone();
+            let (hop_tx, mut hop_rx) = mpsc::channel(1);
+            let trace_task = tokio::spawn(async move {
+                trace::run_streaming(&config, target, max_hops, timeout, Some(hop_tx)).await
+            });
+            while let Some(hop) = hop_rx.recv().await {
+                send_message(
+                    &mut writer,
+                    &ServerMessage::TraceHop {
+                        version: CONTROL_PROTOCOL_VERSION,
+                        id: request.id,
+                        hop,
+                    },
+                )
+                .await?;
+            }
+            match trace_task.await.context("trace task panicked")? {
+                Ok(result) => {
+                    send_message(
+                        &mut writer,
+                        &ServerMessage::TraceDone {
+                            version: CONTROL_PROTOCOL_VERSION,
+                            id: request.id,
+                            result,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("trace_failed", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::Reload => {
+            if peer.uid != 0 && peer.uid != owner_uid {
+                send_error(
+                    &mut writer,
+                    request.id,
+                    RpcError::new(
+                        "permission_denied",
+                        "reload requires root or the daemon service user",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let (reply, response) = oneshot::channel();
+            command_tx
+                .send(DaemonCommand::Reload { reply })
+                .await
+                .map_err(|_| anyhow::anyhow!("daemon supervisor stopped"))?;
+            match response.await.context("daemon dropped reload response")? {
+                Ok(ack) => send_result(&mut writer, request.id, &ack).await?,
+                Err(error) => send_error(&mut writer, request.id, error).await?,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn method_name(method: &Method) -> &'static str {
+    match method {
+        Method::Snapshot => "snapshot",
+        Method::Status => "status",
+        Method::Peers => "peers",
+        Method::Health => "health",
+        Method::Ping { .. } => "ping",
+        Method::Trace { .. } => "trace",
+        Method::Reload => "reload",
+    }
+}
+
+async fn load_status(config: &Config) -> Result<RuntimeStatus> {
+    read_status(&config.observability.status_file).await
+}
+
+pub fn ensure_healthy(config: &Config, status: &RuntimeStatus) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let maximum_age = config.observability.report_interval_secs * 3 + 5;
+    ensure!(
+        now.saturating_sub(status.updated_unix) <= maximum_age,
+        "runtime status is stale"
+    );
+    ensure!(status.ready, "runtime is not ready");
+    Ok(())
+}
+
+async fn send_result<T: Serialize>(writer: &mut OwnedWriteHalf, id: u64, result: &T) -> Result<()> {
+    send_message(
+        writer,
+        &ServerMessage::Result {
+            version: CONTROL_PROTOCOL_VERSION,
+            id,
+            result: serde_json::to_value(result)?,
+        },
+    )
+    .await
+}
+
+async fn send_error(writer: &mut OwnedWriteHalf, id: u64, error: RpcError) -> Result<()> {
+    send_message(
+        writer,
+        &ServerMessage::Error {
+            version: CONTROL_PROTOCOL_VERSION,
+            id,
+            error,
+        },
+    )
+    .await
+}
+
+async fn send_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &ServerMessage,
+) -> Result<()> {
+    let mut encoded = serde_json::to_vec(message).context("failed encoding control response")?;
+    ensure!(
+        encoded.len() <= MAX_RESPONSE_BYTES,
+        "control response exceeds {MAX_RESPONSE_BYTES} bytes"
+    );
+    encoded.push(b'\n');
+    writer
+        .write_all(&encoded)
+        .await
+        .context("failed writing control response")
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let (take, finished) = {
+            let available = reader
+                .fill_buf()
+                .await
+                .context("failed reading control message")?;
+            if available.is_empty() {
+                return Ok(line);
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            ensure!(
+                line.len() + take <= maximum,
+                "control message exceeds {maximum} bytes"
+            );
+            line.extend_from_slice(&available[..take]);
+            (take, available[take - 1] == b'\n')
+        };
+        reader.consume(take);
+        if finished {
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            return Ok(line);
+        }
+    }
+}
+
+fn request_id() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ (u64::from(std::process::id()) << 32)
+}
+
+async fn connect(
+    path: &Path,
+    method: Method,
+) -> Result<(u64, BufReader<tokio::net::unix::OwnedReadHalf>)> {
+    let stream = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("failed connecting to daemon socket {}", path.display()))?;
+    let id = request_id();
+    let request = Request {
+        version: CONTROL_PROTOCOL_VERSION,
+        id,
+        method,
+    };
+    let mut encoded = serde_json::to_vec(&request)?;
+    ensure!(
+        encoded.len() <= MAX_REQUEST_BYTES,
+        "control request is too large"
+    );
+    encoded.push(b'\n');
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(&encoded)
+        .await
+        .context("failed writing control request")?;
+    writer
+        .shutdown()
+        .await
+        .context("failed closing control request")?;
+    Ok((id, BufReader::new(reader)))
+}
+
+async fn request_result<T: DeserializeOwned>(path: &Path, method: Method) -> Result<T> {
+    let (id, mut reader) = connect(path, method).await?;
+    let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
+    ensure!(
+        !line.is_empty(),
+        "daemon closed the control connection without a response"
+    );
+    let message: ServerMessage =
+        serde_json::from_slice(&line).context("failed parsing daemon response")?;
+    match message {
+        ServerMessage::Result {
+            version,
+            id: response_id,
+            result,
+        } => {
+            validate_response(version, id, response_id)?;
+            serde_json::from_value(result).context("failed decoding daemon result")
+        }
+        ServerMessage::Error {
+            version,
+            id: response_id,
+            error,
+        } => {
+            validate_response(version, id, response_id)?;
+            bail!("daemon {}: {}", error.code, error.message);
+        }
+        ServerMessage::PingSample { .. }
+        | ServerMessage::PingDone { .. }
+        | ServerMessage::TraceHop { .. }
+        | ServerMessage::TraceDone { .. } => {
+            bail!("daemon returned a streaming event for a non-streaming request")
+        }
+    }
+}
+
+fn validate_response(version: u16, expected_id: u64, actual_id: u64) -> Result<()> {
+    ensure!(
+        version == CONTROL_PROTOCOL_VERSION,
+        "daemon returned unsupported control protocol {version}"
+    );
+    ensure!(
+        expected_id == actual_id,
+        "daemon response ID mismatch: expected {expected_id}, got {actual_id}"
+    );
+    Ok(())
+}
+
+pub async fn status(path: &Path) -> Result<RuntimeStatus> {
+    request_result(path, Method::Status).await
+}
+
+pub async fn snapshot(path: &Path) -> Result<RuntimeStatus> {
+    request_result(path, Method::Snapshot).await
+}
+
+pub async fn peers(path: &Path) -> Result<Vec<PeerStatus>> {
+    request_result(path, Method::Peers).await
+}
+
+pub async fn health(path: &Path) -> Result<RuntimeStatus> {
+    request_result(path, Method::Health).await
+}
+
+pub async fn reload(path: &Path) -> Result<ReloadAck> {
+    request_result(path, Method::Reload).await
+}
+
+pub async fn ping(
+    path: &Path,
+    target: IpAddr,
+    count: u16,
+    timeout: Duration,
+) -> Result<PingResult> {
+    ping_with(path, target, count, timeout, |_| Ok(())).await
+}
+
+pub async fn ping_with<F>(
+    path: &Path,
+    target: IpAddr,
+    count: u16,
+    timeout: Duration,
+    mut on_sample: F,
+) -> Result<PingResult>
+where
+    F: FnMut(&PingSample) -> Result<()>,
+{
+    ensure!(
+        (1..=trace::MAX_PING_COUNT).contains(&count),
+        "ping count must be between 1 and {}",
+        trace::MAX_PING_COUNT
+    );
+    ensure!(
+        !timeout.is_zero() && timeout <= MAX_TRACE_HOP_TIMEOUT,
+        "ping timeout must be between 1 ms and 60 s"
+    );
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let (id, mut reader) = connect(
+        path,
+        Method::Ping {
+            target,
+            count,
+            timeout_ms,
+        },
+    )
+    .await?;
+    let mut streamed_samples = Vec::new();
+    loop {
+        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
+        ensure!(!line.is_empty(), "daemon closed an incomplete ping stream");
+        let message: ServerMessage =
+            serde_json::from_slice(&line).context("failed parsing daemon ping event")?;
+        match message {
+            ServerMessage::PingSample {
+                version,
+                id: response_id,
+                sample,
+            } => {
+                validate_response(version, id, response_id)?;
+                on_sample(&sample)?;
+                streamed_samples.push(sample);
+            }
+            ServerMessage::PingDone {
+                version,
+                id: response_id,
+                result,
+            } => {
+                validate_response(version, id, response_id)?;
+                ensure!(
+                    streamed_samples == result.samples,
+                    "daemon ping stream disagrees with final result"
+                );
+                return Ok(result);
+            }
+            ServerMessage::Error {
+                version,
+                id: response_id,
+                error,
+            } => {
+                validate_response(version, id, response_id)?;
+                bail!("daemon {}: {}", error.code, error.message);
+            }
+            ServerMessage::Result { .. }
+            | ServerMessage::TraceHop { .. }
+            | ServerMessage::TraceDone { .. } => {
+                bail!("daemon returned a non-ping result")
+            }
+        }
+    }
+}
+
+pub async fn trace(
+    path: &Path,
+    target: IpAddr,
+    max_hops: u8,
+    timeout: Duration,
+) -> Result<TraceResult> {
+    trace_with(path, target, max_hops, timeout, |_| Ok(())).await
+}
+
+pub async fn trace_with<F>(
+    path: &Path,
+    target: IpAddr,
+    max_hops: u8,
+    timeout: Duration,
+    mut on_hop: F,
+) -> Result<TraceResult>
+where
+    F: FnMut(&TraceHop) -> Result<()>,
+{
+    ensure!(max_hops > 0, "trace max hops must be greater than zero");
+    ensure!(
+        !timeout.is_zero() && timeout <= MAX_TRACE_HOP_TIMEOUT,
+        "trace timeout must be between 1 ms and 60 s"
+    );
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let (id, mut reader) = connect(
+        path,
+        Method::Trace {
+            target,
+            max_hops,
+            timeout_ms,
+        },
+    )
+    .await?;
+    let mut streamed_hops = Vec::new();
+    loop {
+        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
+        ensure!(!line.is_empty(), "daemon closed an incomplete trace stream");
+        let message: ServerMessage =
+            serde_json::from_slice(&line).context("failed parsing daemon trace event")?;
+        match message {
+            ServerMessage::TraceHop {
+                version,
+                id: response_id,
+                hop,
+            } => {
+                validate_response(version, id, response_id)?;
+                on_hop(&hop)?;
+                streamed_hops.push(hop);
+            }
+            ServerMessage::TraceDone {
+                version,
+                id: response_id,
+                result,
+            } => {
+                validate_response(version, id, response_id)?;
+                ensure!(
+                    streamed_hops == result.hops,
+                    "daemon trace stream disagrees with final result"
+                );
+                return Ok(result);
+            }
+            ServerMessage::Error {
+                version,
+                id: response_id,
+                error,
+            } => {
+                validate_response(version, id, response_id)?;
+                bail!("daemon {}: {}", error.code, error.message);
+            }
+            ServerMessage::Result { .. }
+            | ServerMessage::PingSample { .. }
+            | ServerMessage::PingDone { .. } => bail!("daemon returned a non-trace result"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        capacity::RouteEstimateTable,
+        capacity_probe::ProbeStatusSnapshot,
+        flow_router::FlowRouterConfig,
+        mesh::MeshStatus,
+        observability::{CapacityObservability, FlowRouterCounters, RuntimeState},
+    };
+    use iroh::SecretKey;
+    use std::sync::RwLock;
+    use std::{collections::HashMap, os::unix::fs::PermissionsExt};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn test_config(directory: &Path) -> Config {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.observability.status_file = directory.join("status.json");
+        config
+    }
+
+    #[tokio::test]
+    async fn bounded_line_rejects_oversized_messages() {
+        let data = vec![b'x'; 9];
+        let mut reader = BufReader::new(data.as_slice());
+        let error = read_bounded_line(&mut reader, 8).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+    }
+
+    #[test]
+    fn request_is_versioned_and_method_tagged() {
+        let request = Request {
+            version: CONTROL_PROTOCOL_VERSION,
+            id: 7,
+            method: Method::Status,
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["version"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(json["id"], 7);
+        assert_eq!(json["method"], "status");
+    }
+
+    #[test]
+    fn live_snapshot_request_is_versioned_and_method_tagged() {
+        let request = Request {
+            version: CONTROL_PROTOCOL_VERSION,
+            id: 8,
+            method: Method::Snapshot,
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["version"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(json["id"], 8);
+        assert_eq!(json["method"], "snapshot");
+    }
+
+    #[test]
+    fn ping_request_has_bounded_probe_parameters() {
+        let request = Request {
+            version: CONTROL_PROTOCOL_VERSION,
+            id: 8,
+            method: Method::Ping {
+                target: "21.0.0.2".parse().unwrap(),
+                count: 4,
+                timeout_ms: 1_000,
+            },
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["method"], "ping");
+        assert_eq!(json["target"], "21.0.0.2");
+        assert_eq!(json["count"], 4);
+        assert_eq!(json["timeout_ms"], 1_000);
+    }
+
+    #[tokio::test]
+    async fn bind_never_replaces_a_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        std::fs::write(&socket, b"keep").unwrap();
+
+        let error = bind(&socket).await.unwrap_err();
+        assert!(error.to_string().contains("refusing to replace non-socket"));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn socket_is_private_and_status_errors_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        let error = status(&socket).await.unwrap_err();
+        assert!(error.to_string().contains("daemon status_unavailable"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_requests_return_structured_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        let requests: [&[u8]; 2] = [
+            b"{not-json}\n",
+            b"{\"version\":1,\"id\":9,\"method\":\"unknown\"}\n",
+        ];
+        for request in requests {
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+                .await
+                .unwrap();
+            match serde_json::from_slice::<ServerMessage>(&line).unwrap() {
+                ServerMessage::Error { error, .. } => {
+                    assert_eq!(error.code, "invalid_request");
+                }
+                message => panic!("expected structured error, got {message:?}"),
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_version_and_invalid_ping_params_are_rejected_by_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(b"{\"version\":99,\"id\":10,\"method\":\"status\"}\n")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        match serde_json::from_slice::<ServerMessage>(&line).unwrap() {
+            ServerMessage::Error { id, error, .. } => {
+                assert_eq!(id, 10);
+                assert_eq!(error.code, "unsupported_version");
+            }
+            message => panic!("expected version error, got {message:?}"),
+        }
+
+        let error = request_result::<PingResult>(
+            &socket,
+            Method::Ping {
+                target: "21.0.0.1".parse().unwrap(),
+                count: 0,
+                timeout_ms: 1_000,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("daemon invalid_params"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_rejects_ping_bounds_before_connecting() {
+        let missing = Path::new("/definitely/missing/control.sock");
+        let target = "21.0.0.1".parse().unwrap();
+        let count_error = ping(missing, target, 0, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(count_error.to_string().contains("count must be between"));
+        let timeout_error = ping(missing, target, 1, Duration::from_secs(61))
+            .await
+            .unwrap_err();
+        assert!(
+            timeout_error
+                .to_string()
+                .contains("timeout must be between")
+        );
+    }
+
+    #[tokio::test]
+    async fn peers_are_projected_from_runtime_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let config = test_config(directory.path());
+        let status = RuntimeStatus {
+            ready: true,
+            endpoint_id: "endpoint".into(),
+            started_unix: 1,
+            updated_unix: 2,
+            uptime_seconds: 1,
+            routes_ready: true,
+            routes: Vec::new(),
+            peers: Vec::new(),
+            mesh: MeshStatus::default(),
+            capacities: Vec::new(),
+            capacity_table_entries: 0,
+            capacity_table_limit: 4_096,
+            capacity_probe_in_flight: false,
+            capacity_probe_budget_bytes: 256 * 1024,
+            capacity_probe_attempts: 0,
+            capacity_probe_failures: 0,
+            capacity_probe_bytes: 0,
+            flow_router: Default::default(),
+        };
+        tokio::fs::write(
+            &config.observability.status_file,
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(config);
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        assert!(peers(&socket).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_snapshot_reads_in_memory_runtime_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let config = test_config(directory.path());
+        let runtime_state = Arc::new(RuntimeState::new(
+            SecretKey::from_bytes(&[11; 32]).public(),
+            100,
+            Vec::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            CapacityObservability::new(
+                Arc::new(RwLock::new(RouteEstimateTable::default())),
+                Arc::new(RwLock::new(ProbeStatusSnapshot::default())),
+                None,
+            ),
+            Arc::new(FlowRouterCounters::default()),
+        ));
+        runtime_state
+            .flow_router_for_test()
+            .active_flows
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(config);
+        let (_state_tx, state_rx) = watch::channel(Some(runtime_state));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            state_rx,
+        ));
+
+        let status = snapshot(&socket).await.unwrap();
+        assert_eq!(status.flow_router.active_flows, 42);
+        assert_eq!(
+            status.flow_router.max_flows,
+            FlowRouterConfig::default().max_flows as u64
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn overlay_ping_round_trips_through_control_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let config = test_config(directory.path());
+        let target = config.node_info.as_ref().unwrap().ipv4.unwrap().into();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(config);
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        let mut sequences = Vec::new();
+        let result = ping_with(&socket, target, 2, Duration::from_millis(10), |sample| {
+            sequences.push(sample.sequence);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.transmitted, 2);
+        assert_eq!(result.received, 2);
+        assert_eq!(result.loss_ppm, 0);
+        assert_eq!(sequences, [1, 2]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_limit_applies_backpressure_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+
+        let mut idle = Vec::with_capacity(MAX_CONTROL_CONNECTIONS);
+        for _ in 0..MAX_CONTROL_CONNECTIONS {
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(b"{").await.unwrap();
+            idle.push(stream);
+        }
+        time::sleep(Duration::from_millis(200)).await;
+
+        let client_socket = socket.clone();
+        let mut waiting = tokio::spawn(async move { status(&client_socket).await });
+        assert!(
+            time::timeout(Duration::from_millis(200), &mut waiting)
+                .await
+                .is_err(),
+            "the 65th request should wait for a connection slot"
+        );
+        drop(idle.pop());
+        let error = time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("request should resume after a slot is released")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("status_unavailable"));
+        drop(idle);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reload_round_trips_through_supervisor_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+        ));
+        let client_socket = socket.clone();
+        let client = tokio::spawn(async move { reload(&client_socket).await });
+
+        let Some(DaemonCommand::Reload { reply }) = command_rx.recv().await else {
+            panic!("expected reload command");
+        };
+        reply
+            .send(Ok(ReloadAck {
+                generation: 2,
+                endpoint_id: "endpoint".into(),
+            }))
+            .unwrap();
+        let ack = client.await.unwrap().unwrap();
+        assert_eq!(ack.generation, 2);
+        assert_eq!(ack.endpoint_id, "endpoint");
+        server.abort();
+    }
+}
