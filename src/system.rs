@@ -15,6 +15,12 @@ use crate::config::Config;
 // 100 avoids the named assignments commonly used by dynamic routing stacks,
 // OSPF, and other routing daemons.
 const FLOW_ROUTER_ROUTE_PROTOCOL: &str = "100";
+const NAT_INGRESS_CHAIN: &str = "IRONET_NAT_INGRESS";
+const NAT_POSTROUTING_CHAIN: &str = "IRONET_NAT_POSTROUTING";
+// Conntrack marks do not participate in policy routing, unlike packet marks.
+// Reserve one bit so the postrouting hook can recognize packets that entered
+// through the FlowRouter TUN without changing their source address earlier.
+const NAT_CONNMARK: &str = "0x40000000/0x40000000";
 
 /// Configure the already-created FlowRouter TUN. Device creation stays in the
 /// data-plane lifecycle so exactly one file descriptor owns packet I/O.
@@ -97,6 +103,7 @@ pub async fn prepare_routing(config: &Config) -> Result<()> {
     }
 
     sync_overlay_routes(config, config.all_remote_prefixes()).await?;
+    prepare_advertised_prefix_nat(config).await?;
     info!(
         table = routing_table(config),
         priority = config.routing.rule_priority,
@@ -219,6 +226,7 @@ fn parse_route_destination(family: &str, destination: &str) -> Option<IpNet> {
 }
 
 pub async fn cleanup_routing(config: &Config) -> Result<()> {
+    cleanup_advertised_prefix_nat(config).await?;
     let table = routing_table(config).to_string();
     let priority = config.routing.rule_priority.to_string();
     let underlay_priority = config.routing.rule_priority.saturating_sub(1).to_string();
@@ -260,6 +268,143 @@ pub async fn cleanup_routing(config: &Config) -> Result<()> {
         priority = config.routing.rule_priority,
         "cleaned FlowRouter routes"
     );
+    Ok(())
+}
+
+async fn prepare_advertised_prefix_nat(config: &Config) -> Result<()> {
+    if config.advertised_prefixes.is_empty() {
+        return Ok(());
+    }
+
+    for (command, ipv4) in [("iptables", true), ("ip6tables", false)] {
+        let prefixes = config
+            .advertised_prefixes
+            .iter()
+            .filter(|prefix| prefix.addr().is_ipv4() == ipv4)
+            .copied()
+            .collect::<Vec<_>>();
+        if prefixes.is_empty() {
+            continue;
+        }
+
+        cleanup_nat_family(command).await?;
+        if !config.routing.nat_enabled {
+            continue;
+        }
+        if let Err(error) = install_nat_family(command, &config.node_interface, &prefixes).await {
+            let _ = cleanup_nat_family(command).await;
+            return Err(error);
+        }
+    }
+    if config.routing.nat_enabled {
+        info!(interface = %config.node_interface, "enabled NAT for advertised prefixes");
+    }
+    Ok(())
+}
+
+async fn cleanup_advertised_prefix_nat(config: &Config) -> Result<()> {
+    if config.advertised_prefixes.is_empty() {
+        return Ok(());
+    }
+    for (command, ipv4) in [("iptables", true), ("ip6tables", false)] {
+        if config
+            .advertised_prefixes
+            .iter()
+            .any(|prefix| prefix.addr().is_ipv4() == ipv4)
+        {
+            cleanup_nat_family(command).await?;
+        }
+    }
+    info!("cleaned advertised-prefix NAT rules");
+    Ok(())
+}
+
+async fn install_nat_family(command: &str, interface: &str, prefixes: &[IpNet]) -> Result<()> {
+    run_firewall(command, &["-t", "mangle", "-N", NAT_INGRESS_CHAIN]).await?;
+    run_firewall(
+        command,
+        &[
+            "-t",
+            "mangle",
+            "-A",
+            NAT_INGRESS_CHAIN,
+            "-i",
+            interface,
+            "-j",
+            "CONNMARK",
+            "--set-xmark",
+            NAT_CONNMARK,
+        ],
+    )
+    .await?;
+    run_firewall(command, &["-t", "nat", "-N", NAT_POSTROUTING_CHAIN]).await?;
+    for prefix in prefixes {
+        run_firewall_owned(
+            command,
+            vec![
+                "-t".into(),
+                "nat".into(),
+                "-A".into(),
+                NAT_POSTROUTING_CHAIN.into(),
+                "-m".into(),
+                "connmark".into(),
+                "--mark".into(),
+                NAT_CONNMARK.into(),
+                "-d".into(),
+                prefix.to_string(),
+                "-j".into(),
+                "MASQUERADE".into(),
+            ],
+        )
+        .await?;
+    }
+    // Install hooks last, after both target chains are complete.
+    run_firewall(
+        command,
+        &[
+            "-t",
+            "mangle",
+            "-I",
+            "PREROUTING",
+            "1",
+            "-j",
+            NAT_INGRESS_CHAIN,
+        ],
+    )
+    .await?;
+    run_firewall(
+        command,
+        &[
+            "-t",
+            "nat",
+            "-I",
+            "POSTROUTING",
+            "1",
+            "-j",
+            NAT_POSTROUTING_CHAIN,
+        ],
+    )
+    .await
+}
+
+async fn cleanup_nat_family(command: &str) -> Result<()> {
+    for args in [
+        vec!["-t", "mangle", "-D", "PREROUTING", "-j", NAT_INGRESS_CHAIN],
+        vec![
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-j",
+            NAT_POSTROUTING_CHAIN,
+        ],
+        vec!["-t", "mangle", "-F", NAT_INGRESS_CHAIN],
+        vec!["-t", "mangle", "-X", NAT_INGRESS_CHAIN],
+        vec!["-t", "nat", "-F", NAT_POSTROUTING_CHAIN],
+        vec!["-t", "nat", "-X", NAT_POSTROUTING_CHAIN],
+    ] {
+        run_firewall_allow_failure(command, &args).await?;
+    }
     Ok(())
 }
 
@@ -326,6 +471,47 @@ async fn run_ip_allow_failure(args: &[&str]) -> Result<()> {
         .status()
         .await
         .context("failed to execute iproute2")?;
+    Ok(())
+}
+
+async fn run_firewall(command: &str, args: &[&str]) -> Result<()> {
+    let mut full_args = vec!["-w", "5"];
+    full_args.extend_from_slice(args);
+    debug!(command = %format!("{command} {}", full_args.join(" ")), "executing NAT configuration");
+    let output = Command::new(command)
+        .args(&full_args)
+        .output()
+        .await
+        .with_context(|| format!("failed to execute {command}"))?;
+    if !output.status.success() {
+        bail!(
+            "{command} {} failed: {}",
+            full_args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn run_firewall_owned(command: &str, args: Vec<String>) -> Result<()> {
+    let references = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_firewall(command, &references).await
+}
+
+async fn run_firewall_allow_failure(command: &str, args: &[&str]) -> Result<()> {
+    let mut full_args = vec!["-w", "5"];
+    full_args.extend_from_slice(args);
+    let status = Command::new(command)
+        .args(full_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("failed to execute {command}")),
+    }
     Ok(())
 }
 

@@ -891,6 +891,7 @@ async fn validate(config_path: &Path) -> Result<()> {
     println!("static_route_owners = {}", config.route_origins.len());
     println!("route_file = {}", config.route_registry_path().display());
     println!("transit_enabled = {}", config.routing.transit_enabled);
+    println!("nat_enabled = {}", config.routing.nat_enabled);
     Ok(())
 }
 
@@ -942,6 +943,38 @@ async fn doctor(config_path: &Path) -> Result<()> {
     }
     if needs_forwarding && has_ipv6_overlay {
         ensure_sysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
+    }
+    if config.routing.nat_enabled && needs_forwarding {
+        for (command, required) in [
+            (
+                "iptables",
+                config
+                    .advertised_prefixes
+                    .iter()
+                    .any(|prefix| prefix.addr().is_ipv4()),
+            ),
+            (
+                "ip6tables",
+                config
+                    .advertised_prefixes
+                    .iter()
+                    .any(|prefix| prefix.addr().is_ipv6()),
+            ),
+        ] {
+            if !required {
+                continue;
+            }
+            let output = tokio::process::Command::new(command)
+                .args(["-w", "5", "-t", "nat", "-L"])
+                .output()
+                .await
+                .with_context(|| format!("failed executing {command} for advertised-prefix NAT"))?;
+            ensure!(
+                output.status.success(),
+                "{command} NAT support is not operational: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
     }
     for peer in &config.peers {
         for address in &peer.direct_addresses {

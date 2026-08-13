@@ -238,6 +238,11 @@ pub struct RoutingConfig {
     pub table: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_default_routes: bool,
+    /// Source-NAT packets arriving from the overlay before they are forwarded
+    /// to a locally advertised LAN/service prefix. This removes the need for
+    /// LAN hosts to carry explicit return routes for remote overlay prefixes.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub nat_enabled: bool,
     /// Optional local policy cap for this node's single overlay egress. This
     /// is never advertised to peers and is not a capacity measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,6 +282,7 @@ impl Default for RoutingConfig {
             rule_priority: default_rule_priority(),
             table: default_routing_table(),
             allow_default_routes: false,
+            nat_enabled: true,
             max_egress_mbps: None,
         }
     }
@@ -1484,6 +1490,13 @@ mod tests {
         )
         .unwrap();
         assert!(!routing.transit_enabled);
+        assert!(routing.nat_enabled);
+    }
+
+    #[test]
+    fn advertised_prefix_nat_can_be_disabled_explicitly() {
+        let routing: RoutingConfig = toml::from_str("nat_enabled = false\n").unwrap();
+        assert!(!routing.nat_enabled);
     }
 
     #[test]

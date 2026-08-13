@@ -82,6 +82,7 @@
             pkgs.cacert
             pkgs.git
             pkgs.iproute2
+            pkgs.iptables
             pkgs.pkg-config
             pkgs.python3
           ];

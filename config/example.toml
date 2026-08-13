@@ -62,6 +62,8 @@ transit_enabled = false
 rule_priority = 10000
 table = 211
 allow_default_routes = false
+# 默认对来自覆盖网络、发往本节点 advertised_prefixes 的流量做源 NAT。
+nat_enabled = true
 # 可选的仅本机策略上限，不会通过 Presence 传播。
 # max_egress_mbps = 80
 

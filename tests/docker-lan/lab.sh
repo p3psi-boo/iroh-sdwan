@@ -99,6 +99,10 @@ wait_until "IPv6 routed LAN" ip netns exec lan-host-a ping -6 -c 1 -W 3 fd20:20:
 ip netns exec lan-host-c ping -c 3 -W 3 192.168.10.10
 ip netns exec lan-host-c ping -6 -c 3 -W 3 fd20:10::10
 ip netns exec lan-host-a ping -c 2 -W 3 -M dont -s 4000 192.168.20.10
+ip netns exec lan-node-c iptables -t nat -L IRONET_NAT_POSTROUTING -n -v -x \
+  | awk '$3 == "MASQUERADE" && $1 > 0 { found=1 } END { exit !found }'
+ip netns exec lan-node-c ip6tables -t nat -L IRONET_NAT_POSTROUTING -n -v -x \
+  | awk '$3 == "MASQUERADE" && $1 > 0 { found=1 } END { exit !found }'
 ip -n lan-node-a route show table 100 192.168.20.0/24 | grep -q 'dev ironet0'
 ip -n lan-node-c -6 route show table 100 fd20:10::/64 | grep -q 'dev ironet0'
 

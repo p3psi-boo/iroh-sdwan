@@ -57,6 +57,7 @@ in
       after = [ "network-online.target" ];
       path = [
         pkgs.iproute2
+        pkgs.iptables
       ];
       environment = {
         RUST_LOG = "info";

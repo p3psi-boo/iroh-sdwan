@@ -188,7 +188,7 @@ Priority: optional
 Architecture: $DEB_ARCH
 Maintainer: ironet maintainers <maintainers@ironet.invalid>
 Installed-Size: $INSTALLED_SIZE
-Depends: adduser, iproute2, procps
+Depends: adduser, iproute2, iptables, procps
 Description: Demand-aware SD-WAN data plane using iroh and FlowRouter
  ironet provides an unprivileged control CLI and a capability-bounded
  daemon. The daemon builds encrypted peer tunnels, exchanges bounded mesh

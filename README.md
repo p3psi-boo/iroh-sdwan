@@ -47,7 +47,7 @@ ETA = RTT + 抖动 + 丢包惩罚
 
 运行节点需要：
 
-- Linux 主机、`/dev/net/tun` 和 `iproute2`；
+- Linux 主机、`/dev/net/tun`、`iproute2` 和 `iptables`；
 - 启用 systemd 服务时，需要 systemd、`systemd-sysusers` 或等价的系统用户管理工具；
 - 守护进程需要 `CAP_NET_ADMIN`；运行 `doctor`、初始化和服务管理命令通常使用 `sudo`。
 
