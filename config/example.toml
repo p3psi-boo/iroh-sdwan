@@ -57,7 +57,7 @@ isolate_overlay = true
 # 也不控制 peer 访问本节点发布的 LAN/服务前缀。
 transit_enabled = false
 rule_priority = 10000
-table = 100
+table = 211
 allow_default_routes = false
 # 可选的仅本机策略上限，不会通过 Presence 传播。
 # max_egress_mbps = 80

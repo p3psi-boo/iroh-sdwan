@@ -1112,7 +1112,7 @@ fn is_default_node_interface(value: &str) -> bool {
 }
 
 fn default_routing_table() -> u32 {
-    100
+    211
 }
 
 fn is_default_routing_table(value: &u32) -> bool {
