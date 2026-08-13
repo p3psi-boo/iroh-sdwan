@@ -17,6 +17,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::{
+    address::NetworkDiscoveryStatus,
     capacity::{DEFAULT_ROUTE_ESTIMATE_CAPACITY, RouteEstimateTable, SampleSource},
     capacity_probe::{MAX_PROBE_BYTES, ProbeStatusSnapshot},
     config::ObservabilityConfig,
@@ -198,6 +199,7 @@ pub struct RuntimeState {
     mesh: Option<Arc<MeshRuntime>>,
     capacity: CapacityObservability,
     flow_router: Arc<FlowRouterCounters>,
+    network: RwLock<NetworkDiscoveryStatus>,
 }
 
 #[derive(Clone)]
@@ -251,7 +253,15 @@ impl RuntimeState {
             mesh,
             capacity,
             flow_router,
+            network: RwLock::new(NetworkDiscoveryStatus::default()),
         }
+    }
+
+    pub fn update_network_discovery(&self, status: NetworkDiscoveryStatus) {
+        *self
+            .network
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
     }
 
     pub async fn snapshot(&self) -> Result<RuntimeStatus> {
@@ -392,6 +402,11 @@ impl RuntimeState {
             routes_ready,
             routes,
             peers: peer_statuses,
+            network: self
+                .network
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             mesh,
             capacities,
             capacity_table_entries: self
@@ -429,6 +444,8 @@ pub struct RuntimeStatus {
     #[serde(default)]
     pub routes: Vec<RouteStatus>,
     pub peers: Vec<PeerStatus>,
+    #[serde(default)]
+    pub network: NetworkDiscoveryStatus,
     #[serde(default)]
     pub mesh: MeshStatus,
     #[serde(default)]
@@ -800,6 +817,56 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
         "ironet_routes_ready {}\n",
         u8::from(status.routes_ready)
     ));
+    output.push_str("# TYPE ironet_network_udp_available gauge\n");
+    output.push_str(&format!(
+        "ironet_network_udp_available{{family=\"ipv4\"}} {}\n",
+        u8::from(status.network.udp_ipv4)
+    ));
+    output.push_str(&format!(
+        "ironet_network_udp_available{{family=\"ipv6\"}} {}\n",
+        u8::from(status.network.udp_ipv6)
+    ));
+    output.push_str("# TYPE ironet_nat_mapping_varies_by_destination gauge\n");
+    output.push_str("# TYPE ironet_nat_mapping_classification_known gauge\n");
+    for (family, varies) in [
+        ("ipv4", status.network.mapping_varies_by_destination_ipv4),
+        ("ipv6", status.network.mapping_varies_by_destination_ipv6),
+    ] {
+        output.push_str(&format!(
+            "ironet_nat_mapping_varies_by_destination{{family=\"{family}\"}} {}\n",
+            u8::from(varies.unwrap_or(false))
+        ));
+        output.push_str(&format!(
+            "ironet_nat_mapping_classification_known{{family=\"{family}\"}} {}\n",
+            u8::from(varies.is_some())
+        ));
+    }
+    output.push_str("# TYPE ironet_network_candidate_info gauge\n");
+    for candidate in &status.network.candidates {
+        output.push_str(&format!(
+            "ironet_network_candidate_info{{kind=\"{}\",address=\"{}\"}} 1\n",
+            prometheus_escape(&candidate.kind),
+            prometheus_escape(&candidate.address.to_string()),
+        ));
+    }
+    if let Some(address) = status.network.global_ipv4 {
+        output.push_str(&format!(
+            "ironet_network_global_address_info{{family=\"ipv4\",address=\"{}\"}} 1\n",
+            prometheus_escape(&address.to_string()),
+        ));
+    }
+    if let Some(address) = status.network.global_ipv6 {
+        output.push_str(&format!(
+            "ironet_network_global_address_info{{family=\"ipv6\",address=\"{}\"}} 1\n",
+            prometheus_escape(&address.to_string()),
+        ));
+    }
+    if let Some(prefix) = status.network.nat64_prefix {
+        output.push_str(&format!(
+            "ironet_network_nat64_prefix_info{{prefix=\"{}/{}\"}} 1\n",
+            prefix.network, prefix.prefix_len,
+        ));
+    }
     output.push_str("# TYPE ironet_capacity_table_entries gauge\n");
     output.push_str(&format!(
         "ironet_capacity_table_entries {}\n",
@@ -1172,6 +1239,16 @@ mod tests {
             ),
             Arc::new(FlowRouterCounters::default()),
         );
+        state.update_network_discovery(NetworkDiscoveryStatus {
+            udp_ipv4: true,
+            mapping_varies_by_destination_ipv4: Some(true),
+            global_ipv4: Some("203.0.113.8:41000".parse().unwrap()),
+            candidates: vec![crate::address::CandidateStatus {
+                address: "203.0.113.8:41000".parse().unwrap(),
+                kind: "qad_ipv4".into(),
+            }],
+            ..Default::default()
+        });
         let status = state.snapshot().await.unwrap();
         let peer = &status.peers[0];
         assert_eq!(peer.priority_queue_packets, 2);
@@ -1194,6 +1271,9 @@ mod tests {
         assert!(output.contains("ironet_peer_active_tx_bytes"));
         assert!(output.contains("ironet_peer_quic_send_buffer_used_bytes"));
         assert!(output.contains("ironet_peer_bulk_preemptions_total"));
+        assert!(output.contains("ironet_network_udp_available{family=\"ipv4\"} 1"));
+        assert!(output.contains("ironet_nat_mapping_varies_by_destination{family=\"ipv4\"} 1"));
+        assert!(output.contains("ironet_network_candidate_info{kind=\"qad_ipv4\""));
     }
 
     #[tokio::test]

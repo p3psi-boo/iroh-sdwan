@@ -194,6 +194,41 @@ mod tests {
     }
 
     #[test]
+    fn hard_nat_starts_on_relay_then_upgrades_without_replacing_session() {
+        // Before coordinated punching there is deliberately no direct path.
+        assert_eq!(
+            choose_transport(None, false, false, true, false),
+            Choice::Relay
+        );
+        // A CGNAT/hairpin candidate is kept in probation during hold-down.
+        assert_eq!(
+            choose_transport(Some(TransportKind::Relay), true, true, true, true),
+            Choice::Keep
+        );
+        // Once proven, the same connection selects it.
+        assert_eq!(
+            choose_transport(Some(TransportKind::Relay), true, true, true, false),
+            Choice::Direct
+        );
+    }
+
+    #[test]
+    fn double_nat_and_network_change_fall_back_then_recover() {
+        assert_eq!(
+            choose_transport(Some(TransportKind::Direct), false, false, true, false),
+            Choice::Relay
+        );
+        assert_eq!(
+            choose_transport(Some(TransportKind::Relay), true, false, true, false),
+            Choice::Keep
+        );
+        assert_eq!(
+            choose_transport(Some(TransportKind::Relay), true, true, true, false),
+            Choice::Direct
+        );
+    }
+
+    #[test]
     fn overlay_addresses_are_never_eligible_as_underlay_paths() {
         let selector = WanPathSelector::new(vec!["10.250.12.0/24".parse().unwrap()]);
         assert!(!selector.path_allowed(&FourTuple::Ip {

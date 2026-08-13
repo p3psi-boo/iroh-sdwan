@@ -163,6 +163,12 @@ pub struct RelayConfig {
     /// Explicit iroh relay URLs inherited by peers without `relay_urls`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
+    /// Public iroh relay/QAD endpoints used for address discovery even when
+    /// normal peer traffic uses DERP or overlay transit.  These endpoints are
+    /// also viable encrypted fallback paths, because iroh uses the same relay
+    /// map for QAD and relay registration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_urls: Vec<String>,
     /// Tailscale DERP transport servers. Each URL is one independent region.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<String>,
@@ -171,6 +177,13 @@ pub struct RelayConfig {
 impl RelayConfig {
     pub fn derp_enabled(&self) -> bool {
         !self.servers.is_empty()
+    }
+
+    pub fn iroh_urls(&self) -> impl Iterator<Item = &str> {
+        self.urls
+            .iter()
+            .chain(&self.discovery_urls)
+            .map(String::as_str)
     }
 }
 
@@ -675,8 +688,10 @@ impl Config {
                 "default routes require discovery_enabled = false"
             );
             ensure!(
-                self.relay.urls.is_empty() && !self.relay.derp_enabled(),
-                "default routes require relay.urls and relay.servers to be empty"
+                self.relay.urls.is_empty()
+                    && self.relay.discovery_urls.is_empty()
+                    && !self.relay.derp_enabled(),
+                "default routes require relay.urls, relay.discovery_urls, and relay.servers to be empty"
             );
             ensure!(
                 self.peers
@@ -910,6 +925,22 @@ impl Config {
             }
         }
 
+        if !self.relay.discovery_urls.is_empty() {
+            ensure!(
+                self.relay.discovery_urls.len() >= 2,
+                "relay.discovery_urls requires at least two URLs to classify NAT mappings"
+            );
+            let mut unique = self.relay.urls.iter().collect::<HashSet<_>>();
+            for url in &self.relay.discovery_urls {
+                url.parse::<RelayUrl>()
+                    .context("invalid relay.discovery_urls entry")?;
+                ensure!(
+                    unique.insert(url),
+                    "duplicate iroh relay/discovery URL {url}"
+                );
+            }
+        }
+
         if !self.relay.derp_enabled() {
             return self.ensure_no_derp_peer_keys();
         }
@@ -998,8 +1029,7 @@ impl Config {
 
     pub fn inherited_peer_relays(&self) -> Result<Vec<RelayUrl>> {
         self.relay
-            .urls
-            .iter()
+            .iroh_urls()
             .map(|url| url.parse().context("invalid relay.urls entry"))
             .collect()
     }
@@ -1345,7 +1375,39 @@ mod tests {
 
         let wrapper: Wrapper = toml::from_str("").unwrap();
         assert!(wrapper.relay.urls.is_empty());
+        assert!(wrapper.relay.discovery_urls.is_empty());
         assert!(wrapper.relay.servers.is_empty());
+    }
+
+    #[test]
+    fn qad_discovery_requires_two_unique_observation_urls() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.relay.discovery_urls = vec!["https://qad-a.example.com".into()];
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("at least two URLs")
+        );
+        config
+            .relay
+            .discovery_urls
+            .push("https://qad-b.example.com".into());
+        config.validate().unwrap();
+        assert_eq!(config.inherited_peer_relays().unwrap().len(), 2);
+        config.relay.urls = vec![
+            "https://relay-a.example.com".into(),
+            "https://relay-b.example.com".into(),
+        ];
+        config.relay.discovery_urls[0] = "https://relay-a.example.com".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate iroh relay/discovery URL")
+        );
     }
 
     #[test]
@@ -1499,6 +1561,7 @@ mod tests {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
         config.relay = RelayConfig {
             urls: Vec::new(),
+            discovery_urls: Vec::new(),
             servers: vec![
                 "https://derp-a.example.com".into(),
                 "https://derp-b.example.com/derp".into(),
@@ -1553,6 +1616,7 @@ mod tests {
                 "https://relay-a.example.com".into(),
                 "https://relay-b.example.com".into(),
             ],
+            discovery_urls: Vec::new(),
             servers: vec!["https://derp.example.com".into()],
         };
         config.peers = vec![peer.clone()];

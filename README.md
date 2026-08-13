@@ -10,7 +10,8 @@
 - 节点使用签名 Presence 传播节点地址、前缀归属和转发能力；固定 peer 用于引导连接。
 - 同一流在短租约内固定到一条路径；租约到期后可根据延迟、抖动、丢包、队列压力和实测容量重新选择路径。
 - 容量以 `(目的节点所有者, 首跳节点)` 为键，分别维护两个方向的测量值。主动探测和接收端确认的业务交付样本共同参与估计。
-- 默认通过固定 bootstrap peer 交换签名 Presence 和 peer 观察到的 NAT 地址候选，优先建立直连 UDP；失败时由普通 transit peer 做覆盖层转发，不依赖公共 iroh relay。
+- 开启发现时默认使用至少两个 iroh QAD/relay 观察点：先建立正式 relay 邻接，再在同一 QUIC 连接上交换候选并执行 QNT 打洞；直连可用后透明升级，直连失效时回退 relay 并重新发现。
+- 固定 bootstrap peer 继续交换签名 Presence 和经过过滤的 NAT 地址候选；普通 transit peer 是覆盖层的额外兜底，不与底层 relay 混为一层。
 - 直连 UDP、可选 iroh relay 和 DERP 都是节点邻接的底层传输；覆盖层的转发和选路仍由 FlowRouter 处理。
 - 守护进程以 `CAP_NET_ADMIN` 运行；操作命令通过 Unix 控制套接字访问守护进程。
 

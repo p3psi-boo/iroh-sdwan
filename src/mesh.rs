@@ -16,11 +16,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use futures_util::StreamExt;
 use ipnet::IpNet;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, endpoint::Connection,
 };
 use iroh_base::Signature;
+use n0_watcher::Watcher as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{debug, warn};
@@ -541,6 +543,7 @@ pub struct MeshRuntime {
     probe_nonce: AtomicU64,
     sequence_file: PathBuf,
     local_presence: RwLock<SignedPresence>,
+    local_presence_updates: watch::Sender<u64>,
     directory: Mutex<Directory>,
     /// Direct socket addresses observed on authenticated peer connections.
     /// Only locally observed records are forwarded, so rendezvous data is
@@ -593,6 +596,7 @@ impl MeshRuntime {
             &hidden_underlay_prefixes,
         )?;
         let (rendezvous_updates, _) = watch::channel(0);
+        let (local_presence_updates, _) = watch::channel(sequence);
         Ok(Arc::new(Self {
             config: config.clone(),
             secret_key,
@@ -602,6 +606,7 @@ impl MeshRuntime {
             probe_nonce: AtomicU64::new(sequence.rotate_left(17)),
             sequence_file,
             local_presence: RwLock::new(local_presence),
+            local_presence_updates,
             directory: Mutex::new(Directory::with_reserved(
                 owner,
                 config.all_advertised_prefixes(),
@@ -626,10 +631,16 @@ impl MeshRuntime {
     pub async fn run_maintenance(self: Arc<Self>) -> Result<()> {
         let mut refresh = tokio::time::interval(LOCAL_REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut address_updates = self.endpoint.watch_addr().stream_updates_only();
         // The constructor already published the first record.
         refresh.tick().await;
         loop {
-            refresh.tick().await;
+            tokio::select! {
+                _ = refresh.tick() => {}
+                update = address_updates.next() => {
+                    update.context("endpoint address watcher stopped")?;
+                }
+            }
             let now = SystemTime::now();
             let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
             crate::deployment::atomic_write(
@@ -647,6 +658,7 @@ impl MeshRuntime {
                 &self.hidden_underlay_prefixes,
             )?;
             *self.local_presence.write().await = presence;
+            self.local_presence_updates.send_replace(sequence);
             let mut directory = self.directory.lock().await;
             let expired = directory.prune(now)?;
             if !expired.is_empty() {
@@ -996,22 +1008,28 @@ impl MeshRuntime {
         let mut interval = tokio::time::interval(GOSSIP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut rendezvous_updates = self.rendezvous_updates.subscribe();
+        let mut local_presence_updates = self.local_presence_updates.subscribe();
         let mut cursor = 0_usize;
         let mut rendezvous_cursor = 0_usize;
         loop {
-            let gossip = tokio::select! {
-                _ = interval.tick() => true,
+            let (send_local, gossip) = tokio::select! {
+                _ = interval.tick() => (true, true),
                 update = rendezvous_updates.changed() => {
                     update.context("rendezvous update channel closed")?;
-                    false
+                    (false, false)
+                }
+                update = local_presence_updates.changed() => {
+                    update.context("local Presence update channel closed")?;
+                    (true, false)
                 }
             };
+            if send_local {
+                let local = self.local_presence.read().await.clone();
+                send_presence(&connection, &local).await?;
+            }
             if gossip {
                 self.refresh_connection_observation(remote_id, &connection)
                     .await;
-                let local = self.local_presence.read().await.clone();
-                send_presence(&connection, &local).await?;
-
                 let mut records = self
                     .directory
                     .lock()

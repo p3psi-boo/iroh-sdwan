@@ -2,6 +2,7 @@ FROM rust:1.91-trixie AS builder
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

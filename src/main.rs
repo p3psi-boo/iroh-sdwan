@@ -626,6 +626,40 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<String>
     writeln!(rendered, "routes_ready: {}", status.routes_ready)?;
     writeln!(
         rendered,
+        "network: udp4={} udp6={} mapping_varies4={} mapping_varies6={} global4={} global6={} nat64={} candidates={}",
+        status.network.udp_ipv4,
+        status.network.udp_ipv6,
+        status
+            .network
+            .mapping_varies_by_destination_ipv4
+            .map_or("unknown".into(), |value| value.to_string()),
+        status
+            .network
+            .mapping_varies_by_destination_ipv6
+            .map_or("unknown".into(), |value| value.to_string()),
+        status
+            .network
+            .global_ipv4
+            .map_or("none".into(), |value| value.to_string()),
+        status
+            .network
+            .global_ipv6
+            .map_or("none".into(), |value| value.to_string()),
+        status.network.nat64_prefix.map_or("none".into(), |prefix| {
+            format!("{}/{}", prefix.network, prefix.prefix_len)
+        }),
+        status.network.candidates.len(),
+    )?;
+    for candidate in &status.network.candidates {
+        writeln!(
+            rendered,
+            "network_candidate: kind={} address={}",
+            single_line(&candidate.kind),
+            candidate.address
+        )?;
+    }
+    writeln!(
+        rendered,
         "capacity: table={}/{} probe_in_flight={} probe_budget={} probe_attempts={} probe_failures={} probe_transferred={}",
         status.capacity_table_entries,
         status.capacity_table_limit,
@@ -1016,6 +1050,7 @@ async fn init(
         node_info: None,
         relay: RelayConfig {
             urls: Vec::new(),
+            discovery_urls: Vec::new(),
             servers: answers.derp_servers,
         },
         peers: answers.peers,
@@ -1637,6 +1672,7 @@ mod tests {
                 present: false,
             }],
             peers: vec![sample_peer()],
+            network: Default::default(),
             mesh: MeshStatus::default(),
             capacities: Vec::new(),
             capacity_table_entries: 0,

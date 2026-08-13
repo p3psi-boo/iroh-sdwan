@@ -44,11 +44,14 @@ description = "Example branch router"
 site = "example-site"
 
 [relay]
-# DERP 能力默认可用；服务器列表为空时不建立 DERP 传输。至少配置一个具有固定
-# 可达地址的 bootstrap peer；签名 Presence、peer 辅助打洞和 overlay transit
-# 会扩展其余 mesh。
+# discovery_enabled = true 且未填写下列 iroh URL 时，使用 iroh N0 默认公共
+# QAD/relay 集合。QAD、UPnP/PCP/NAT-PMP 和 host/IPv6 候选都从同一 UDP
+# endpoint 产生；正式连接可先走 relay，再在原连接上打洞并透明升级为直连。
+# 自建观察点至少填写两个；discovery_urls 也可作为加密 fallback relay。
+# discovery_urls = ["https://qad-1.example.net", "https://qad-2.example.net"]
+# DERP 服务器列表为空时不建立 DERP 自定义传输。
 # servers = ["https://derp-1.example.net/derp", "https://derp-2.example.net/derp"]
-# 可选的 iroh relay URL；设置后与 DERP 并行可用。
+# 可选的自建 iroh relay URL；至少两个，设置后取代 N0 默认集合并与 DERP 并行。
 # urls = ["https://relay-1.example.net", "https://relay-2.example.net"]
 
 [routing]

@@ -1487,6 +1487,7 @@ mod tests {
             routes_ready: true,
             routes: Vec::new(),
             peers: Vec::new(),
+            network: Default::default(),
             mesh: MeshStatus::default(),
             capacities: Vec::new(),
             capacity_table_entries: 0,

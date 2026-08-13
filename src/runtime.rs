@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
+    net::IpAddr,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -21,6 +22,7 @@ use iroh::{
         presets,
     },
 };
+use n0_watcher::Watcher as _;
 use noq_proto::congestion::Bbr3Config;
 use tokio::{
     sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot},
@@ -29,7 +31,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    address::{network_alpn, network_probe_alpn},
+    address::{
+        Nat64Prefix, discover_nat64_prefix, network_alpn, network_discovery_status,
+        network_probe_alpn,
+    },
     capacity::{CapacitySnapshot, RouteEstimateTable, RouteKey},
     capacity_probe::{
         ActiveProbeScheduler, CapacityProbeMessage, CapacityProbePacket, CapacityProbeReady,
@@ -47,15 +52,15 @@ use crate::{
     flow_router::{FlowRouter, RouteCandidate, RouteId},
     link_metrics::{LinkEstimator, LinkMetrics},
     mesh::{
-        CANDIDATES_PER_ROUND, EVALUATION_INTERVAL, MESH_BUFFER_POOL_BUDGET_BYTES, MeshPlanner,
-        MeshRuntime, PROBE_CONCURRENCY, PathKind, ProbeObservation, SignedPresence,
+        EVALUATION_INTERVAL, MESH_BUFFER_POOL_BUDGET_BYTES, MeshPlanner, MeshRuntime, PathKind,
+        ProbeObservation, SignedPresence,
     },
     observability::{
         CapacityObservability, FlowRouterCounters, PeerCounters, RuntimeState, log_runtime_started,
         publish_status, run_reporter, should_log,
     },
     packet::{FlowKey, PacketInfo, decrement_hop_limit_validated, inspect_ip_packet},
-    path_selection::{RELAY_HOLD_DOWN, WanPathSelector},
+    path_selection::WanPathSelector,
     protocol::{
         feature,
         session::{LinkAuthentication, NegotiatedSession, SessionPolicy, negotiate_connection},
@@ -100,8 +105,8 @@ const DERP_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // connection. This guard repairs the connection if no usable backup exists.
 const OVERLAY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(7);
 const INITIAL_OVERLAY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-const DISCOVERED_DIRECT_PROBE_COOLDOWN: Duration = Duration::from_secs(60);
 const BOOTSTRAP_FALLBACK_DELAY: Duration = Duration::from_secs(5);
+const NAT64_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const UNKNOWN_ADMISSION_CONCURRENCY: usize = 16;
 // This queue sits before FlowRouter classifies packets.  Keep it shallow so a
 // burst of jumbo TUN packets cannot hide hundreds of milliseconds of work in
@@ -577,6 +582,7 @@ async fn run_data_plane(
         .transpose()?;
 
     let inherited_relays = config.inherited_peer_relays()?;
+    let nat64_prefix = Arc::new(StdRwLock::new(None::<Nat64Prefix>));
     let (inbound_tx, inbound_rx) = mpsc::channel(FLOW_DISPATCH_QUEUE);
     let (route_tx, route_rx) = mpsc::channel(FLOW_DISPATCH_QUEUE);
     let (capacity_tx, capacity_rx) = mpsc::channel(CAPACITY_EVENT_QUEUE);
@@ -597,6 +603,7 @@ async fn run_data_plane(
                 trace_responder: trace_responder.clone(),
                 derp_transport: derp_transport.as_ref(),
                 mesh_runtime: mesh_runtime.clone(),
+                nat64_prefix: nat64_prefix.clone(),
                 inbound_packets: inbound_tx.clone(),
                 capacity_events: capacity_tx.clone(),
             },
@@ -623,10 +630,10 @@ async fn run_data_plane(
             local_id,
             endpoint.clone(),
             alpn.clone(),
-            probe_alpn.clone(),
             inherited_relays.clone(),
             trace_responder.clone(),
             derp_transport.clone(),
+            nat64_prefix.clone(),
             mesh,
             peers.clone(),
             peer_counters.clone(),
@@ -746,6 +753,14 @@ async fn run_data_plane(
         let observability = config.observability.clone();
         let runtime_state = runtime_state.clone();
         tasks.spawn(async move { run_reporter(observability, runtime_state).await });
+    }
+    {
+        let endpoint = endpoint.clone();
+        let runtime_state = runtime_state.clone();
+        let nat64_prefix = nat64_prefix.clone();
+        tasks.spawn(async move {
+            monitor_network_discovery(endpoint, runtime_state, nat64_prefix).await
+        });
     }
     if let Some(mesh_runtime) = mesh_runtime.clone() {
         let route_config = config.clone();
@@ -2101,17 +2116,20 @@ async fn build_endpoint(
     probe_alpn: &[u8],
     derp_transport: Option<Arc<DerpTransport>>,
 ) -> Result<Endpoint> {
-    let relay_mode = if config.relay.urls.is_empty() {
-        RelayMode::Disabled
+    let configured_relays = config.inherited_peer_relays()?;
+    let relay_mode = if configured_relays.is_empty() {
+        if config.discovery_enabled {
+            // Net-report needs multiple independent QAD observers to detect
+            // endpoint-dependent mappings.  The N0 preset provides that
+            // public observation set and an immediately usable relay path, so
+            // hard-NAT peers can establish the formal connection before QNT
+            // starts coordinated hole punching.
+            RelayMode::Default
+        } else {
+            RelayMode::Disabled
+        }
     } else {
-        RelayMode::custom(
-            config
-                .relay
-                .urls
-                .iter()
-                .map(|url| url.parse::<RelayUrl>())
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        )
+        RelayMode::custom(configured_relays)
     };
     // Retain BBR3's conservative, MTU-scaled initial window.  A fixed 64 KiB
     // window can inject roughly half a second of data on a 1 Mbit/s path
@@ -2195,6 +2213,81 @@ async fn build_endpoint(
     builder.bind().await.context("failed to bind iroh endpoint")
 }
 
+async fn monitor_network_discovery(
+    endpoint: Endpoint,
+    runtime_state: Arc<RuntimeState>,
+    nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
+) -> Result<()> {
+    let mut address_updates = endpoint.watch_addr().stream();
+    let mut report_updates = endpoint.net_report().stream();
+    let mut endpoint_addr = endpoint.addr();
+    let mut report = None;
+    let mut refresh = tokio::time::interval(NAT64_REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_status = None;
+
+    loop {
+        let refresh_nat64 = tokio::select! {
+            update = address_updates.next() => {
+                endpoint_addr = update.context("endpoint address watcher stopped")?;
+                true
+            }
+            update = report_updates.next() => {
+                report = update.context("network report watcher stopped")?;
+                false
+            }
+            _ = refresh.tick() => true,
+        };
+        if refresh_nat64 {
+            let detected = tokio::time::timeout(Duration::from_secs(3), detect_nat64_prefix())
+                .await
+                .ok()
+                .flatten();
+            *nat64_prefix
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = detected;
+        }
+        let nat64 = *nat64_prefix
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = network_discovery_status(&endpoint_addr, report.as_ref(), nat64);
+        if last_status.as_ref() != Some(&status) {
+            if status.mapping_varies_by_destination_ipv4 == Some(true)
+                || status.mapping_varies_by_destination_ipv6 == Some(true)
+            {
+                warn!(
+                    ipv4 = ?status.mapping_varies_by_destination_ipv4,
+                    ipv6 = ?status.mapping_varies_by_destination_ipv6,
+                    "NAT mapping varies by destination; direct UDP success may require relay or port prediction"
+                );
+            }
+            info!(
+                udp_ipv4 = status.udp_ipv4,
+                udp_ipv6 = status.udp_ipv6,
+                global_ipv4 = ?status.global_ipv4,
+                global_ipv6 = ?status.global_ipv6,
+                nat64_prefix = ?status.nat64_prefix,
+                candidates = status.candidates.len(),
+                "network discovery state changed"
+            );
+            runtime_state.update_network_discovery(status.clone());
+            last_status = Some(status);
+        }
+    }
+}
+
+async fn detect_nat64_prefix() -> Option<Nat64Prefix> {
+    let addresses = tokio::net::lookup_host(("ipv4only.arpa", 0))
+        .await
+        .ok()?
+        .filter_map(|address| match address.ip() {
+            IpAddr::V6(address) => Some(address),
+            IpAddr::V4(_) => None,
+        })
+        .collect::<Vec<_>>();
+    discover_nat64_prefix(addresses)
+}
+
 struct DynamicPeerTasks {
     peer: Arc<Peer>,
     tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
@@ -2217,17 +2310,16 @@ struct DynamicMeshManager {
     local_id: EndpointId,
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
-    probe_alpn: Arc<Vec<u8>>,
     inherited_relays: Vec<RelayUrl>,
     trace_responder: Option<Arc<TraceResponder>>,
     derp_transport: Option<Arc<DerpTransport>>,
+    nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
     mesh: Arc<MeshRuntime>,
     peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
     peer_counters: Arc<StdRwLock<HashMap<EndpointId, Arc<PeerCounters>>>>,
     inbound_packets: mpsc::Sender<InboundPacket>,
     capacity_events: mpsc::Sender<CapacityEvent>,
     planner: Mutex<MeshPlanner>,
-    probe_cursor: Mutex<usize>,
     admission_lock: Mutex<()>,
     dynamic: Mutex<HashMap<EndpointId, DynamicPeerTasks>>,
 }
@@ -2239,10 +2331,10 @@ impl DynamicMeshManager {
         local_id: EndpointId,
         endpoint: Endpoint,
         alpn: Arc<Vec<u8>>,
-        probe_alpn: Arc<Vec<u8>>,
         inherited_relays: Vec<RelayUrl>,
         trace_responder: Option<Arc<TraceResponder>>,
         derp_transport: Option<Arc<DerpTransport>>,
+        nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
         mesh: Arc<MeshRuntime>,
         peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
         peer_counters: Arc<StdRwLock<HashMap<EndpointId, Arc<PeerCounters>>>>,
@@ -2258,17 +2350,16 @@ impl DynamicMeshManager {
             local_id,
             endpoint,
             alpn,
-            probe_alpn,
             inherited_relays,
             trace_responder,
             derp_transport,
+            nat64_prefix,
             mesh,
             peers,
             peer_counters,
             inbound_packets,
             capacity_events,
             planner: Mutex::new(planner),
-            probe_cursor: Mutex::new(0),
             admission_lock: Mutex::new(()),
             dynamic: Mutex::new(HashMap::new()),
         }))
@@ -2323,14 +2414,18 @@ impl DynamicMeshManager {
                     let presence = presences
                         .iter()
                         .find(|presence| presence.body.owner == active.peer.endpoint_id)?;
-                    let (direct_path, _, direct_diversity) = presence_path(presence)?;
+                    let direct_hint = presence_direct_path(presence).unwrap_or((
+                        PathKind::DirectIpv4,
+                        Duration::from_millis(100),
+                        "qnt-direct".into(),
+                    ));
                     let (path, diversity_key) = match active
                         .peer
                         .counters
                         .selected_path_transport
                         .load(Ordering::Relaxed)
                     {
-                        1 => (direct_path, direct_diversity),
+                        1 => (direct_hint.0, direct_hint.2),
                         2..=4 => (PathKind::Relay, "relay".into()),
                         _ => return None,
                     };
@@ -2388,74 +2483,36 @@ impl DynamicMeshManager {
             .collect::<HashSet<_>>();
         let mut candidates = presences
             .iter()
-            // Both endpoints probe. Coordinated outbound traffic is required
-            // to open two NAT mappings; only the canonical lower EndpointId
-            // will later activate the durable adjacency.
             .filter(|presence| !dynamic_ids.contains(&presence.body.owner))
             .filter(|presence| !pinned.contains(&presence.body.owner))
             .filter(|presence| presence_path(presence).is_some())
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by_key(|presence| presence.body.owner);
-        let probe_batch = if candidates.is_empty() {
-            Vec::new()
-        } else {
-            let mut cursor = self.probe_cursor.lock().await;
-            *cursor %= candidates.len();
-            let batch = (0..candidates.len().min(CANDIDATES_PER_ROUND))
-                .map(|offset| candidates[(*cursor + offset) % candidates.len()].clone())
-                .collect::<Vec<_>>();
-            *cursor = (*cursor + batch.len()) % candidates.len();
-            batch
-        };
-        let probe_observations = futures_util::stream::iter(probe_batch)
-            .map(|presence| async move {
-                let endpoint_id = presence.body.owner;
-                let transit_enabled = presence.body.transit_enabled;
-                match self
-                    .mesh
-                    .probe_candidate(&presence, self.probe_alpn.as_slice())
-                    .await
-                {
-                    Ok((rtt, address)) => ProbeObservation {
-                        endpoint_id,
-                        path: if address.is_ipv6() {
-                            PathKind::DirectIpv6
-                        } else {
-                            PathKind::DirectIpv4
-                        },
-                        rtt,
-                        loss_ppm: 0,
-                        diversity_key: diversity_key(address),
-                        transit_enabled,
-                        observed_at: Instant::now(),
-                    },
-                    Err(error) => {
-                        debug!(%endpoint_id, %error, "mesh candidate probe failed");
-                        ProbeObservation {
-                            endpoint_id,
-                            path: PathKind::Unreachable,
-                            rtt: Duration::from_secs(3),
-                            loss_ppm: 1_000_000,
-                            diversity_key: presence
-                                .body
-                                .direct_addresses
-                                .first()
-                                .copied()
-                                .map(diversity_key)
-                                .unwrap_or_default(),
-                            transit_enabled,
-                            observed_at: Instant::now(),
-                        }
-                    }
-                }
+        // Presence is the side channel: once any relay or direct locator is
+        // known, create the durable connection immediately.  The formal iroh
+        // connection starts on the first reachable path (normally relay) and
+        // performs QNT hole punching on that same connection.  A disposable
+        // direct-only QUIC probe would prevent two hard-NAT peers from ever
+        // reaching the coordinated punching phase.
+        let candidate_observations = candidates.iter().filter_map(|presence| {
+            let (path, rtt, diversity_key) = presence_path(presence)?;
+            Some(ProbeObservation {
+                endpoint_id: presence.body.owner,
+                path,
+                rtt,
+                loss_ppm: 0,
+                diversity_key,
+                transit_enabled: presence.body.transit_enabled,
+                observed_at: now,
             })
-            .buffer_unordered(PROBE_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+        });
 
         let mut planner = self.planner.lock().await;
-        for observation in active_observations.into_iter().chain(probe_observations) {
+        for observation in active_observations
+            .into_iter()
+            .chain(candidate_observations)
+        {
             planner.observe(observation);
         }
         let eligible = presences
@@ -2537,7 +2594,7 @@ impl DynamicMeshManager {
         presence.body.direct_addresses = self.mesh.direct_candidates(&presence).await;
         ensure!(
             presence_path(&presence).is_some(),
-            "dynamic endpoint has no usable direct candidate"
+            "dynamic endpoint has no usable direct or relay candidate"
         );
         let _admission = self.admission_lock.lock().await;
         ensure!(
@@ -2592,6 +2649,7 @@ impl DynamicMeshManager {
                 trace_responder: self.trace_responder.clone(),
                 derp_transport: self.derp_transport.as_ref(),
                 mesh_runtime: Some(self.mesh.clone()),
+                nat64_prefix: self.nat64_prefix.clone(),
                 inbound_packets: self.inbound_packets.clone(),
                 capacity_events: self.capacity_events.clone(),
             },
@@ -2663,6 +2721,24 @@ fn presence_peer_config(presence: &SignedPresence) -> PeerConfig {
 }
 
 fn presence_path(presence: &SignedPresence) -> Option<(PathKind, Duration, String)> {
+    if let Some(direct) = presence_direct_path(presence) {
+        return Some(direct);
+    }
+    (!presence.body.relay_urls.is_empty() || presence.body.derp_public_key.is_some()).then(|| {
+        (
+            PathKind::Relay,
+            Duration::from_millis(400),
+            presence
+                .body
+                .relay_urls
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "derp".into()),
+        )
+    })
+}
+
+fn presence_direct_path(presence: &SignedPresence) -> Option<(PathKind, Duration, String)> {
     if let Some(address) = presence
         .body
         .direct_addresses
@@ -2724,9 +2800,7 @@ struct Peer {
     shutdown_ready: Notify,
     shutting_down: AtomicBool,
     refresh_requested: AtomicBool,
-    direct_probe_requested: AtomicBool,
     relay_bootstrap_started: AtomicBool,
-    last_direct_probe: Mutex<Option<Instant>>,
     discovered_direct_addresses: Mutex<HashSet<std::net::SocketAddr>>,
     dial_outbound: bool,
     connection_mode: ConnectionMode,
@@ -2760,6 +2834,7 @@ struct Peer {
     fec_decoder: Mutex<FecDecoder>,
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
+    nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2778,6 +2853,7 @@ struct PeerServices<'a> {
     trace_responder: Option<Arc<TraceResponder>>,
     derp_transport: Option<&'a Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
+    nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
     inbound_packets: mpsc::Sender<InboundPacket>,
     capacity_events: mpsc::Sender<CapacityEvent>,
 }
@@ -2943,15 +3019,13 @@ impl Peer {
             shutdown_ready: Notify::new(),
             shutting_down: AtomicBool::new(false),
             refresh_requested: AtomicBool::new(false),
-            direct_probe_requested: AtomicBool::new(false),
             relay_bootstrap_started: AtomicBool::new(false),
-            last_direct_probe: Mutex::new(None),
             discovered_direct_addresses: Mutex::new(HashSet::new()),
             dial_outbound,
             connection_mode,
             relay_bootstrap_enabled: link.is_none()
                 && config.discovery_enabled
-                && (!config.relay.urls.is_empty() || !peer.relay_urls.is_empty()),
+                && (config.relay.iroh_urls().next().is_some() || !peer.relay_urls.is_empty()),
             candidate_exchange_enabled: link.is_none() && config.discovery_enabled,
             trace_responder: services.trace_responder,
             enforce_overlay_prefixes: config.packet_policy.enforce_overlay_prefixes,
@@ -2992,6 +3066,7 @@ impl Peer {
             )?),
             derp_transport: services.derp_transport.cloned(),
             mesh_runtime: services.mesh_runtime,
+            nat64_prefix: services.nat64_prefix,
         })
     }
 
@@ -3401,12 +3476,6 @@ impl Peer {
                 }
                 continue;
             }
-            if self.direct_probe_requested.swap(false, Ordering::Relaxed) {
-                if let Err(error) = self.refresh_direct_connection().await {
-                    debug!(peer = %self.name, %error, "direct underlay probe did not establish a connection");
-                }
-                continue;
-            }
             self.reconnect_needed.notified().await;
         }
     }
@@ -3419,71 +3488,6 @@ impl Peer {
             .connect(endpoint_addr, self.alpn.as_slice())
             .await
             .with_context(|| format!("failed refreshing peer {}", self.name))?;
-        self.install_connection(connection).await
-    }
-
-    async fn request_direct_probe(self: &Arc<Self>) {
-        // Only the deterministic dialer creates the replacement connection.
-        // If both sides refresh simultaneously they can install different
-        // selected paths during the hold-down boundary and briefly black-hole
-        // the otherwise healthy relay connection.
-        if !self.can_dial() {
-            return;
-        }
-        // A relay-only peer has nowhere direct to probe. In particular, a
-        // custom DERP address in iroh's remote-info cache is not a direct
-        // candidate. Asking iroh to refresh with it can disturb the only open
-        // path and cause a needless liveness reconnect.
-        let has_configured_direct = self.endpoint_addr.ip_addrs().next().is_some();
-        let has_discovered_direct = !self.discovered_direct_addresses.lock().await.is_empty();
-        if !has_configured_direct && !has_discovered_direct {
-            return;
-        }
-        let cooldown = if self.endpoint_addr.ip_addrs().next().is_some() {
-            RELAY_HOLD_DOWN
-        } else {
-            DISCOVERED_DIRECT_PROBE_COOLDOWN
-        };
-        let mut last = self.last_direct_probe.lock().await;
-        if last.is_some_and(|instant| instant.elapsed() < cooldown) {
-            return;
-        }
-        *last = Some(Instant::now());
-        drop(last);
-        info!(peer = %self.name, "probing direct underlay after relay hold-down");
-        self.direct_probe_requested.store(true, Ordering::Relaxed);
-        self.reconnect_needed.notify_one();
-    }
-
-    async fn refresh_direct_connection(self: &Arc<Self>) -> Result<()> {
-        let resolved = self.dial_addr().await;
-        let direct_addresses = resolved.ip_addrs().copied().collect::<Vec<_>>();
-        if direct_addresses.is_empty() {
-            bail!("no safe direct address was discovered");
-        }
-        let mut endpoint_addr = EndpointAddr::new(self.endpoint_id);
-        for address in &direct_addresses {
-            endpoint_addr = endpoint_addr.with_ip_addr(*address);
-        }
-        let result = tokio::time::timeout(
-            Duration::from_secs(4),
-            self.endpoint.connect(endpoint_addr, self.alpn.as_slice()),
-        )
-        .await;
-        let connection = result
-            .context("direct underlay probe timed out")?
-            .context("direct underlay probe failed")?;
-        let selected_configured_direct = connection.paths().iter().any(|path| {
-            path.is_selected()
-                && matches!(
-                    path.remote_addr(),
-                    TransportAddr::Ip(address) if direct_addresses.contains(address)
-                )
-        });
-        if !selected_configured_direct {
-            connection.close(7_u8.into(), b"direct probe did not use configured address");
-            bail!("direct underlay probe resolved through a non-configured path");
-        }
         self.install_connection(connection).await
     }
 
@@ -3571,6 +3575,23 @@ impl Peer {
             })
             .await;
         }
+        if let Some(prefix) = *self
+            .nat64_prefix
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let synthesized = nat64_candidates(prefix, &endpoint_addr)
+                .into_iter()
+                .filter(|address| {
+                    dial_address_allowed(
+                        &TransportAddr::Ip(*address),
+                        &self.forbidden_underlay_prefixes,
+                    )
+                })
+                .collect::<Vec<_>>();
+            endpoint_addr =
+                endpoint_addr.with_addrs(synthesized.into_iter().map(TransportAddr::Ip));
+        }
         endpoint_addr
     }
 
@@ -3612,20 +3633,6 @@ impl Peer {
             return;
         }
         info!(peer = %self.name, addresses = ?added_addresses, "learned authenticated direct underlay candidates");
-        let selected_relay = self
-            .connection
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|connection| {
-                connection
-                    .paths()
-                    .iter()
-                    .any(|path| path.is_selected() && is_relay_transport(path.remote_addr()))
-            });
-        if selected_relay {
-            self.request_direct_probe().await;
-        }
     }
 
     async fn connection(self: &Arc<Self>) -> Result<Connection> {
@@ -4012,6 +4019,48 @@ impl Peer {
             }
             peer.clear_connection(stable_id).await;
         });
+        if self.candidate_exchange_enabled {
+            let peer = self.clone();
+            let candidate_connection = connection.clone();
+            tokio::spawn(async move {
+                let stable_id = candidate_connection.stable_id();
+                let mut address_updates = peer.endpoint.watch_addr().stream();
+                while address_updates.next().await.is_some() {
+                    let is_current = !peer.shutting_down.load(Ordering::Acquire)
+                        && peer
+                            .connection
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_some_and(|current| current.stable_id() == stable_id);
+                    if !is_current {
+                        break;
+                    }
+                    let addresses = peer.local_address_candidates();
+                    if addresses.is_empty() {
+                        continue;
+                    }
+                    let Ok(datagram) = encode_address_candidates(&addresses) else {
+                        continue;
+                    };
+                    // The iroh QNT update on this same formal connection is the
+                    // primary, reliable path trigger.  This authenticated
+                    // overlay hint supplements it with Ironet's filtered
+                    // candidate view; bounded retries cover DATAGRAM loss
+                    // without falling back to periodic gossip.
+                    for attempt in 0..3 {
+                        if candidate_connection
+                            .send_datagram_wait(datagram.clone())
+                            .await
+                            .is_ok()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                    }
+                }
+            });
+        }
         let peer = self.clone();
         let heartbeat_connection = connection.clone();
         tokio::spawn(async move {
@@ -4020,7 +4069,6 @@ impl Peer {
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_udp_rx = heartbeat_connection.stats().udp_rx.datagrams;
             let mut last_transport_receive = Instant::now();
-            let mut next_address_advertisement = Instant::now();
             heartbeat.tick().await;
             loop {
                 heartbeat.tick().await;
@@ -4095,19 +4143,6 @@ impl Peer {
                         debug!(peer = %peer.name, "timed out queueing overlay heartbeat");
                     }
                 }
-                if Instant::now() >= next_address_advertisement {
-                    next_address_advertisement = Instant::now() + Duration::from_secs(5);
-                    let addresses = peer.local_address_candidates();
-                    if !addresses.is_empty()
-                        && let Ok(datagram) = encode_address_candidates(&addresses)
-                    {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(1),
-                            heartbeat_connection.send_datagram_wait(datagram),
-                        )
-                        .await;
-                    }
-                }
             }
         });
         let peer = self.clone();
@@ -4117,7 +4152,6 @@ impl Peer {
             let mut telemetry = tokio::time::interval(Duration::from_secs(1));
             telemetry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut frame_sizer = AdaptiveFrameSizer::new(peer.frame_size_ceiling);
-            let mut relay_selected_since = None;
             loop {
                 tokio::select! {
                     snapshot = paths.next() => {
@@ -4191,15 +4225,6 @@ impl Peer {
                             continue;
                         };
                         let stats = path.stats();
-                        if is_relay_transport(path.remote_addr()) {
-                            let selected_since = relay_selected_since.get_or_insert_with(Instant::now);
-                            if selected_since.elapsed() >= RELAY_HOLD_DOWN {
-                                peer.request_direct_probe().await;
-                                relay_selected_since = Some(Instant::now());
-                            }
-                        } else {
-                            relay_selected_since = None;
-                        }
                         store_duration_micros(&peer.counters.path_rtt_micros, stats.rtt);
                         peer.counters.path_mtu.store(u64::from(stats.current_mtu), Ordering::Relaxed);
                         peer.counters.path_cwnd_bytes.store(stats.cwnd, Ordering::Relaxed);
@@ -4382,6 +4407,22 @@ impl Peer {
     }
 }
 
+fn nat64_candidates(
+    prefix: Nat64Prefix,
+    endpoint_addr: &EndpointAddr,
+) -> Vec<std::net::SocketAddr> {
+    endpoint_addr
+        .ip_addrs()
+        .filter_map(|address| match address {
+            std::net::SocketAddr::V4(address) => Some(std::net::SocketAddr::new(
+                IpAddr::V6(prefix.synthesize(*address.ip())),
+                address.port(),
+            )),
+            std::net::SocketAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 fn path_transport_code(address: &TransportAddr) -> u64 {
     match address {
         TransportAddr::Ip(_) => 1,
@@ -4392,6 +4433,7 @@ fn path_transport_code(address: &TransportAddr) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn is_relay_transport(address: &TransportAddr) -> bool {
     match address {
         TransportAddr::Relay(_) => true,
@@ -4706,9 +4748,66 @@ fn dial_address_allowed(address: &TransportAddr, forbidden_prefixes: &[IpNet]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::PresenceBody;
 
     fn endpoint(byte: u8) -> EndpointId {
         SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    fn presence_with_paths(
+        key_byte: u8,
+        direct_addresses: Vec<std::net::SocketAddr>,
+        relay_urls: Vec<String>,
+    ) -> SignedPresence {
+        let key = SecretKey::from_bytes(&[key_byte; 32]);
+        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        let body = PresenceBody::from_config(
+            &config,
+            key.public(),
+            1,
+            std::time::SystemTime::now(),
+            direct_addresses,
+            relay_urls,
+            None,
+        )
+        .unwrap();
+        SignedPresence::sign(body, &key, &config.network_id).unwrap()
+    }
+
+    #[test]
+    fn relay_only_presence_is_eligible_for_formal_connection() {
+        let presence =
+            presence_with_paths(61, Vec::new(), vec!["https://relay.example.com".into()]);
+        let (path, _, diversity) = presence_path(&presence).unwrap();
+        assert_eq!(path, PathKind::Relay);
+        assert_eq!(diversity, "https://relay.example.com");
+    }
+
+    #[test]
+    fn direct_path_is_preferred_over_relay_hint() {
+        let presence = presence_with_paths(
+            62,
+            vec!["203.0.113.62:10119".parse().unwrap()],
+            vec!["https://relay.example.com".into()],
+        );
+        assert_eq!(presence_path(&presence).unwrap().0, PathKind::DirectIpv4);
+    }
+
+    #[test]
+    fn nat64_candidate_preserves_ipv4_port() {
+        let endpoint_addr =
+            EndpointAddr::new(endpoint(63)).with_ip_addr("203.0.113.63:45119".parse().unwrap());
+        let candidates = nat64_candidates(
+            Nat64Prefix {
+                network: "64:ff9b::".parse().unwrap(),
+                prefix_len: 96,
+            },
+            &endpoint_addr,
+        );
+        assert_eq!(
+            candidates,
+            vec!["[64:ff9b::cb00:713f]:45119".parse().unwrap()]
+        );
     }
 
     fn route_input(
@@ -5021,6 +5120,7 @@ mod tests {
     fn derp_uses_stream_tolerant_path_idle_timeout() {
         let derp = RelayConfig {
             urls: Vec::new(),
+            discovery_urls: Vec::new(),
             servers: vec!["https://derp.example.com".into()],
         };
         assert_eq!(quic_path_idle_timeout(&derp), DERP_PATH_IDLE_TIMEOUT);
@@ -5028,6 +5128,11 @@ mod tests {
             quic_path_idle_timeout(&RelayConfig::default()),
             QUIC_PATH_IDLE_TIMEOUT
         );
+    }
+
+    #[test]
+    fn default_qad_observation_set_has_multiple_vantage_points() {
+        assert!(RelayMode::Default.relay_map().len() >= 2);
     }
 
     #[test]
