@@ -1191,8 +1191,8 @@ fn render(frame: &mut Frame<'_>, dashboard: &Dashboard, interval: Duration) {
     let area = frame.area();
     if area.width < 80 || area.height < 22 {
         frame.render_widget(
-            Paragraph::new("Terminal too small for iroh-sdwan tui (minimum 80x22)")
-                .block(Block::bordered().title(" iroh-sdwan tui "))
+            Paragraph::new("Terminal too small for ironet tui (minimum 80x22)")
+                .block(Block::bordered().title(" ironet tui "))
                 .wrap(Wrap { trim: true }),
             area,
         );
@@ -1490,7 +1490,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard, inter
     let age = unix_now().saturating_sub(status.updated_unix);
     let mut line = vec![
         Span::styled(
-            " iroh-sdwan ",
+            " ironet ",
             Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
         ),
         Span::raw("  "),
@@ -1994,7 +1994,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let text = vec![
         Line::from(Span::styled(
-            "iroh-sdwan tui",
+            "ironet tui",
             Style::new().fg(Color::Cyan).bold(),
         )),
         Line::from(""),
@@ -2237,7 +2237,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "name": "peer-a",
             "endpoint_id": "endpoint-a",
-            "interface": "isw0",
+            "interface": "ironet0",
             "connected": true,
             "connection_events": 1,
             "tx_packets": 10,

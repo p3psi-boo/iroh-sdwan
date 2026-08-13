@@ -137,7 +137,7 @@ pub struct LinkConfig {
     pub allowed_local_prefixes: Vec<IpNet>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_remote_prefixes: Vec<IpNet>,
-    /// 32-byte hexadecimal pairwise secret used by the v4 session transcript.
+    /// 32-byte hexadecimal pairwise secret used by the V1 session transcript.
     pub auth_key: String,
 }
 
@@ -1067,7 +1067,7 @@ fn is_default_max_frame_size(value: &u16) -> bool {
 }
 
 fn default_node_interface() -> String {
-    "isw0".into()
+    "ironet0".into()
 }
 
 fn is_default_node_interface(value: &str) -> bool {
@@ -1091,7 +1091,7 @@ fn is_default_rule_priority(value: &u32) -> bool {
 }
 
 fn default_status_file() -> PathBuf {
-    "/run/iroh-sdwan/status.json".into()
+    "/run/ironet/status.json".into()
 }
 
 fn is_default_status_file(value: &Path) -> bool {
@@ -1099,7 +1099,7 @@ fn is_default_status_file(value: &Path) -> bool {
 }
 
 fn default_metrics_file() -> PathBuf {
-    "/run/iroh-sdwan/metrics.prom".into()
+    "/run/ironet/metrics.prom".into()
 }
 
 fn is_default_metrics_file(value: &Path) -> bool {
@@ -1204,7 +1204,7 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
-            node_interface: "isw0".into(),
+            node_interface: "ironet0".into(),
             node_addresses: Vec::new(),
             advertised_prefixes: Vec::new(),
             node_info: Some(NodeInfo {

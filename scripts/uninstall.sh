@@ -11,13 +11,13 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-systemctl disable --now iroh-sdwan 2>/dev/null || true
+systemctl disable --now ironet 2>/dev/null || true
 rm -f \
-  "$SYSTEMD_DIR/iroh-sdwan.service" \
-  "$SYSCTL_DIR/90-iroh-sdwan.conf" \
-  "$SYSUSERS_DIR/iroh-sdwan.conf" \
-  "$PREFIX/bin/iroh-sdwan" \
-  "$PREFIX/bin/iroh-sdwand"
+  "$SYSTEMD_DIR/ironet.service" \
+  "$SYSCTL_DIR/90-ironet.conf" \
+  "$SYSUSERS_DIR/ironet.conf" \
+  "$PREFIX/bin/ironet" \
+  "$PREFIX/bin/ironetd"
 sysctl --system >/dev/null
 systemctl daemon-reload
 echo "binary and service removed; configuration and identity were preserved"

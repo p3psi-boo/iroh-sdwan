@@ -1,7 +1,7 @@
-# `iroh-sdwan init` 输出的共享网络加入密钥。所有节点使用同一值，
+# `ironet init` 输出的共享网络加入密钥。所有节点使用同一值，
 # 不要将其提交到公开配置仓库。
 network_id = "REPLACE_WITH_RANDOM_NETWORK_ID"
-identity_file = "/var/lib/iroh-sdwan/identity.key"
+identity_file = "/var/lib/ironet/identity.key"
 # 可选的固定 iroh UDP 监听地址，适用于静态直连地址部署。
 # bind_addresses = ["0.0.0.0:4000"]
 # 当直连底层路径任一端点落入这些前缀时拒绝该路径。
@@ -20,9 +20,9 @@ tun_mtu = 65535
 # 自动帧大小的安全上限。QUIC 从 1400 字节 UDP 负载开始；检测到 MTU 黑洞时，
 # 自动回退到 1200 字节的安全下限。
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 
-# 配置到 isw0 虚拟接口的稳定节点/管理地址。
+# 配置到 ironet0 虚拟接口的稳定节点/管理地址。
 node_addresses = [
   "21.0.0.1/32",
   "21::1/128",
@@ -82,8 +82,8 @@ block_timeout_millis = 20
 decoder_ttl_millis = 2000
 
 [observability]
-status_file = "/run/iroh-sdwan/status.json"
-metrics_file = "/run/iroh-sdwan/metrics.prom"
+status_file = "/run/ironet/status.json"
+metrics_file = "/run/ironet/metrics.prom"
 report_interval_secs = 10
 
 # 只添加引导/固定邻居（例如一个或两个公共节点）。其他成员通过签名
@@ -120,5 +120,5 @@ report_interval_secs = 10
 # allowed_remote_prefixes = ["10.255.0.2/32"]
 # auth_key = "REPLACE_WITH_64_HEX_PAIRWISE_SECRET"
 
-# 静态远端路由不写入本文件。使用 `iroh-sdwan route add/import` 管理
+# 静态远端路由不写入本文件。使用 `ironet route add/import` 管理
 # identity_file 同目录的 routes.toml；`route list/remove` 可查询和删除。

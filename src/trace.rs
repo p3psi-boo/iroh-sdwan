@@ -20,8 +20,8 @@ use crate::{
 pub const TRACE_PORT: u16 = 49_091;
 pub const MAX_PING_COUNT: u16 = 20;
 
-const REQUEST_MAGIC: &[u8; 8] = b"ISWTRC1Q";
-const RESPONSE_MAGIC: &[u8; 8] = b"ISWTRC1R";
+const REQUEST_MAGIC: &[u8; 8] = b"IRNTRC1Q";
+const RESPONSE_MAGIC: &[u8; 8] = b"IRNTRC1R";
 // Pad requests to the maximum response size so a spoofed probe cannot turn a
 // node into a UDP amplification source.
 const REQUEST_LEN: usize = 1_024;

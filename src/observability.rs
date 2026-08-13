@@ -793,26 +793,26 @@ fn peer_snapshot(peer: &PeerCounters) -> PeerStatus {
 
 fn render_prometheus(status: &RuntimeStatus) -> String {
     let mut output = String::new();
-    output.push_str("# TYPE iroh_sdwan_ready gauge\n");
-    output.push_str(&format!("iroh_sdwan_ready {}\n", u8::from(status.ready)));
-    output.push_str("# TYPE iroh_sdwan_routes_ready gauge\n");
+    output.push_str("# TYPE ironet_ready gauge\n");
+    output.push_str(&format!("ironet_ready {}\n", u8::from(status.ready)));
+    output.push_str("# TYPE ironet_routes_ready gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_routes_ready {}\n",
+        "ironet_routes_ready {}\n",
         u8::from(status.routes_ready)
     ));
-    output.push_str("# TYPE iroh_sdwan_capacity_table_entries gauge\n");
+    output.push_str("# TYPE ironet_capacity_table_entries gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_capacity_table_entries {}\n",
+        "ironet_capacity_table_entries {}\n",
         status.capacity_table_entries
     ));
-    output.push_str("# TYPE iroh_sdwan_capacity_table_limit gauge\n");
+    output.push_str("# TYPE ironet_capacity_table_limit gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_capacity_table_limit {}\n",
+        "ironet_capacity_table_limit {}\n",
         status.capacity_table_limit
     ));
-    output.push_str("# TYPE iroh_sdwan_capacity_probe_inflight gauge\n");
+    output.push_str("# TYPE ironet_capacity_probe_inflight gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_capacity_probe_inflight {}\n",
+        "ironet_capacity_probe_inflight {}\n",
         u8::from(status.capacity_probe_in_flight)
     ));
     for (name, value) in [
@@ -820,11 +820,11 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
         ("failures_total", status.capacity_probe_failures),
         ("bytes_total", status.capacity_probe_bytes),
     ] {
-        output.push_str(&format!("iroh_sdwan_capacity_probe_{name} {value}\n"));
+        output.push_str(&format!("ironet_capacity_probe_{name} {value}\n"));
     }
-    output.push_str("# TYPE iroh_sdwan_capacity_probe_budget_bytes gauge\n");
+    output.push_str("# TYPE ironet_capacity_probe_budget_bytes gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_capacity_probe_budget_bytes {}\n",
+        "ironet_capacity_probe_budget_bytes {}\n",
         status.capacity_probe_budget_bytes
     ));
     for (name, value) in [
@@ -834,25 +834,25 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
         ("route_switches_total", status.flow_router.route_switches),
         ("no_route_drops_total", status.flow_router.no_route_drops),
     ] {
-        output.push_str(&format!("iroh_sdwan_flow_router_{name} {value}\n"));
+        output.push_str(&format!("ironet_flow_router_{name} {value}\n"));
     }
-    output.push_str("# TYPE iroh_sdwan_route_present gauge\n");
+    output.push_str("# TYPE ironet_route_present gauge\n");
     for route in &status.routes {
         output.push_str(&format!(
-            "iroh_sdwan_route_present{{prefix=\"{}\"}} {}\n",
+            "ironet_route_present{{prefix=\"{}\"}} {}\n",
             prometheus_escape(&route.prefix),
             u8::from(route.present)
         ));
     }
-    output.push_str("# TYPE iroh_sdwan_peer_connected gauge\n");
-    output.push_str("# TYPE iroh_sdwan_mesh_directory_entries gauge\n");
+    output.push_str("# TYPE ironet_peer_connected gauge\n");
+    output.push_str("# TYPE ironet_mesh_directory_entries gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_mesh_directory_entries {}\n",
+        "ironet_mesh_directory_entries {}\n",
         status.mesh.directory_entries
     ));
-    output.push_str("# TYPE iroh_sdwan_mesh_quarantined_entries gauge\n");
+    output.push_str("# TYPE ironet_mesh_quarantined_entries gauge\n");
     output.push_str(&format!(
-        "iroh_sdwan_mesh_quarantined_entries {}\n",
+        "ironet_mesh_quarantined_entries {}\n",
         status.mesh.quarantined_entries
     ));
     for route in &status.capacities {
@@ -893,10 +893,10 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             ("probe_failures_total", route.probe_failures),
             ("probe_bytes_total", route.probe_bytes),
         ] {
-            output.push_str(&format!("iroh_sdwan_route_{name}{{{labels}}} {value}\n"));
+            output.push_str(&format!("ironet_route_{name}{{{labels}}} {value}\n"));
         }
         output.push_str(&format!(
-            "iroh_sdwan_route_capacity_info{{{labels},freshness=\"{}\",source=\"{}\"}} 1\n",
+            "ironet_route_capacity_info{{{labels},freshness=\"{}\",source=\"{}\"}} 1\n",
             prometheus_escape(&route.freshness),
             prometheus_escape(route.sample_source.as_deref().unwrap_or("none")),
         ));
@@ -909,17 +909,17 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             prometheus_escape(&peer.interface)
         );
         output.push_str(&format!(
-            "iroh_sdwan_peer_connected{{{labels}}} {}\n",
+            "ironet_peer_connected{{{labels}}} {}\n",
             u8::from(peer.connected)
         ));
         output.push_str(&format!(
-            "iroh_sdwan_peer_protocol_info{{{labels},major=\"{}\",minor=\"{}\",private_link=\"{}\"}} 1\n",
+            "ironet_peer_protocol_info{{{labels},major=\"{}\",minor=\"{}\",private_link=\"{}\"}} 1\n",
             peer.protocol_major,
             peer.protocol_minor,
             peer.private_link,
         ));
         output.push_str(&format!(
-            "iroh_sdwan_peer_negotiated_features{{{labels}}} {}\n",
+            "ironet_peer_negotiated_features{{{labels}}} {}\n",
             peer.negotiated_features
         ));
         for (name, value) in [
@@ -974,7 +974,7 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             ("reassembly_evictions_total", peer.reassembly_evictions),
             ("path_switches_total", peer.path_switches),
         ] {
-            output.push_str(&format!("iroh_sdwan_peer_{name}{{{labels}}} {value}\n"));
+            output.push_str(&format!("ironet_peer_{name}{{{labels}}} {value}\n"));
         }
         for (name, value) in [
             ("queue_packets", peer.queue_packets),
@@ -1005,10 +1005,10 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             ("path_lost_packets", peer.path_lost_packets),
             ("open_paths", peer.open_paths),
         ] {
-            output.push_str(&format!("iroh_sdwan_peer_{name}{{{labels}}} {value}\n"));
+            output.push_str(&format!("ironet_peer_{name}{{{labels}}} {value}\n"));
         }
         output.push_str(&format!(
-            "iroh_sdwan_peer_selected_path_info{{{labels},transport=\"{}\",remote=\"{}\"}} 1\n",
+            "ironet_peer_selected_path_info{{{labels},transport=\"{}\",remote=\"{}\"}} 1\n",
             prometheus_escape(&peer.selected_path_transport),
             prometheus_escape(&peer.selected_path_remote)
         ));
@@ -1147,7 +1147,7 @@ mod tests {
         let peer = Arc::new(PeerCounters::new(
             "branch-a".into(),
             SecretKey::from_bytes(&[1; 32]).public(),
-            "isw-a".into(),
+            "ironet-a".into(),
         ));
         peer.connected.store(true, Ordering::Relaxed);
         peer.tx_packets.store(4, Ordering::Relaxed);
@@ -1182,18 +1182,18 @@ mod tests {
         assert_eq!(peer.quic_send_buffer_used_bytes, 2_400);
         assert_eq!(peer.bulk_preemptions, 7);
         let output = render_prometheus(&status);
-        assert!(output.contains("iroh_sdwan_peer_connected"));
-        assert!(output.contains("iroh_sdwan_peer_tx_packets_total"));
-        assert!(output.contains("iroh_sdwan_capacity_table_entries"));
-        assert!(output.contains("iroh_sdwan_capacity_probe_inflight"));
-        assert!(output.contains("iroh_sdwan_flow_router_active_flows"));
-        assert!(output.contains("iroh_sdwan_peer_priority_queue_packets"));
-        assert!(output.contains("iroh_sdwan_peer_priority_queue_bytes"));
-        assert!(output.contains("iroh_sdwan_peer_bulk_queue_packets"));
-        assert!(output.contains("iroh_sdwan_peer_bulk_queue_bytes"));
-        assert!(output.contains("iroh_sdwan_peer_active_tx_bytes"));
-        assert!(output.contains("iroh_sdwan_peer_quic_send_buffer_used_bytes"));
-        assert!(output.contains("iroh_sdwan_peer_bulk_preemptions_total"));
+        assert!(output.contains("ironet_peer_connected"));
+        assert!(output.contains("ironet_peer_tx_packets_total"));
+        assert!(output.contains("ironet_capacity_table_entries"));
+        assert!(output.contains("ironet_capacity_probe_inflight"));
+        assert!(output.contains("ironet_flow_router_active_flows"));
+        assert!(output.contains("ironet_peer_priority_queue_packets"));
+        assert!(output.contains("ironet_peer_priority_queue_bytes"));
+        assert!(output.contains("ironet_peer_bulk_queue_packets"));
+        assert!(output.contains("ironet_peer_bulk_queue_bytes"));
+        assert!(output.contains("ironet_peer_active_tx_bytes"));
+        assert!(output.contains("ironet_peer_quic_send_buffer_used_bytes"));
+        assert!(output.contains("ironet_peer_bulk_preemptions_total"));
     }
 
     #[tokio::test]
@@ -1249,9 +1249,9 @@ mod tests {
         assert!(status.capacities[0].probe_in_flight);
         assert_eq!(status.capacities[0].probe_failures, 2);
         let output = render_prometheus(&status);
-        assert!(output.contains("iroh_sdwan_route_probe_attempts_total"));
-        assert!(output.contains("iroh_sdwan_route_probe_bytes_total"));
-        assert!(output.contains("iroh_sdwan_route_switches_total"));
+        assert!(output.contains("ironet_route_probe_attempts_total"));
+        assert!(output.contains("ironet_route_probe_bytes_total"));
+        assert!(output.contains("ironet_route_switches_total"));
     }
 
     #[test]

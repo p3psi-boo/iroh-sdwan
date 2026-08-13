@@ -54,9 +54,9 @@ const GOSSIP_INTERVAL: Duration = Duration::from_secs(15);
 const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_STREAMS_PER_MINUTE: usize = 256;
 const PROBES_PER_MINUTE: usize = 128;
-const CONTROL_MAGIC: &str = "iroh-sdwan-v4/node-record/1";
-const RENDEZVOUS_MAGIC: &str = "iroh-sdwan-v4/rendezvous/1";
-const PROBE_MAGIC: &str = "iroh-sdwan-v4/mesh-probe/1";
+const CONTROL_MAGIC: &str = "ironet-v1/node-record/1";
+const RENDEZVOUS_MAGIC: &str = "ironet-v1/rendezvous/1";
+const PROBE_MAGIC: &str = "ironet-v1/mesh-probe/1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDEZVOUS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
 const MAX_RENDEZVOUS_TTL: Duration = Duration::from_secs(120);
@@ -125,7 +125,7 @@ impl PresenceBody {
 
     fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1024);
-        field(&mut out, b"iroh-sdwan-node-record-v4");
+        field(&mut out, b"ironet-node-record-v1");
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.network_fingerprint);
         out.extend_from_slice(self.owner.as_bytes());
@@ -1717,14 +1717,14 @@ impl MeshPlanner {
 
 pub fn network_fingerprint(network_id: &str) -> [u8; 32] {
     blake3::derive_key(
-        "iroh-sdwan presence network fingerprint v1",
+        "ironet presence network fingerprint v1",
         network_id.as_bytes(),
     )
 }
 
 fn membership_tag(network_id: &str, body: &[u8], signature: &Signature) -> [u8; 32] {
     let key = blake3::derive_key(
-        "iroh-sdwan decentralized network admission v2",
+        "ironet decentralized network admission v2",
         network_id.as_bytes(),
     );
     let mut hasher = blake3::Hasher::new_keyed(&key);
@@ -1740,7 +1740,7 @@ fn probe_membership_tag(
     nonce: u64,
 ) -> [u8; 32] {
     let key = blake3::derive_key(
-        "iroh-sdwan decentralized mesh probe admission v1",
+        "ironet decentralized mesh probe admission v1",
         network_id.as_bytes(),
     );
     let mut hasher = blake3::Hasher::new_keyed(&key);
@@ -1857,7 +1857,7 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
-            node_interface: "isw0".into(),
+            node_interface: "ironet0".into(),
             node_addresses: vec!["10.200.0.1/32".parse().unwrap()],
             advertised_prefixes: Vec::new(),
             node_info: Some(NodeInfo {

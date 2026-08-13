@@ -8,7 +8,7 @@ trap 'rm -rf "$ROOT"' EXIT
 dpkg-deb --info "$PACKAGE" >/dev/null
 dpkg-deb --extract "$PACKAGE" "$ROOT"
 
-for binary in iroh-sdwan iroh-sdwand; do
+for binary in ironet ironetd; do
   path="$ROOT/usr/bin/$binary"
   test -x "$path"
   if readelf -l "$path" | grep -q 'Requesting program interpreter'; then
@@ -16,22 +16,22 @@ for binary in iroh-sdwan iroh-sdwand; do
     exit 1
   fi
 done
-test -f "$ROOT/usr/lib/systemd/system/iroh-sdwan.service"
-test -f "$ROOT/usr/lib/sysusers.d/iroh-sdwan.conf"
-test -f "$ROOT/usr/lib/sysctl.d/90-iroh-sdwan.conf"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/examples/config.toml"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/config/example.toml"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/docs/README.md"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/docs/快速开始.md"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/CONTRIBUTING.md"
-test -f "$ROOT/usr/share/doc/iroh-sdwan/PLAN.md"
-test "$(stat -c %a "$ROOT/etc/iroh-sdwan")" = 700
+test -f "$ROOT/usr/lib/systemd/system/ironet.service"
+test -f "$ROOT/usr/lib/sysusers.d/ironet.conf"
+test -f "$ROOT/usr/lib/sysctl.d/90-ironet.conf"
+test -f "$ROOT/usr/share/doc/ironet/examples/config.toml"
+test -f "$ROOT/usr/share/doc/ironet/config/example.toml"
+test -f "$ROOT/usr/share/doc/ironet/docs/README.md"
+test -f "$ROOT/usr/share/doc/ironet/docs/快速开始.md"
+test -f "$ROOT/usr/share/doc/ironet/CONTRIBUTING.md"
+test -f "$ROOT/usr/share/doc/ironet/PLAN.md"
+test "$(stat -c %a "$ROOT/etc/ironet")" = 700
 
-SERVICE="$ROOT/usr/lib/systemd/system/iroh-sdwan.service"
-grep -q '^User=iroh-sdwan$' "$SERVICE"
-grep -q '^Group=iroh-sdwan$' "$SERVICE"
-grep -q '^ExecStart=/usr/bin/iroh-sdwand ' "$SERVICE"
-grep -q '^ExecReload=/usr/bin/iroh-sdwan reload ' "$SERVICE"
+SERVICE="$ROOT/usr/lib/systemd/system/ironet.service"
+grep -q '^User=ironet$' "$SERVICE"
+grep -q '^Group=ironet$' "$SERVICE"
+grep -q '^ExecStart=/usr/bin/ironetd ' "$SERVICE"
+grep -q '^ExecReload=/usr/bin/ironet reload ' "$SERVICE"
 grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN$' "$SERVICE"
 grep -q '^NoNewPrivileges=true$' "$SERVICE"
 grep -q '^ProtectSystem=strict$' "$SERVICE"
@@ -53,7 +53,7 @@ cat >"$ROOT/usr/lib/systemd/system/systemd-sysctl.service" <<'EOF'
 Type=oneshot
 ExecStart=/bin/true
 EOF
-systemd-analyze verify --root="$ROOT" usr/lib/systemd/system/iroh-sdwan.service
+systemd-analyze verify --root="$ROOT" usr/lib/systemd/system/ironet.service
 
 dpkg-deb --ctrl-tarfile "$PACKAGE" \
   | tar -xOf - ./postinst \

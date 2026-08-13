@@ -25,7 +25,7 @@ use crate::{
 };
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
-pub const DEFAULT_CONTROL_SOCKET: &str = "/run/iroh-sdwan/control.sock";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ironet/control.sock";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTROL_CONNECTIONS: usize = 64;

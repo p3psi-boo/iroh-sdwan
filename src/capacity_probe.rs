@@ -165,7 +165,7 @@ pub fn decode_probe(bytes: &[u8]) -> Result<CapacityProbeMessage> {
         let envelope = Envelope::decode(Bytes::copy_from_slice(bytes))?;
         ensure!(
             envelope.kind == MessageType::CapacityProbe,
-            "v4 envelope does not contain a capacity probe"
+            "V1 envelope does not contain a capacity probe"
         );
         return decode_probe(&envelope.payload);
     }

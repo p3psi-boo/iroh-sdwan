@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
-use crate::protocol::envelope::{Envelope as V4Envelope, HEADER_LEN as V4_HEADER_LEN, MessageType};
+use crate::protocol::envelope::{Envelope as V1Envelope, HEADER_LEN as V1_HEADER_LEN, MessageType};
 
 const HEADER_LEN: usize = 16;
 const LENGTH_PREFIX_LEN: usize = 2;
@@ -20,7 +20,7 @@ const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
 const EXPIRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Number of bytes unavailable to an inner overlay frame when FEC is enabled.
-pub const WIRE_OVERHEAD: usize = V4_HEADER_LEN + HEADER_LEN + LENGTH_PREFIX_LEN;
+pub const WIRE_OVERHEAD: usize = V1_HEADER_LEN + HEADER_LEN + LENGTH_PREFIX_LEN;
 
 #[derive(Debug)]
 pub struct EncodedDatagram {
@@ -253,16 +253,16 @@ impl FecDecoder {
             expired_blocks: self.expire(false),
             ..DecodeBatch::default()
         };
-        let Ok(v4) = V4Envelope::decode(datagram.clone()) else {
+        let Ok(v1) = V1Envelope::decode(datagram.clone()) else {
             batch.frames.push(datagram);
             return Ok(batch);
         };
-        if v4.kind != MessageType::FecShard {
+        if v1.kind != MessageType::FecShard {
             batch.frames.push(datagram);
             return Ok(batch);
         }
 
-        let envelope = Envelope::parse(&v4.payload)?;
+        let envelope = Envelope::parse(&v1.payload)?;
         if envelope.kind == KIND_RECOVERY {
             batch.recovery_shards = 1;
         }
@@ -586,7 +586,7 @@ fn encode_envelope(
     frame.extend_from_slice(&(shard_bytes as u16).to_be_bytes());
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
-    V4Envelope::new(MessageType::FecShard, frame).encode()
+    V1Envelope::new(MessageType::FecShard, frame).encode()
 }
 
 fn expand_original(payload: &[u8], shard_bytes: usize) -> Result<Vec<u8>> {
@@ -833,7 +833,7 @@ mod tests {
         assert!(
             datagrams[4..]
                 .iter()
-                .all(|datagram| datagram.bytes.len() == V4_HEADER_LEN + HEADER_LEN + 64)
+                .all(|datagram| datagram.bytes.len() == V1_HEADER_LEN + HEADER_LEN + 64)
         );
     }
 
@@ -841,9 +841,9 @@ mod tests {
     fn plain_overlay_frames_pass_through() {
         let mut decoder = FecDecoder::new(Duration::from_secs(1)).unwrap();
         let batch = decoder
-            .push(Bytes::from_static(b"ISWIP3\0\0frame"))
+            .push(Bytes::from_static(b"IRNIP1\0\0frame"))
             .unwrap();
-        assert_eq!(batch.frames, [Bytes::from_static(b"ISWIP3\0\0frame")]);
+        assert_eq!(batch.frames, [Bytes::from_static(b"IRNIP1\0\0frame")]);
     }
 
     #[test]

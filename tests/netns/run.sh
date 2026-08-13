@@ -5,7 +5,7 @@ SUITE=${1:?usage: tests/netns/run.sh SUITE}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 LAB_SCRIPT="$ROOT/tests/$SUITE/lab.sh"
 STATE_DIR="$ROOT/target/$SUITE-test"
-IMAGE=iroh-sdwan:netns-test
+IMAGE=ironet:netns-test
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 
@@ -29,7 +29,7 @@ docker run --rm \
 
 status=0
 docker run --rm \
-  --name "iroh-sdwan-${SUITE}-netns" \
+  --name "ironet-${SUITE}-netns" \
   --privileged \
   --device /dev/net/tun:/dev/net/tun \
   --env SOAK_SECONDS="${SOAK_SECONDS:-20}" \

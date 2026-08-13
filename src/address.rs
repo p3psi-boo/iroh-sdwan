@@ -1,14 +1,14 @@
 use crate::PROTOCOL_NAME;
 
 pub fn network_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"iroh-sdwan-network-alpn-v4\0", "")
+    network_alpn_with_context(network_id, b"ironet-network-alpn-v1\0", "")
 }
 
 /// Separate ALPN for short-lived reachability/RTT probes. Keeping probes off
 /// the data-plane ALPN prevents an exploratory handshake from replacing an
 /// established overlay connection for the same endpoint.
 pub fn network_probe_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"iroh-sdwan-mesh-probe-alpn-v4\0", "/probe")
+    network_alpn_with_context(network_id, b"ironet-mesh-probe-alpn-v1\0", "/probe")
 }
 
 fn network_alpn_with_context(network_id: &str, context: &[u8], suffix: &str) -> Vec<u8> {
@@ -27,5 +27,11 @@ mod tests {
         assert_ne!(network_alpn("one"), network_alpn("two"));
         assert_ne!(network_probe_alpn("one"), network_probe_alpn("two"));
         assert_ne!(network_alpn("one"), network_probe_alpn("one"));
+    }
+
+    #[test]
+    fn alpn_identifies_ironet_protocol_v1() {
+        assert!(network_alpn("network").starts_with(b"ironet/ip/1/"));
+        assert!(network_probe_alpn("network").starts_with(b"ironet/ip/1/probe/"));
     }
 }

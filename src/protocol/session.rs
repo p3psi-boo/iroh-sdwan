@@ -105,21 +105,21 @@ pub async fn negotiate_connection(
         }
     })
     .await
-    .context("v4 session handshake timed out")?
+    .context("v1 session handshake timed out")?
 }
 
 async fn client(connection: &Connection, policy: &SessionPolicy) -> Result<NegotiatedSession> {
     let (mut send, mut receive) = connection
         .open_bi()
         .await
-        .context("opening v4 session stream")?;
+        .context("opening v1 session stream")?;
     let nonce = nonce(policy.local_id, policy.remote_id);
     let hello = make_hello(policy, nonce);
     let hello_bytes = serde_json::to_vec(&hello)?;
     write_record(&mut send, &hello_bytes).await?;
     let ack_bytes = read_record(&mut receive).await?;
     let ack: HelloAck =
-        serde_json::from_slice(&ack_bytes).context("invalid v4 hello acknowledgement")?;
+        serde_json::from_slice(&ack_bytes).context("invalid v1 hello acknowledgement")?;
     validate_ack(policy, &hello, &ack)?;
     let transcript = transcript(&hello_bytes, &ack_bytes);
     write_record(
@@ -130,7 +130,7 @@ async fn client(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
         })?,
     )
     .await?;
-    send.finish().context("finishing v4 session stream")?;
+    send.finish().context("finishing v1 session stream")?;
     Ok(session_from_ack(ack))
 }
 
@@ -138,17 +138,14 @@ async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
     let (mut send, mut receive) = connection
         .accept_bi()
         .await
-        .context("accepting v4 session stream")?;
+        .context("accepting v1 session stream")?;
     let hello_bytes = read_record(&mut receive).await?;
-    let hello: Hello = serde_json::from_slice(&hello_bytes).context("invalid v4 hello")?;
+    let hello: Hello = serde_json::from_slice(&hello_bytes).context("invalid v1 hello")?;
     validate_hello(policy, &hello)?;
     let features = negotiate(&policy.features, &hello.features)?;
     let server_nonce = nonce(policy.local_id, policy.remote_id);
-    let minor = MAX_MINOR.min(hello.max_minor);
-    ensure!(
-        minor >= MIN_MINOR.max(hello.min_minor),
-        "no compatible v4 minor version"
-    );
+    let minor = compatible_minor(MIN_MINOR, MAX_MINOR, hello.min_minor, hello.max_minor)
+        .context("no compatible v1 minor version")?;
     let mut ack = HelloAck {
         kind: ACK_KIND.into(),
         major: MAJOR,
@@ -168,13 +165,13 @@ async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
     let ack_bytes = serde_json::to_vec(&ack)?;
     write_record(&mut send, &ack_bytes).await?;
     let ready_bytes = read_record(&mut receive).await?;
-    let ready: Ready = serde_json::from_slice(&ready_bytes).context("invalid v4 ready record")?;
-    ensure!(ready.kind == READY_KIND, "invalid v4 ready kind");
+    let ready: Ready = serde_json::from_slice(&ready_bytes).context("invalid v1 ready record")?;
+    ensure!(ready.kind == READY_KIND, "invalid v1 ready kind");
     ensure!(
         constant_time_eq(&ready.transcript, &transcript(&hello_bytes, &ack_bytes)),
-        "v4 session transcript mismatch"
+        "v1 session transcript mismatch"
     );
-    send.finish().context("finishing v4 session response")?;
+    send.finish().context("finishing v1 session response")?;
     Ok(session_from_ack(ack))
 }
 
@@ -208,11 +205,11 @@ fn validate_hello(policy: &SessionPolicy, hello: &Hello) -> Result<()> {
     );
     ensure!(
         hello.owner == policy.remote_id,
-        "v4 hello identity mismatch"
+        "v1 hello identity mismatch"
     );
     ensure!(
-        hello.min_minor <= MAX_MINOR && MIN_MINOR <= hello.max_minor,
-        "no compatible v4 minor version"
+        compatible_minor(MIN_MINOR, MAX_MINOR, hello.min_minor, hello.max_minor).is_some(),
+        "no compatible v1 minor version"
     );
     ensure!(
         hello.max_datagram_size >= 256,
@@ -227,7 +224,7 @@ fn validate_hello(policy: &SessionPolicy, hello: &Hello) -> Result<()> {
             &hello.membership_proof,
             &hello_proof(&policy.network_id, hello)
         ),
-        "invalid v4 network membership proof"
+        "invalid v1 network membership proof"
     );
     validate_link_hello(policy, hello)
 }
@@ -238,22 +235,22 @@ fn validate_ack(policy: &SessionPolicy, hello: &Hello, ack: &HelloAck) -> Result
             && ack.major == MAJOR
             && (MIN_MINOR..=MAX_MINOR).contains(&ack.minor)
             && (hello.min_minor..=hello.max_minor).contains(&ack.minor),
-        "unsupported v4 acknowledgement"
+        "unsupported v1 acknowledgement"
     );
     ensure!(
         ack.owner == policy.remote_id && ack.client_nonce == hello.nonce,
-        "v4 acknowledgement identity mismatch"
+        "v1 acknowledgement identity mismatch"
     );
     ensure!(
         ack.max_datagram_size <= policy.max_datagram_size
             && ack.max_datagram_size >= 256
             && ack.max_control_size <= policy.max_control_size
             && ack.max_control_size >= 1024,
-        "v4 acknowledgement exceeds local limits"
+        "v1 acknowledgement exceeds local limits"
     );
     ensure!(
         constant_time_eq(&ack.membership_proof, &ack_proof(&policy.network_id, ack)),
-        "invalid v4 acknowledgement membership proof"
+        "invalid v1 acknowledgement membership proof"
     );
     validate_selection(&policy.features, &ack.features)?;
     validate_link_ack(policy, ack)
@@ -297,22 +294,36 @@ fn session_from_ack(ack: HelloAck) -> NegotiatedSession {
     }
 }
 
+fn compatible_minor(
+    local_min: u16,
+    local_max: u16,
+    remote_min: u16,
+    remote_max: u16,
+) -> Option<u16> {
+    let minimum = local_min.max(remote_min);
+    let maximum = local_max.min(remote_max);
+    (minimum <= maximum).then_some(maximum)
+}
+
 fn hello_proof(network_id: &str, hello: &Hello) -> [u8; 32] {
     keyed(
         network_id.as_bytes(),
-        &[b"isw-v4-hello", &hello_unsigned(hello)],
+        &[b"ironet-v1-hello", &hello_unsigned(hello)],
     )
 }
 
 fn ack_proof(network_id: &str, ack: &HelloAck) -> [u8; 32] {
-    keyed(network_id.as_bytes(), &[b"isw-v4-ack", &ack_unsigned(ack)])
+    keyed(
+        network_id.as_bytes(),
+        &[b"ironet-v1-ack", &ack_unsigned(ack)],
+    )
 }
 
 fn link_hello_proof(link: &LinkAuthentication, hello: &Hello) -> [u8; 32] {
     keyed(
         &link.secret,
         &[
-            b"isw-v4-link-hello",
+            b"ironet-v1-link-hello",
             link.link_id.as_bytes(),
             &hello_unsigned(hello),
         ],
@@ -323,7 +334,7 @@ fn link_ack_proof(link: &LinkAuthentication, ack: &HelloAck) -> [u8; 32] {
     keyed(
         &link.secret,
         &[
-            b"isw-v4-link-ack",
+            b"ironet-v1-link-ack",
             link.link_id.as_bytes(),
             &ack_unsigned(ack),
         ],
@@ -345,7 +356,7 @@ fn hello_unsigned(hello: &Hello) -> Vec<u8> {
         membership_proof: [0; 32],
         link_proof: None,
     })
-    .expect("v4 hello is serializable")
+    .expect("v1 hello is serializable")
 }
 
 fn ack_unsigned(ack: &HelloAck) -> Vec<u8> {
@@ -363,7 +374,7 @@ fn ack_unsigned(ack: &HelloAck) -> Vec<u8> {
         membership_proof: [0; 32],
         link_proof: None,
     })
-    .expect("v4 acknowledgement is serializable")
+    .expect("v1 acknowledgement is serializable")
 }
 
 fn keyed(secret: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -378,7 +389,7 @@ fn keyed(secret: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 
 fn transcript(hello: &[u8], ack: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"isw-v4-transcript");
+    hasher.update(b"ironet-v1-transcript");
     hasher.update(hello);
     hasher.update(ack);
     *hasher.finalize().as_bytes()
@@ -391,7 +402,7 @@ fn nonce(local: EndpointId, remote: EndpointId) -> [u8; 32] {
         .unwrap_or_default()
         .as_nanos();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"isw-v4-nonce");
+    hasher.update(b"ironet-v1-nonce");
     hasher.update(local.as_bytes());
     hasher.update(remote.as_bytes());
     hasher.update(&counter.to_be_bytes());
@@ -409,7 +420,7 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 async fn write_record(send: &mut iroh::endpoint::SendStream, bytes: &[u8]) -> Result<()> {
     ensure!(
         bytes.len() <= MAX_RECORD_BYTES,
-        "v4 session record exceeds limit"
+        "v1 session record exceeds limit"
     );
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(bytes).await?;
@@ -422,7 +433,7 @@ async fn read_record(receive: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>
     let length = u32::from_be_bytes(length) as usize;
     ensure!(
         length <= MAX_RECORD_BYTES,
-        "v4 session record exceeds limit"
+        "v1 session record exceeds limit"
     );
     let mut bytes = vec![0; length];
     receive.read_exact(&mut bytes).await?;
@@ -439,7 +450,7 @@ mod tests {
     use crate::protocol::feature;
 
     async fn connections() -> (Endpoint, Endpoint, Connection, Connection) {
-        let alpn = b"iroh-sdwan/session-v4-test".to_vec();
+        let alpn = b"ironet/session-v1-test".to_vec();
         let client_key = SecretKey::generate();
         let server_key = SecretKey::generate();
         let client = Endpoint::builder(presets::N0)

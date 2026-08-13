@@ -48,7 +48,7 @@ jobs:
         run: |
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
-          for binary in iroh-sdwan iroh-sdwand; do
+          for binary in ironet ironetd; do
             file "target/x86_64-unknown-linux-musl/release/$binary"
             if readelf -l "target/x86_64-unknown-linux-musl/release/$binary" \
               | grep -q 'Requesting program interpreter'; then
@@ -60,7 +60,7 @@ jobs:
       - name: Upload workflow artifacts
         uses: https://data.forgejo.org/actions/upload-artifact@v4
         with:
-          name: iroh-sdwan-${{ forgejo.ref_name }}-musl-deb
+          name: ironet-${{ forgejo.ref_name }}-musl-deb
           path: |
             dist/*.deb
             dist/SHA256SUMS

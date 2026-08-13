@@ -20,7 +20,7 @@ const FLOW_ROUTER_ROUTE_PROTOCOL: &str = "100";
 /// data-plane lifecycle so exactly one file descriptor owns packet I/O.
 pub async fn prepare_node_interface(config: &Config) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("iroh-sdwan runtime is supported only on Linux");
+        bail!("ironet runtime is supported only on Linux");
     }
 
     run_ip(&["link", "set", "dev", &config.node_interface, "up"]).await?;

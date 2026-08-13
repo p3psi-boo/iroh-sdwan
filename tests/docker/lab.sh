@@ -31,7 +31,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1000
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address_v4/32", "$address_v6/128"]
 advertised_prefixes = []
 
@@ -150,8 +150,8 @@ if ip netns exec ns-a ping -c 1 -W 1 172.30.20.3 >/dev/null 2>&1; then
   echo "A unexpectedly reached C underlay" >&2
   exit 1
 fi
-ip -n ns-a route show table 100 10.200.0.3/32 | grep -q 'dev isw0'
-ip -n ns-a -6 route show table 100 fd73:9db8:4200::3/128 | grep -q 'dev isw0'
+ip -n ns-a route show table 100 10.200.0.3/32 | grep -q 'dev ironet0'
+ip -n ns-a -6 route show table 100 fd73:9db8:4200::3/128 | grep -q 'dev ironet0'
 ip -n ns-a route show table 100 10.200.0.3/32 | grep -q 'src 10.200.0.1'
 ip -n ns-a -6 route show table 100 fd73:9db8:4200::3/128 | grep -q 'src fd73:9db8:4200::1'
 if ip -n ns-a route show table main 10.200.0.3/32 | grep -q .; then
@@ -162,7 +162,7 @@ ip netns exec ns-a ping -c 1 -W 2 10.200.0.3
 ip netns exec ns-a ping -6 -c 1 -W 2 fd73:9db8:4200::3
 ip netns exec ns-a ping -q -l 256 -c 256 -W 2 -I 10.200.0.1 10.200.0.3
 wait_until "small-packet aggregation" grep -Eq \
-  'iroh_sdwan_peer_tx_batches_total\{.*\} [1-9][0-9]*$' \
+  'ironet_peer_tx_batches_total\{.*\} [1-9][0-9]*$' \
   /state/node-a/metrics.prom
 wait_until "aggregation flood queue drain" ip netns exec ns-a \
   ping -c 1 -W 2 -M do -s 1200 -I 10.200.0.1 10.200.0.3
@@ -172,9 +172,9 @@ ctl ns-a node-a health --quiet
 ctl ns-a node-a status --output json | grep -q '"ready": true'
 ctl ns-a node-a peers --output json | grep -q '"name": "node-b"'
 timeout 3s script -qec \
-  'ip netns exec ns-a iroh-sdwan --config /state/node-a/config.toml --socket /state/node-a/control.sock tui --interval-ms 200' \
+  'ip netns exec ns-a ironet --config /state/node-a/config.toml --socket /state/node-a/control.sock tui --interval-ms 200' \
   /state/node-a/tui.typescript >/dev/null 2>&1 || test "$?" -eq 124
-grep -q 'iroh-sdwan' /state/node-a/tui.typescript
+grep -q 'ironet' /state/node-a/tui.typescript
 ctl ns-a node-a ping --count 2 --timeout-ms 2000 10.200.0.3 | grep -q '2 transmitted, 2 received'
 ctl ns-a node-a ping --count 2 --timeout-ms 2000 fd73:9db8:4200::3 | grep -q '2 transmitted, 2 received'
 trace_v4=$(ctl ns-a node-a trace --timeout-ms 3000 10.200.0.3)
@@ -186,8 +186,8 @@ grep -Eq '^[[:space:]]*2[[:space:]]+node-c ' <<<"$trace_v6"
 trace_reverse=$(ctl ns-c node-c trace --timeout-ms 3000 10.200.0.1)
 grep -Eq '^[[:space:]]*1[[:space:]]+node-b ' <<<"$trace_reverse"
 grep -Eq '^[[:space:]]*2[[:space:]]+node-a ' <<<"$trace_reverse"
-test "$(find /sys/class/net -maxdepth 1 -name 'isw*' | wc -l)" -eq 0
-test "$(ip -n ns-a -o link show | grep -c 'isw0')" -eq 1
+test "$(find /sys/class/net -maxdepth 1 -name 'ironet*' | wc -l)" -eq 0
+test "$(ip -n ns-a -o link show | grep -c 'ironet0')" -eq 1
 
 echo "==> validating doctor, metrics, fragmentation, and source policy"
 for entry in 'ns-a node-a' 'ns-b node-b' 'ns-c node-c'; do
@@ -195,29 +195,29 @@ for entry in 'ns-a node-a' 'ns-b node-b' 'ns-c node-c'; do
   ctl "$namespace" "$node" doctor --config "/state/$node/config.toml"
 done
 for metric in \
-  iroh_sdwan_peer_tx_packets_total \
-  iroh_sdwan_peer_effective_frame_size_bytes \
-  iroh_sdwan_peer_path_mtu_bytes \
-  iroh_sdwan_peer_path_cwnd_bytes \
-  iroh_sdwan_peer_selected_path_info \
-  iroh_sdwan_peer_open_paths \
-  iroh_sdwan_peer_tun_mtu_bytes \
-  iroh_sdwan_peer_heartbeats_sent_total \
-  iroh_sdwan_peer_heartbeats_received_total; do
+  ironet_peer_tx_packets_total \
+  ironet_peer_effective_frame_size_bytes \
+  ironet_peer_path_mtu_bytes \
+  ironet_peer_path_cwnd_bytes \
+  ironet_peer_selected_path_info \
+  ironet_peer_open_paths \
+  ironet_peer_tun_mtu_bytes \
+  ironet_peer_heartbeats_sent_total \
+  ironet_peer_heartbeats_received_total; do
   grep -q "$metric" /state/node-a/metrics.prom
 done
-grep -q 'iroh_sdwan_routes_ready 1' /state/node-a/metrics.prom
-grep -q 'iroh_sdwan_route_present.*10.200.0.3/32.* 1' /state/node-a/metrics.prom
-tx_packets=$(sed -n 's/.*iroh_sdwan_peer_tx_packets_total[^ ]* //p' /state/node-a/metrics.prom)
-tx_fragments=$(sed -n 's/.*iroh_sdwan_peer_tx_fragments_total[^ ]* //p' /state/node-a/metrics.prom)
+grep -q 'ironet_routes_ready 1' /state/node-a/metrics.prom
+grep -q 'ironet_route_present.*10.200.0.3/32.* 1' /state/node-a/metrics.prom
+tx_packets=$(sed -n 's/.*ironet_peer_tx_packets_total[^ ]* //p' /state/node-a/metrics.prom)
+tx_fragments=$(sed -n 's/.*ironet_peer_tx_fragments_total[^ ]* //p' /state/node-a/metrics.prom)
 test "$tx_fragments" -gt "$tx_packets"
 
-ip -n ns-a address add 10.200.0.3/32 dev isw0
+ip -n ns-a address add 10.200.0.3/32 dev ironet0
 ip netns exec ns-a ping -c 32 -i 0.01 -W 1 -I 10.200.0.3 10.200.0.2 \
   >/dev/null 2>&1 || true
-ip -n ns-a address del 10.200.0.3/32 dev isw0
+ip -n ns-a address del 10.200.0.3/32 dev ironet0
 wait_until "node-b adjacency-policy drop" sh -c \
-  'grep -q "dropping inbound packet rejected" /state/node-b/daemon.log && grep -q "10.200.0.3" /state/node-b/daemon.log && awk '\''$1 ~ /iroh_sdwan_peer_policy_drops_total/ && $0 ~ /peer="node-a"/ && $NF > 0 { found=1 } END { exit !found }'\'' /state/node-b/metrics.prom'
+  'grep -q "dropping inbound packet rejected" /state/node-b/daemon.log && grep -q "10.200.0.3" /state/node-b/daemon.log && awk '\''$1 ~ /ironet_peer_policy_drops_total/ && $0 ~ /peer="node-a"/ && $NF > 0 { found=1 } END { exit !found }'\'' /state/node-b/metrics.prom'
 
 echo "==> transactional and concurrent reload"
 cp /state/node-a/config.toml /state/node-a/config.valid.toml
@@ -255,24 +255,24 @@ fd_after=$(find "/proc/$PID_A/fd" -mindepth 1 -maxdepth 1 | wc -l)
 test "$fd_after" -le "$((fd_before + 2))"
 
 echo "==> enforcing Unix control-socket group permissions"
-groupadd --force sdwanctl
-id -u ctl-allowed >/dev/null 2>&1 || useradd --no-create-home --gid sdwanctl ctl-allowed
+groupadd --force ironetctl
+id -u ctl-allowed >/dev/null 2>&1 || useradd --no-create-home --gid ironetctl ctl-allowed
 id -u ctl-denied >/dev/null 2>&1 || useradd --no-create-home ctl-denied
-chgrp sdwanctl /state/node-a/control.sock
+chgrp ironetctl /state/node-a/control.sock
 chmod 0660 /state/node-a/control.sock
-chgrp sdwanctl /state/node-a
+chgrp ironetctl /state/node-a
 chmod 0750 /state/node-a
 ip netns exec ns-a runuser -u ctl-allowed -- \
-  iroh-sdwan --socket /state/node-a/control.sock health --quiet
+  ironet --socket /state/node-a/control.sock health --quiet
 if ip netns exec ns-a runuser -u ctl-denied -- \
-  iroh-sdwan --socket /state/node-a/control.sock status >/state/denied-control.log 2>&1; then
+  ironet --socket /state/node-a/control.sock status >/state/denied-control.log 2>&1; then
   echo "unprivileged non-group user accessed the control socket" >&2
   exit 1
 fi
 grep -Eq 'Permission denied|failed connecting' /state/denied-control.log
 
 echo "==> client cancellation and daemon restart during ping"
-timeout 0.5s bash -c 'ip netns exec ns-a iroh-sdwan --socket /state/node-a/control.sock ping --count 20 --timeout-ms 2000 10.200.0.3' >/dev/null 2>&1 || true
+timeout 0.5s bash -c 'ip netns exec ns-a ironet --socket /state/node-a/control.sock ping --count 20 --timeout-ms 2000 10.200.0.3' >/dev/null 2>&1 || true
 ctl ns-a node-a health --quiet
 ctl ns-a node-a ping --count 20 --timeout-ms 2000 10.200.0.3 >/state/restart-ping.log 2>&1 &
 restart_ping_pid=$!

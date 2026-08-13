@@ -31,7 +31,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = true
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address/32"]
 advertised_prefixes = []
 
@@ -140,7 +140,7 @@ sleep 1
 ip -n mesh-a route del blackhole 172.31.3.3/32
 ip -n mesh-c route del blackhole 172.31.3.2/32
 wait_until "direct A-C adjacency" sh -c \
-  'ip netns exec mesh-a iroh-sdwan --socket /state/node-a/control.sock trace --timeout-ms 3000 10.210.0.3 | grep -Eq "^[[:space:]]*1[[:space:]]+node-c "'
+  'ip netns exec mesh-a ironet --socket /state/node-a/control.sock trace --timeout-ms 3000 10.210.0.3 | grep -Eq "^[[:space:]]*1[[:space:]]+node-c "'
 sleep 1
 touch "$stop_file"
 wait "$switch_pid"
@@ -172,7 +172,7 @@ grep -Eq '^[[:space:]]*1[[:space:]]+public ' <<<"$partition_trace"
 ip -n mesh-a route del blackhole 172.31.3.3/32
 ip -n mesh-c route del blackhole 172.31.3.2/32
 wait_until "direct path after merge" sh -c \
-  'ip netns exec mesh-a iroh-sdwan --socket /state/node-a/control.sock trace --timeout-ms 3000 10.210.0.3 | grep -Eq "^[[:space:]]*1[[:space:]]+node-c "'
+  'ip netns exec mesh-a ironet --socket /state/node-a/control.sock trace --timeout-ms 3000 10.210.0.3 | grep -Eq "^[[:space:]]*1[[:space:]]+node-c "'
 
 echo "==> bounded resources, peers output, and dynamic-target failure"
 ctl mesh-a node-a peers --output jsonl | grep -q '"connected":true'
@@ -180,8 +180,8 @@ grep -q '"name": "node-c"' /state/node-a/status.json
 test "$(grep -c '"connected":' /state/node-a/status.json)" -le 3
 test "$(grep -c '"connected":' /state/node-c/status.json)" -le 3
 test "$(grep -c '"connected":' /state/public/status.json)" -le 8
-grep -q 'iroh_sdwan_mesh_directory_entries 2' /state/node-a/metrics.prom
-grep -q 'iroh_sdwan_mesh_quarantined_entries 0' /state/node-a/metrics.prom
+grep -q 'ironet_mesh_directory_entries 2' /state/node-a/metrics.prom
+grep -q 'ironet_mesh_quarantined_entries 0' /state/node-a/metrics.prom
 
 ip netns exec mesh-c tc qdisc replace dev ac-c root netem loss 100%
 if unreachable=$(ctl mesh-a node-a ping --count 3 --timeout-ms 250 10.210.0.3 2>&1); then
@@ -195,7 +195,7 @@ wait_until "dynamic target recovery" ctl mesh-a node-a ping --count 1 --timeout-
 echo "==> quarantining conflicting signed prefix owners"
 start_daemon mesh-x node-x PID_X
 wait_until "conflicting Presence quarantine" sh -c \
-  'awk '\''$1 == "iroh_sdwan_mesh_quarantined_entries" && ($NF + 0) >= 2 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
+  'awk '\''$1 == "ironet_mesh_quarantined_entries" && ($NF + 0) >= 2 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
 grep -q '"quarantined": true' /state/node-a/status.json
 test "$(grep -c '"connected":' /state/public/status.json)" -le 8
 

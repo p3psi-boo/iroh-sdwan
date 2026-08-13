@@ -30,7 +30,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address4/32", "$address6/128"]
 advertised_prefixes = []
 
@@ -143,6 +143,6 @@ fi
 wait_until "backup iroh relay path" ctl relay-a node-a ping --count 1 --timeout-ms 5000 10.244.0.2
 wait_until "relay failover path epoch" route_epoch_exceeds "$epoch_before"
 wait_until "relay failover capacity probe" probe_attempts_exceed "$attempts_before"
-grep -Eq 'iroh_sdwan_route_path_epoch\{.*\} [1-9][0-9]*$' /state/node-a/metrics.prom
+grep -Eq 'ironet_route_path_epoch\{.*\} [1-9][0-9]*$' /state/node-a/metrics.prom
 
 echo "iroh relay network-namespace integration test passed"

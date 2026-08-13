@@ -47,8 +47,8 @@ case "$STATUS" in
     [[ "$VERSION" == *-* ]] && PRERELEASE=true
     PAYLOAD=$(jq -n \
       --arg tag "$FORGEJO_REF_NAME" \
-      --arg name "iroh-sdwan $VERSION" \
-      --arg body "Automated musl Debian package release for iroh-sdwan $VERSION." \
+      --arg name "ironet $VERSION" \
+      --arg body "Automated musl Debian package release for ironet $VERSION." \
       --argjson prerelease "$PRERELEASE" \
       '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: $prerelease}')
     curl --fail-with-body --silent --show-error \

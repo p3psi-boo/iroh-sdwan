@@ -26,7 +26,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address/32"]
 advertised_prefixes = []
 
@@ -67,7 +67,7 @@ EOF
 
 metric() {
   local node=$1 name=$2
-  awk -v metric="iroh_sdwan_peer_${name}" \
+  awk -v metric="ironet_peer_${name}" \
     '$1 ~ ("^" metric "\\{") { print $NF; found=1; exit } END { if (!found) exit 1 }' \
     "/state/$node/metrics.prom"
 }
@@ -87,7 +87,7 @@ create_namespace congestion-a
 create_namespace congestion-b
 create_veth congestion-a ca0 172.36.10.2/24 congestion-b cb0 172.36.10.3/24
 
-# Keep the netem backlog itself small.  This exercises iroh-sdwan's application
+# Keep the netem backlog itself small.  This exercises ironet's application
 # queue and QUIC backpressure rather than manufacturing hundreds of
 # milliseconds in an oversized host qdisc which the overlay cannot preempt.
 for entry in 'congestion-a ca0' 'congestion-b cb0'; do

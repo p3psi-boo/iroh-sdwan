@@ -487,7 +487,7 @@ where
     F: Future<Output = Result<()>>,
 {
     if !cfg!(target_os = "linux") {
-        bail!("iroh-sdwan runtime is supported only on Linux");
+        bail!("ironet runtime is supported only on Linux");
     }
 
     let local_id = secret_key.public();
@@ -2028,7 +2028,7 @@ fn configured_destination_owner(
 
 fn route_id(endpoint_id: EndpointId) -> RouteId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"iroh-sdwan-flow-route-v1\0");
+    hasher.update(b"ironet-flow-route-v1\0");
     hasher.update(endpoint_id.as_bytes());
     let bytes = hasher.finalize();
     RouteId(u64::from_be_bytes(
@@ -2513,7 +2513,7 @@ impl DynamicMeshManager {
             },
         )
         .await
-        .context("dynamic peer v4 admission handshake failed")?;
+        .context("dynamic peer V1 admission handshake failed")?;
         if let Some(address) = connection.paths().iter().find_map(|path| {
             if let TransportAddr::Ip(address) = path.remote_addr() {
                 Some(*address)
@@ -3740,9 +3740,9 @@ impl Peer {
             None => match negotiate_connection(&connection, &self.session_policy).await {
                 Ok(session) => session,
                 Err(error) => {
-                    connection.close(9_u8.into(), b"v4 session negotiation failed");
+                    connection.close(9_u8.into(), b"V1 session negotiation failed");
                     return Err(error).with_context(|| {
-                        format!("v4 session negotiation with {} failed", self.name)
+                        format!("V1 session negotiation with {} failed", self.name)
                     });
                 }
             },

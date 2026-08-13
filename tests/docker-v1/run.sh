@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-exec "$ROOT/tests/netns/run.sh" docker-v4
+exec "$ROOT/tests/netns/run.sh" docker-v1

@@ -34,11 +34,11 @@ endpoint_id() {
 }
 
 ctl_a() {
-  ip netns exec ns-a iroh-sdwan --socket "$STATE_DIR/node-a/control.sock" "$@"
+  ip netns exec ns-a ironet --socket "$STATE_DIR/node-a/control.sock" "$@"
 }
 
 ctl_b() {
-  ip netns exec ns-b iroh-sdwan --socket "$STATE_DIR/node-b/control.sock" "$@"
+  ip netns exec ns-b ironet --socket "$STATE_DIR/node-b/control.sock" "$@"
 }
 
 write_config() {
@@ -55,7 +55,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$overlay/32"]
 advertised_prefixes = []
 
@@ -140,7 +140,7 @@ ip netns exec ns-nat iptables -t nat -A POSTROUTING \
 echo "==> creating identities and sealed configurations"
 declare -A IDS
 for node in node-a node-b; do
-  output=$(iroh-sdwan init \
+  output=$(ironet init \
     --config "$STATE_DIR/$node/config.toml" \
     --state-dir "$STATE_DIR/$node" \
     --network-id docker-nat-wan)
@@ -151,16 +151,16 @@ write_config node-a 10.220.0.1 node-b 10.220.0.2 \
   "${IDS[node-b]}" 172.28.10.254:41002
 write_config node-b 10.220.0.2 node-a 10.220.0.1 \
   "${IDS[node-a]}" 172.28.20.254:41001
-iroh-sdwan seal-config --config "$STATE_DIR/node-a/config.toml"
-iroh-sdwan seal-config --config "$STATE_DIR/node-b/config.toml"
+ironet seal-config --config "$STATE_DIR/node-a/config.toml"
+ironet seal-config --config "$STATE_DIR/node-b/config.toml"
 
 echo "==> starting both daemons inside their network namespaces"
-ip netns exec ns-a iroh-sdwand \
+ip netns exec ns-a ironetd \
   --config "$STATE_DIR/node-a/config.toml" \
   --socket "$STATE_DIR/node-a/control.sock" \
   >"$STATE_DIR/node-a/daemon.log" 2>&1 &
 PID_A=$!
-ip netns exec ns-b iroh-sdwand \
+ip netns exec ns-b ironetd \
   --config "$STATE_DIR/node-b/config.toml" \
   --socket "$STATE_DIR/node-b/control.sock" \
   >"$STATE_DIR/node-b/daemon.log" 2>&1 &
@@ -190,7 +190,7 @@ ip netns exec ns-nat iptables -t nat -A PREROUTING \
   -d 172.28.10.254 -p udp --dport 42002 \
   -j DNAT --to-destination 172.28.20.2:4000
 sed -i 's/172.28.10.254:41002/172.28.10.254:42002/' "$STATE_DIR/node-a/config.toml"
-iroh-sdwan seal-config --config "$STATE_DIR/node-a/config.toml" >/dev/null
+ironet seal-config --config "$STATE_DIR/node-a/config.toml" >/dev/null
 ctl_a reload >/dev/null
 ip netns exec ns-nat conntrack -F >/dev/null
 wait_until "overlay after NAT mapping rotation" ctl_a ping --count 1 --timeout-ms 3000 10.220.0.2
@@ -219,7 +219,7 @@ wait_until "large packet after MTU black-hole adaptation" \
   ip netns exec ns-a ping -c 1 -W 3 -M do -s 1200 \
   -I 10.220.0.1 10.220.0.2
 wait_until "safe effective frame size" sh -c \
-  'awk '\''/iroh_sdwan_peer_effective_frame_size_bytes/ { ok = ($NF <= 1200) } END { exit !ok }'\'' "$1"' \
+  'awk '\''/ironet_peer_effective_frame_size_bytes/ { ok = ($NF <= 1200) } END { exit !ok }'\'' "$1"' \
   sh "$STATE_DIR/node-a/metrics.prom"
 ip netns exec ns-nat iptables -D FORWARD \
   -p udp -m length --length 1281:65535 -j DROP

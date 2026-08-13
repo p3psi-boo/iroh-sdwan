@@ -38,7 +38,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address/32"]
 advertised_prefixes = []
 
@@ -78,7 +78,7 @@ metric() {
   local node=$1
   local peer=$2
   local name=$3
-  awk -v metric="iroh_sdwan_peer_${name}" -v peer="$peer" \
+  awk -v metric="ironet_peer_${name}" -v peer="$peer" \
     '$1 ~ ("^" metric "\\{") && $0 ~ ("peer=\\\"" peer "\\\"") { print $NF; found=1; exit } END { if (!found) exit 1 }' \
     "/state/$node/metrics.prom"
 }
@@ -339,7 +339,7 @@ d_latency_before=$(metric node-a node-d flow_latency_packets_total)
 ip netns exec fr-a python3 /tests/netns/tcp_echo.py client 10.230.0.4 5222 4096
 ip netns exec fr-a python3 /tests/netns/tcp_echo.py client 10.230.0.4 5233 4096
 wait_until "short-flow counters" sh -c \
-  'test "$(awk '\''$1 ~ /^iroh_sdwan_peer_flow_latency_packets_total/ && /peer="node-b"/ {print $NF}'\'' /state/node-a/metrics.prom)" -gt "$1"' \
+  'test "$(awk '\''$1 ~ /^ironet_peer_flow_latency_packets_total/ && /peer="node-b"/ {print $NF}'\'' /state/node-a/metrics.prom)" -gt "$1"' \
   sh "$b_latency_before"
 b_latency_after=$(metric node-a node-b flow_latency_packets_total)
 d_latency_after=$(metric node-a node-d flow_latency_packets_total)
@@ -493,6 +493,6 @@ test "$((b_bytes_after - b_bytes_before))" -gt "$((d_bytes_after - d_bytes_befor
 grep -q 'FlowRouter switched route' /state/node-a/daemon.log
 grep -q 'demand_bytes' /state/node-a/daemon.log
 jq -e 'any(.capacities[]; .route_switches > 0)' /state/node-a/status.json >/dev/null
-grep -Eq 'iroh_sdwan_route_switches_total\{.*\} [1-9][0-9]*$' /state/node-a/metrics.prom
+grep -Eq 'ironet_route_switches_total\{.*\} [1-9][0-9]*$' /state/node-a/metrics.prom
 
 echo "FlowRouter business network-namespace integration test passed"

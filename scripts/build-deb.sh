@@ -39,7 +39,7 @@ fi
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)}
 export CC_x86_64_unknown_linux_musl=${CC_x86_64_unknown_linux_musl:-musl-gcc}
 
-for binary in iroh-sdwan iroh-sdwand; do
+for binary in ironet ironetd; do
   cargo rustc \
     --manifest-path "$ROOT/Cargo.toml" \
     --locked \
@@ -60,9 +60,9 @@ for binary in iroh-sdwan iroh-sdwand; do
   fi
 done
 
-WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/iroh-sdwan-deb.XXXXXX")
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ironet-deb.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
-PACKAGE_ROOT="$WORK_DIR/iroh-sdwan"
+PACKAGE_ROOT="$WORK_DIR/ironet"
 
 install -d -m 0755 \
   "$PACKAGE_ROOT/DEBIAN" \
@@ -70,67 +70,67 @@ install -d -m 0755 \
   "$PACKAGE_ROOT/usr/lib/sysusers.d" \
   "$PACKAGE_ROOT/usr/lib/systemd/system" \
   "$PACKAGE_ROOT/usr/lib/sysctl.d" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/config" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/examples" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/docs"
-install -d -m 0700 "$PACKAGE_ROOT/etc/iroh-sdwan"
-install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/iroh-sdwan" "$PACKAGE_ROOT/usr/bin/iroh-sdwan"
-install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/iroh-sdwand" "$PACKAGE_ROOT/usr/bin/iroh-sdwand"
+  "$PACKAGE_ROOT/usr/share/doc/ironet/config" \
+  "$PACKAGE_ROOT/usr/share/doc/ironet/examples" \
+  "$PACKAGE_ROOT/usr/share/doc/ironet/docs"
+install -d -m 0700 "$PACKAGE_ROOT/etc/ironet"
+install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/ironet" "$PACKAGE_ROOT/usr/bin/ironet"
+install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/ironetd" "$PACKAGE_ROOT/usr/bin/ironetd"
 sed 's|/usr/local/bin/|/usr/bin/|g' \
-  "$ROOT/systemd/iroh-sdwan.service" \
-  >"$PACKAGE_ROOT/usr/lib/systemd/system/iroh-sdwan.service"
-chmod 0644 "$PACKAGE_ROOT/usr/lib/systemd/system/iroh-sdwan.service"
+  "$ROOT/systemd/ironet.service" \
+  >"$PACKAGE_ROOT/usr/lib/systemd/system/ironet.service"
+chmod 0644 "$PACKAGE_ROOT/usr/lib/systemd/system/ironet.service"
 install -m 0644 \
-  "$ROOT/systemd/iroh-sdwan.sysusers" \
-  "$PACKAGE_ROOT/usr/lib/sysusers.d/iroh-sdwan.conf"
+  "$ROOT/systemd/ironet.sysusers" \
+  "$PACKAGE_ROOT/usr/lib/sysusers.d/ironet.conf"
 install -m 0644 \
-  "$ROOT/systemd/90-iroh-sdwan.conf" \
-  "$PACKAGE_ROOT/usr/lib/sysctl.d/90-iroh-sdwan.conf"
+  "$ROOT/systemd/90-ironet.conf" \
+  "$PACKAGE_ROOT/usr/lib/sysctl.d/90-ironet.conf"
 install -m 0644 "$ROOT/config/example.toml" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/examples/config.toml"
+  "$PACKAGE_ROOT/usr/share/doc/ironet/examples/config.toml"
 # 保留与仓库 docs/ 相同的相对链接结构，便于离线浏览已安装文档。
 install -m 0644 "$ROOT/config/example.toml" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/config/example.toml"
+  "$PACKAGE_ROOT/usr/share/doc/ironet/config/example.toml"
 install -m 0644 \
   "$ROOT/README.md" \
   "$ROOT/CONTRIBUTING.md" \
   "$ROOT/PLAN.md" \
   "$ROOT/LICENSE-APACHE" \
   "$ROOT/LICENSE-MIT" \
-  "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/"
-install -m 0644 "$ROOT"/docs/*.md "$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/docs/"
+  "$PACKAGE_ROOT/usr/share/doc/ironet/"
+install -m 0644 "$ROOT"/docs/*.md "$PACKAGE_ROOT/usr/share/doc/ironet/docs/"
 
-cat >"$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/copyright" <<'EOF'
+cat >"$PACKAGE_ROOT/usr/share/doc/ironet/copyright" <<'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: iroh-sdwan
+Upstream-Name: ironet
 
 Files: *
-Copyright: 2026 iroh-sdwan contributors
+Copyright: 2026 ironet contributors
 License: Apache-2.0 or MIT
- See /usr/share/doc/iroh-sdwan/LICENSE-APACHE and
- /usr/share/doc/iroh-sdwan/LICENSE-MIT for the complete license texts.
+ See /usr/share/doc/ironet/LICENSE-APACHE and
+ /usr/share/doc/ironet/LICENSE-MIT for the complete license texts.
 EOF
 
 CHANGELOG_DATE=$(date --utc --date="@$SOURCE_DATE_EPOCH" --rfc-email)
 {
-  echo "iroh-sdwan ($VERSION) unstable; urgency=medium"
+  echo "ironet ($VERSION) unstable; urgency=medium"
   echo
   echo "  * Automated musl release build."
   echo
-  echo " -- iroh-sdwan maintainers <maintainers@iroh-sdwan.invalid>  $CHANGELOG_DATE"
-} | gzip -9n >"$PACKAGE_ROOT/usr/share/doc/iroh-sdwan/changelog.Debian.gz"
+  echo " -- ironet maintainers <maintainers@ironet.invalid>  $CHANGELOG_DATE"
+} | gzip -9n >"$PACKAGE_ROOT/usr/share/doc/ironet/changelog.Debian.gz"
 
 cat >"$PACKAGE_ROOT/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 
 if command -v systemd-sysusers >/dev/null 2>&1; then
-    systemd-sysusers /usr/lib/sysusers.d/iroh-sdwan.conf >/dev/null
-elif ! getent passwd iroh-sdwan >/dev/null 2>&1; then
-    adduser --system --group --home /var/lib/iroh-sdwan --no-create-home iroh-sdwan >/dev/null
+    systemd-sysusers /usr/lib/sysusers.d/ironet.conf >/dev/null
+elif ! getent passwd ironet >/dev/null 2>&1; then
+    adduser --system --group --home /var/lib/ironet --no-create-home ironet >/dev/null
 fi
-install -d -o root -g iroh-sdwan -m 0750 /etc/iroh-sdwan
-install -d -o iroh-sdwan -g iroh-sdwan -m 0700 /var/lib/iroh-sdwan
+install -d -o root -g ironet -m 0750 /etc/ironet
+install -d -o ironet -g ironet -m 0700 /var/lib/ironet
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
@@ -146,7 +146,7 @@ cat >"$PACKAGE_ROOT/DEBIAN/prerm" <<'EOF'
 set -e
 
 if [ "$1" = remove ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl stop iroh-sdwan.service >/dev/null 2>&1 || true
+    systemctl stop ironet.service >/dev/null 2>&1 || true
 fi
 
 exit 0
@@ -169,16 +169,16 @@ chmod 0755 \
 
 INSTALLED_SIZE=$(du -sk "$PACKAGE_ROOT" | cut -f1)
 cat >"$PACKAGE_ROOT/DEBIAN/control" <<EOF
-Package: iroh-sdwan
+Package: ironet
 Version: $VERSION
 Section: net
 Priority: optional
 Architecture: $DEB_ARCH
-Maintainer: iroh-sdwan maintainers <maintainers@iroh-sdwan.invalid>
+Maintainer: ironet maintainers <maintainers@ironet.invalid>
 Installed-Size: $INSTALLED_SIZE
 Depends: adduser, iproute2, procps
 Description: Demand-aware SD-WAN data plane using iroh and FlowRouter
- iroh-sdwan provides an unprivileged control CLI and a capability-bounded
+ ironet provides an unprivileged control CLI and a capability-bounded
  daemon. The daemon builds encrypted peer tunnels, exchanges bounded mesh
  presence, and uses FlowRouter to route node and LAN prefixes. Both executables are
  statically linked against musl; host routing utilities come from Debian packages.
@@ -192,7 +192,7 @@ EOF
 )
 
 mkdir -p "$OUT_DIR"
-PACKAGE="$OUT_DIR/iroh-sdwan_${VERSION}_${DEB_ARCH}.deb"
+PACKAGE="$OUT_DIR/ironet_${VERSION}_${DEB_ARCH}.deb"
 rm -f "$PACKAGE"
 dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$PACKAGE"
 

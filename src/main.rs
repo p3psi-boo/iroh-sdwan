@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 use iroh::EndpointId;
-use iroh_sdwan::{
+use ironet::{
     address::network_alpn,
     config::{
         AttachmentMode, Config, FecConfig, ObservabilityConfig, PacketPolicyConfig, PeerConfig,
@@ -30,22 +30,22 @@ use iroh_sdwan::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "iroh-sdwan", version, about)]
+#[command(name = "ironet", version, about)]
 struct Cli {
-    /// Configuration file. May also be set with IROH_SDWAN_CONFIG.
+    /// Configuration file. May also be set with IRONET_CONFIG.
     #[arg(
         short = 'c',
         long,
         global = true,
-        env = "IROH_SDWAN_CONFIG",
-        default_value = "/etc/iroh-sdwan/config.toml"
+        env = "IRONET_CONFIG",
+        default_value = "/etc/ironet/config.toml"
     )]
     config: PathBuf,
-    /// Daemon control socket. May also be set with IROH_SDWAN_SOCKET.
+    /// Daemon control socket. May also be set with IRONET_SOCKET.
     #[arg(
         long,
         global = true,
-        env = "IROH_SDWAN_SOCKET",
+        env = "IRONET_SOCKET",
         default_value = DEFAULT_CONTROL_SOCKET
     )]
     socket: PathBuf,
@@ -69,7 +69,7 @@ enum OutputFormat {
 enum Command {
     /// Create a node identity and initial configuration.
     Init {
-        #[arg(long, default_value = "/var/lib/iroh-sdwan")]
+        #[arg(long, default_value = "/var/lib/ironet")]
         state_dir: PathBuf,
         /// Shared network join secret. Omit on the first node to generate one;
         /// pass the printed value when initialising additional nodes.
@@ -155,7 +155,7 @@ enum Command {
     RestoreIdentity {
         #[arg(long)]
         source: PathBuf,
-        #[arg(long, default_value = "/var/lib/iroh-sdwan/identity.key")]
+        #[arg(long, default_value = "/var/lib/ironet/identity.key")]
         identity_file: PathBuf,
     },
     /// Check host prerequisites and underlay reachability without changing state.
@@ -321,7 +321,7 @@ async fn route(config_path: &Path, socket_path: &Path, command: RouteCommand) ->
             let mut candidate = previous.clone();
             candidate.merge(RouteRegistry {
                 version: 1,
-                routes: vec![iroh_sdwan::config::RouteOriginConfig {
+                routes: vec![ironet::config::RouteOriginConfig {
                     endpoint_id,
                     prefixes,
                 }],
@@ -371,7 +371,7 @@ async fn route(config_path: &Path, socket_path: &Path, command: RouteCommand) ->
                 OutputFormat::Human => {
                     if entries.is_empty() {
                         println!("No static routes.");
-                        println!("Add one with: iroh-sdwan route add PREFIX --owner PEER");
+                        println!("Add one with: ironet route add PREFIX --owner PEER");
                     } else {
                         println!("{:<22}  {:<20}  ENDPOINT ID", "PREFIX", "OWNER");
                         for (prefix, endpoint_id) in entries {
@@ -530,7 +530,7 @@ async fn apply_route_change(
 }
 
 async fn validate_route_registry(config_path: &Path, registry: &RouteRegistry) -> Result<()> {
-    iroh_sdwan::routes::validate_for_config(config_path, registry).await
+    ironet::routes::validate_for_config(config_path, registry).await
 }
 
 enum RouteReload {
@@ -558,7 +558,7 @@ async fn backup_identity(config_path: &Path, output: &Path) -> Result<()> {
     let derp_source = config.derp_identity_file();
     if derp_source.exists() {
         let derp_output = companion_derp_path(output);
-        if let Err(error) = iroh_sdwan::derp::identity::backup(&derp_source, &derp_output) {
+        if let Err(error) = ironet::derp::identity::backup(&derp_source, &derp_output) {
             let _ = std::fs::remove_file(output);
             return Err(error);
         }
@@ -572,7 +572,7 @@ fn restore_identity(source: &Path, identity_file: &Path) -> Result<()> {
     let derp_source = companion_derp_path(source);
     if derp_source.exists() {
         let derp_destination = companion_derp_path(identity_file);
-        if let Err(error) = iroh_sdwan::derp::identity::restore(&derp_source, &derp_destination) {
+        if let Err(error) = ironet::derp::identity::restore(&derp_source, &derp_destination) {
             let _ = std::fs::remove_file(identity_file);
             return Err(error);
         }
@@ -936,7 +936,7 @@ async fn doctor(config_path: &Path) -> Result<()> {
     let derp_servers = config.derp_servers()?;
     if !derp_servers.is_empty() {
         let identity = if config.derp_identity_file().exists() {
-            iroh_sdwan::derp::identity::load(&config.derp_identity_file())?
+            ironet::derp::identity::load(&config.derp_identity_file())?
         } else {
             DerpIdentity::generate()
         };
@@ -1010,7 +1010,7 @@ async fn init(
         attachment: AttachmentMode::Tun,
         tun_mtu: u16::MAX,
         max_frame_size: 1400,
-        node_interface: "isw0".into(),
+        node_interface: "ironet0".into(),
         node_addresses: answers.node_addresses,
         advertised_prefixes: answers.advertised_prefixes,
         node_info: None,
@@ -1038,7 +1038,7 @@ async fn init(
     let secret_key = identity::load_or_create(&identity_file)?;
     config.validate_local_id(secret_key.public())?;
     let derp_public_key = if config.relay.derp_enabled() {
-        Some(iroh_sdwan::derp::identity::load_or_create(&config.derp_identity_file())?.public_key())
+        Some(ironet::derp::identity::load_or_create(&config.derp_identity_file())?.public_key())
     } else {
         None
     };
@@ -1317,7 +1317,7 @@ async fn inspect(config_path: &Path) -> Result<()> {
     println!("node_interface: {}", config.node_interface);
     let derp_servers = config.derp_servers()?;
     if !derp_servers.is_empty() {
-        let identity = iroh_sdwan::derp::identity::load_or_create(&config.derp_identity_file())?;
+        let identity = ironet::derp::identity::load_or_create(&config.derp_identity_file())?;
         println!("derp_public_key: {}", identity.public_key());
         println!(
             "derp_identity_file: {}",
@@ -1359,7 +1359,7 @@ async fn inspect(config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh_sdwan::{
+    use ironet::{
         config::NodeInfo, mesh::MeshStatus, observability::RouteStatus, trace::PingSample,
     };
     use std::io::Cursor;
@@ -1368,7 +1368,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "name": "bad\nname",
             "endpoint_id": "endpoint",
-            "interface": "isw0",
+            "interface": "ironet0",
             "connected": true,
             "connection_events": 1,
             "tx_packets": 2,
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn global_config_is_accepted_after_subcommand() {
         let cli = Cli::try_parse_from([
-            "iroh-sdwan",
+            "ironet",
             "trace",
             "21.0.0.1",
             "--config",
@@ -1443,14 +1443,14 @@ mod tests {
     #[test]
     fn global_socket_is_accepted_after_subcommand() {
         let cli =
-            Cli::try_parse_from(["iroh-sdwan", "status", "--socket", "/tmp/control.sock"]).unwrap();
+            Cli::try_parse_from(["ironet", "status", "--socket", "/tmp/control.sock"]).unwrap();
         assert_eq!(cli.socket, PathBuf::from("/tmp/control.sock"));
     }
 
     #[test]
     fn ping_accepts_probe_count_timeout_and_machine_output() {
         let cli = Cli::try_parse_from([
-            "iroh-sdwan",
+            "ironet",
             "ping",
             "21.0.0.2",
             "--count",
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn peers_supports_json_lines_output() {
-        let cli = Cli::try_parse_from(["iroh-sdwan", "peers", "--output", "jsonl"]).unwrap();
+        let cli = Cli::try_parse_from(["ironet", "peers", "--output", "jsonl"]).unwrap();
         match cli.command {
             Command::Peers { output } => assert_eq!(output, OutputFormat::Jsonl),
             command => panic!("expected peers command, got {command:?}"),
@@ -1490,7 +1490,7 @@ mod tests {
     #[test]
     fn route_subcommands_match_the_operational_cli() {
         let cli = Cli::try_parse_from([
-            "iroh-sdwan",
+            "ironet",
             "route",
             "import",
             "site.routes",
@@ -1516,14 +1516,8 @@ mod tests {
             command => panic!("expected route import, got {command:?}"),
         }
 
-        let cli = Cli::try_parse_from([
-            "iroh-sdwan",
-            "route",
-            "remove",
-            "10.0.0.0/24",
-            "10.1.0.0/24",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ironet", "route", "remove", "10.0.0.0/24", "10.1.0.0/24"])
+            .unwrap();
         match cli.command {
             Command::Route {
                 command: RouteCommand::Remove { selectors, .. },
@@ -1532,7 +1526,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "iroh-sdwan",
+            "ironet",
             "route",
             "add",
             "10.2.0.0/24",
@@ -1559,30 +1553,30 @@ mod tests {
             command => panic!("expected route add, got {command:?}"),
         }
 
-        assert!(Cli::try_parse_from(["iroh-sdwan", "route", "ls"]).is_ok());
-        assert!(Cli::try_parse_from(["iroh-sdwan", "route", "rm", "10.2.0.0/24"]).is_ok());
+        assert!(Cli::try_parse_from(["ironet", "route", "ls"]).is_ok());
+        assert!(Cli::try_parse_from(["ironet", "route", "rm", "10.2.0.0/24"]).is_ok());
     }
 
     #[test]
     fn tui_accepts_bounded_refresh_interval_and_top_alias() {
-        let cli = Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "500"]).unwrap();
+        let cli = Cli::try_parse_from(["ironet", "tui", "--interval-ms", "500"]).unwrap();
         match cli.command {
             Command::Tui { interval_ms } => assert_eq!(interval_ms, 500),
             command => panic!("expected tui command, got {command:?}"),
         }
-        assert!(Cli::try_parse_from(["iroh-sdwan", "top"]).is_ok());
-        assert!(Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "199"]).is_err());
-        assert!(Cli::try_parse_from(["iroh-sdwan", "tui", "--interval-ms", "60001"]).is_err());
+        assert!(Cli::try_parse_from(["ironet", "top"]).is_ok());
+        assert!(Cli::try_parse_from(["ironet", "tui", "--interval-ms", "199"]).is_err());
+        assert!(Cli::try_parse_from(["ironet", "tui", "--interval-ms", "60001"]).is_err());
     }
 
     #[test]
     fn ping_rejects_invalid_cli_boundaries_and_targets() {
         for arguments in [
-            vec!["iroh-sdwan", "ping", "21.0.0.2", "--count", "0"],
-            vec!["iroh-sdwan", "ping", "21.0.0.2", "--count", "21"],
-            vec!["iroh-sdwan", "ping", "21.0.0.2", "--timeout-ms", "0"],
-            vec!["iroh-sdwan", "ping", "21.0.0.2", "--timeout-ms", "60001"],
-            vec!["iroh-sdwan", "ping", "not-an-ip"],
+            vec!["ironet", "ping", "21.0.0.2", "--count", "0"],
+            vec!["ironet", "ping", "21.0.0.2", "--count", "21"],
+            vec!["ironet", "ping", "21.0.0.2", "--timeout-ms", "0"],
+            vec!["ironet", "ping", "21.0.0.2", "--timeout-ms", "60001"],
+            vec!["ironet", "ping", "not-an-ip"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }
@@ -1594,7 +1588,7 @@ mod tests {
         let human = render_peers(std::slice::from_ref(&peer), OutputFormat::Human).unwrap();
         assert_eq!(
             human,
-            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=isw0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
+            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=ironet0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
         );
         assert!(!human.contains("bad\nname"));
 

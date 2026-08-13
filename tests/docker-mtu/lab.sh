@@ -25,7 +25,7 @@ bind_addresses = ["[::]:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$overlay4/32", "$overlay6/128"]
 advertised_prefixes = []
 [node_info]
@@ -58,7 +58,7 @@ EOF
 
 metric() {
   local node=$1 name=$2
-  awk -v metric="iroh_sdwan_peer_${name}" '$1 ~ ("^" metric "\\{") {print $NF; exit}' "/state/$node/metrics.prom"
+  awk -v metric="ironet_peer_${name}" '$1 ~ ("^" metric "\\{") {print $NF; exit}' "/state/$node/metrics.prom"
 }
 
 echo "==> creating an IPv6 underlay for PTB and black-hole MTU tests"
@@ -94,7 +94,7 @@ ip -n mtu-b link set mb0 mtu 1280
 wait "$flow_pid"
 test "$(jq '.end.sum_received.bytes > 1000000' /state/mtu-midflow.json)" = true
 wait_until "ICMPv6 PTB frame adaptation" sh -c \
-  'awk '\''$1 ~ /iroh_sdwan_peer_effective_frame_size_bytes/ && $NF <= 1200 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
+  'awk '\''$1 ~ /ironet_peer_effective_frame_size_bytes/ && $NF <= 1200 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
 wait_until "post-PTB bulk queue drain" ip netns exec mtu-a \
   ping -6 -c 1 -W 3 -s 4096 -I fd73:9db8:4242::1 fd73:9db8:4242::2
 ip netns exec mtu-a ping -6 -c 3 -W 3 -s 4096 -I fd73:9db8:4242::1 fd73:9db8:4242::2
@@ -109,7 +109,7 @@ ip -n mtu-b link set mb0 mtu 1500
 start_daemon mtu-a node-a PID_A
 start_daemon mtu-b node-b PID_B
 wait_until "fresh high-MTU connection" sh -c \
-  'awk '\''$1 ~ /iroh_sdwan_peer_effective_frame_size_bytes/ && $NF >= 1300 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
+  'awk '\''$1 ~ /ironet_peer_effective_frame_size_bytes/ && $NF >= 1300 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
 # IPv6 total length is about 48 bytes above noq's UDP payload size.  Drop the
 # high-MTU packets while leaving the QUIC-required 1200-byte fallback usable.
 ip netns exec mtu-a ip6tables -I OUTPUT 1 -p udp -m length --length 1301:65535 -j DROP
@@ -118,7 +118,7 @@ before_b=$(metric node-b effective_frame_size_bytes)
 wait_until "silent black-hole traffic recovery" \
   ip netns exec mtu-a ping -6 -c 1 -W 3 -s 4096 -I fd73:9db8:4242::1 fd73:9db8:4242::2
 wait_until "silent black-hole frame floor" sh -c \
-  'awk '\''$1 ~ /iroh_sdwan_peer_effective_frame_size_bytes/ && $NF <= 1200 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
+  'awk '\''$1 ~ /ironet_peer_effective_frame_size_bytes/ && $NF <= 1200 {ok=1} END {exit !ok}'\'' /state/node-a/metrics.prom'
 after_a=$(metric node-a effective_frame_size_bytes)
 after_b=$(metric node-b effective_frame_size_bytes)
 test "$after_a" -le "$before_a"

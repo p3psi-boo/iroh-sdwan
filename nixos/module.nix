@@ -6,27 +6,27 @@
   ...
 }:
 let
-  cfg = config.services.iroh-sdwan;
+  cfg = config.services.ironet;
 in
 {
-  options.services.iroh-sdwan = {
-    enable = lib.mkEnableOption "the iroh SD-WAN data-plane daemon";
+  options.services.ironet = {
+    enable = lib.mkEnableOption "the Ironet data-plane daemon";
 
     package = lib.mkOption {
       type = lib.types.package;
       default = defaultPackage;
-      defaultText = lib.literalExpression "inputs.iroh-sdwan.packages.${pkgs.stdenv.hostPlatform.system}.default";
-      description = "iroh-sdwan package containing the CLI and daemon.";
+      defaultText = lib.literalExpression "inputs.ironet.packages.${pkgs.stdenv.hostPlatform.system}.default";
+      description = "ironet package containing the CLI and daemon.";
     };
     configFile = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/iroh-sdwan/config.toml";
-      description = "Sealed iroh-sdwan configuration file.";
+      default = "/etc/ironet/config.toml";
+      description = "Sealed ironet configuration file.";
     };
 
     socketPath = lib.mkOption {
       type = lib.types.str;
-      default = "/run/iroh-sdwan/control.sock";
+      default = "/run/ironet/control.sock";
       description = "Unix control socket path.";
     };
 
@@ -35,12 +35,12 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    users.groups.iroh-sdwan = { };
-    users.users.iroh-sdwan = {
+    users.groups.ironet = { };
+    users.users.ironet = {
       isSystemUser = true;
-      group = "iroh-sdwan";
-      home = "/var/lib/iroh-sdwan";
-      description = "iroh SD-WAN daemon";
+      group = "ironet";
+      home = "/var/lib/ironet";
+      description = "Ironet daemon";
     };
 
     boot.kernel.sysctl = {
@@ -50,8 +50,8 @@ in
       "net.ipv6.conf.all.forwarding" = 1;
     };
 
-    systemd.services.iroh-sdwan = {
-      description = "iroh SD-WAN data plane with FlowRouter";
+    systemd.services.ironet = {
+      description = "Ironet data plane with FlowRouter";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
@@ -60,17 +60,17 @@ in
       ];
       environment = {
         RUST_LOG = "info";
-        IROH_SDWAN_LOG_FORMAT = "json";
+        IRONET_LOG_FORMAT = "json";
       };
       preStart = ''
-        ${lib.getExe' cfg.package "iroh-sdwan"} doctor --config ${lib.escapeShellArg (toString cfg.configFile)}
+        ${lib.getExe' cfg.package "ironet"} doctor --config ${lib.escapeShellArg (toString cfg.configFile)}
       '';
       serviceConfig = {
         Type = "simple";
-        User = "iroh-sdwan";
-        Group = "iroh-sdwan";
-        ExecStart = "${cfg.package}/bin/iroh-sdwand --config ${cfg.configFile} --socket ${cfg.socketPath}";
-        ExecReload = "${lib.getExe' cfg.package "iroh-sdwan"} reload --socket ${cfg.socketPath}";
+        User = "ironet";
+        Group = "ironet";
+        ExecStart = "${cfg.package}/bin/ironetd --config ${cfg.configFile} --socket ${cfg.socketPath}";
+        ExecReload = "${lib.getExe' cfg.package "ironet"} reload --socket ${cfg.socketPath}";
         Restart = "on-failure";
         RestartSec = "2s";
         TimeoutStopSec = "20s";
@@ -91,12 +91,12 @@ in
           "AF_NETLINK"
         ];
         ReadWritePaths = [
-          "/run/iroh-sdwan"
-          "/var/lib/iroh-sdwan"
+          "/run/ironet"
+          "/var/lib/ironet"
         ];
-        StateDirectory = "iroh-sdwan";
+        StateDirectory = "ironet";
         StateDirectoryMode = "0700";
-        RuntimeDirectory = "iroh-sdwan";
+        RuntimeDirectory = "ironet";
         RuntimeDirectoryMode = "0770";
       };
     };

@@ -518,7 +518,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to a DERP server"]
     async fn iroh_connection_uses_derp_custom_transport() {
-        let url = std::env::var("IROH_SDWAN_DERP_TEST_URL")
+        let url = std::env::var("IRONET_DERP_TEST_URL")
             .unwrap_or_else(|_| "https://derp1.tailscale.com".into());
         let server = DerpServer::parse(&url).unwrap();
         exercise_iroh_over_derp(vec![server]).await;
@@ -528,8 +528,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to multiple DERP servers"]
     async fn iroh_connection_uses_multiple_derp_regions() {
-        let urls = std::env::var("IROH_SDWAN_DERP_TEST_URLS")
-            .expect("IROH_SDWAN_DERP_TEST_URLS must contain comma-separated DERP URLs");
+        let urls = std::env::var("IRONET_DERP_TEST_URLS")
+            .expect("IRONET_DERP_TEST_URLS must contain comma-separated DERP URLs");
         let servers = urls
             .split(',')
             .map(str::trim)
@@ -545,7 +545,7 @@ mod tests {
         let right_derp = DerpIdentity::generate();
         let left_key = SecretKey::generate();
         let right_key = SecretKey::generate();
-        let alpn = b"iroh-sdwan/derp-test/1".to_vec();
+        let alpn = b"ironet/derp-test/1".to_vec();
         let tls = super::super::client::tls_config().unwrap();
 
         let left_transport = DerpTransport::new(

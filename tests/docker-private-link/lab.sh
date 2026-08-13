@@ -16,7 +16,7 @@ trap cleanup EXIT
 write_config() {
   local node=$1 address=$2 peer_name=$3 peer_id=$4 remote=$5 local_bind=$6 dial=$7 key=$8
   cat >"/state/$node/config.toml" <<EOF
-network_id = "netns-v4-private-link"
+network_id = "netns-v1-private-link"
 identity_file = "/state/$node/identity.key"
 discovery_enabled = false
 max_frame_size = 1200
@@ -72,8 +72,8 @@ create_veth private-a pa-private 10.255.47.1/30 private-b pb-private 10.255.47.2
 create_veth private-a pa-public 198.51.100.1/24 private-b pb-public 198.51.100.2/24
 ip netns exec private-a ping -c 1 -W 1 198.51.100.2 >/dev/null
 
-ID_A=$(initialize_identity node-a netns-v4-private-link)
-ID_B=$(initialize_identity node-b netns-v4-private-link)
+ID_A=$(initialize_identity node-a netns-v1-private-link)
+ID_B=$(initialize_identity node-b netns-v1-private-link)
 PAIR_KEY=$(printf '47%.0s' $(seq 1 32))
 
 write_config node-a 10.247.0.1 node-b "$ID_B" 10.255.47.2:4000 10.255.47.1:4000 active "$PAIR_KEY"
@@ -83,12 +83,12 @@ seal_node node-b
 start_daemon private-a node-a PID_A
 start_daemon private-b node-b PID_B
 
-wait_until "pairwise v4 overlay" ctl private-a node-a ping --count 1 --timeout-ms 3000 10.247.0.2
+wait_until "pairwise V1 overlay" ctl private-a node-a ping --count 1 --timeout-ms 3000 10.247.0.2
 ip netns exec private-b ping -c 3 -W 3 -I 10.247.0.2 10.247.0.1
 
 echo "==> asserting pairwise authentication, dial role and locator secrecy"
 wait_until "private link status" jq -e \
-  '(.peers | length == 1) and all(.peers[]; .connected and .protocol_major == 4 and .private_link and .selected_path_transport == "direct")' \
+  '(.peers | length == 1) and all(.peers[]; .connected and .protocol_major == 1 and .private_link and .selected_path_transport == "direct")' \
   /state/node-a/status.json
 jq -e '.peers[0].selected_path_remote | contains("10.255.47.2")' /state/node-a/status.json >/dev/null
 test "$(grep -c 'peer connection active' /state/node-b/daemon.log)" -ge 1
@@ -123,7 +123,7 @@ fi
 ip netns exec private-a tc qdisc del dev pa-private root
 wait_until "private link recovery" ctl private-a node-a ping --count 1 --timeout-ms 3000 10.247.0.2
 
-echo "==> proving pairwise secret mismatch fails the v4 session"
+echo "==> proving pairwise secret mismatch fails the V1 session"
 stop_process "$PID_B"
 PID_B=
 sed -i "s/auth_key = \"$PAIR_KEY\"/auth_key = \"$(printf '48%.0s' $(seq 1 32))\"/" /state/node-b/config.toml

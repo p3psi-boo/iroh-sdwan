@@ -27,6 +27,6 @@ pub mod tui;
 pub mod tunnel;
 pub mod wire;
 
-/// Clean-slate wire generation. V3 nodes intentionally negotiate a different
-/// ALPN and can therefore never accidentally exchange v4 frames.
-pub const PROTOCOL_NAME: &str = "iroh-sdwan/ip/4";
+/// Clean-slate wire generation. Pre-Ironet protocol experiments intentionally negotiate a different
+/// ALPN and can therefore never accidentally exchange V1 frames.
+pub const PROTOCOL_NAME: &str = "ironet/ip/1";

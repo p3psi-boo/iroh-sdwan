@@ -1,12 +1,12 @@
-# iroh-sdwan
+# Ironet
 
-`iroh-sdwan` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在单个 TUN 接口上处理覆盖网流量，并通过 FlowRouter 按实时路径状态选择首跳。
+`ironet` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在单个 TUN 接口上处理覆盖网流量，并通过 FlowRouter 按实时路径状态选择首跳。
 
-当前版本为 `0.1.0`。配置格式、Presence 格式和内部 wire format 在首次稳定发布前可能发生不兼容变更。
+当前软件版本为 `0.1.0`，当前网络协议正式定位为 **Ironet Protocol V1（1.0）**。协议分层、兼容边界和稳定性规则见 [Protocol V1](docs/protocol-v1.md)。配置格式、Presence 格式和内部 wire format 在首次稳定发布前可能发生不兼容变更。
 
 ## 项目范围
 
-- 每个守护进程创建并管理一个三层 TUN 接口，默认名称为 `isw0`。
+- 每个守护进程创建并管理一个三层 TUN 接口，默认名称为 `ironet0`。
 - 节点使用签名 Presence 传播节点地址、前缀归属和转发能力；固定 peer 用于引导连接。
 - 同一流在短租约内固定到一条路径；租约到期后可根据延迟、抖动、丢包、队列压力和实测容量重新选择路径。
 - 容量以 `(目的节点所有者, 首跳节点)` 为键，分别维护两个方向的测量值。主动探测和接收端确认的业务交付样本共同参与估计。
@@ -20,7 +20,7 @@
 
 ```mermaid
 flowchart LR
-    R["Linux 策略路由"] --> T["单个 L3 TUN：isw0"]
+    R["Linux 策略路由"] --> T["单个 L3 TUN：ironet0"]
     T --> F["FlowRouter\n流键、压力与路径租约"]
     F --> B["首跳 B 的发送队列"]
     F --> D["首跳 D 的发送队列"]
@@ -53,7 +53,7 @@ ETA = RTT + 抖动 + 丢包惩罚
 Debian 包安装：
 
 ```bash
-sudo dpkg -i ./iroh-sdwan_0.1.0_amd64.deb
+sudo dpkg -i ./ironet_0.1.0_amd64.deb
 ```
 
 从源码安装：
@@ -66,22 +66,22 @@ sudo scripts/install.sh
 首次节点使用交互式初始化。第一个节点不传入 `--network-id`，命令会生成并输出网络 ID；其余节点传入相同的值。
 
 ```bash
-sudo iroh-sdwan init \
-  --config /etc/iroh-sdwan/config.toml \
-  --state-dir /var/lib/iroh-sdwan
+sudo ironet init \
+  --config /etc/ironet/config.toml \
+  --state-dir /var/lib/ironet
 
-sudo iroh-sdwan init \
-  --config /etc/iroh-sdwan/config.toml \
-  --state-dir /var/lib/iroh-sdwan \
+sudo ironet init \
+  --config /etc/ironet/config.toml \
+  --state-dir /var/lib/ironet \
   --network-id "第一个节点输出的网络 ID"
 ```
 
 初始化后，根据部署拓扑补充地址、前缀和引导 peer。每次手工修改配置后都必须重新生成完整性摘要：
 
 ```bash
-sudo iroh-sdwan validate --config /etc/iroh-sdwan/config.toml
-sudo iroh-sdwan seal-config --config /etc/iroh-sdwan/config.toml
-sudo systemctl enable --now iroh-sdwan
+sudo ironet validate --config /etc/ironet/config.toml
+sudo ironet seal-config --config /etc/ironet/config.toml
+sudo systemctl enable --now ironet
 ```
 
 两节点静态示例、配置字段说明和配置变更方式见 [快速开始](docs/快速开始.md) 与 [配置参考](docs/配置参考.md)。
@@ -89,21 +89,21 @@ sudo systemctl enable --now iroh-sdwan
 ## 日常操作
 
 ```bash
-sudo iroh-sdwan health
-sudo iroh-sdwan status
-sudo iroh-sdwan peers
-sudo iroh-sdwan tui
-sudo iroh-sdwan ping 21.0.0.3
-sudo iroh-sdwan trace 21.0.0.3
-sudo iroh-sdwan route add 192.168.30.0/24 --owner branch-c
-sudo iroh-sdwan route import ./site-routes.txt
-sudo iroh-sdwan route list
-sudo iroh-sdwan route remove 192.168.30.0/24
-sudo iroh-sdwan reload
+sudo ironet health
+sudo ironet status
+sudo ironet peers
+sudo ironet tui
+sudo ironet ping 21.0.0.3
+sudo ironet trace 21.0.0.3
+sudo ironet route add 192.168.30.0/24 --owner branch-c
+sudo ironet route import ./site-routes.txt
+sudo ironet route list
+sudo ironet route remove 192.168.30.0/24
+sudo ironet reload
 ```
 
 静态远端路由由 CLI 原子写入 `identity_file` 同目录的 `routes.toml`（默认
-`/var/lib/iroh-sdwan/routes.toml`），不会混入或重写 `config.toml`。导入和删除
+`/var/lib/ironet/routes.toml`），不会混入或重写 `config.toml`。导入和删除
 在守护进程运行时会自动 reload；`--dry-run` 可预览，维护窗口可加 `--defer`
 延后应用。
 

@@ -103,7 +103,7 @@ pub fn decode_delivery(bytes: &[u8]) -> Result<DeliveryMessage> {
         let envelope = Envelope::decode(Bytes::copy_from_slice(bytes))?;
         ensure!(
             envelope.kind == MessageType::Delivery,
-            "v4 envelope does not contain a delivery message"
+            "V1 envelope does not contain a delivery message"
         );
         return decode_delivery(&envelope.payload);
     }
@@ -371,7 +371,7 @@ impl DeliverySource {
             let sequence = self.next_session_id.max(1);
             self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
             let mut hasher = blake3::Hasher::new();
-            hasher.update(b"iroh-sdwan-delivery-session-v1\0");
+            hasher.update(b"ironet-delivery-session-v1\0");
             hasher.update(origin.as_bytes());
             hasher.update(&sequence.to_be_bytes());
             let id = u64::from_be_bytes(

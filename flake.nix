@@ -1,5 +1,5 @@
 {
-  description = "Development environment for the Linux-only iroh-sdwan prototype";
+  description = "Development environment for the Linux-only ironet prototype";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -58,7 +58,7 @@
       in
       {
         packages.default = rustPlatform.buildRustPackage {
-          pname = "iroh-sdwan";
+          pname = "ironet";
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
@@ -69,11 +69,11 @@
           postInstall = ''
             # Rust embeds source paths used by panic locations. They are not
             # runtime dependencies and would otherwise retain the toolchain.
-            remove-references-to -t ${rust} "$out/bin/iroh-sdwan"
-            remove-references-to -t ${rust} "$out/bin/iroh-sdwand"
+            remove-references-to -t ${rust} "$out/bin/ironet"
+            remove-references-to -t ${rust} "$out/bin/ironetd"
           '';
           doCheck = true;
-          meta.mainProgram = "iroh-sdwan";
+          meta.mainProgram = "ironet";
         };
 
         devShells.default = pkgs.mkShell {
@@ -88,7 +88,7 @@
 
           RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
           shellHook = ''
-            echo "iroh-sdwan dev shell"
+            echo "ironet dev shell"
             echo "  rustc:  $(rustc --version)"
           '';
         };
@@ -106,7 +106,7 @@
           CC_x86_64_unknown_linux_musl = "${muslGcc}/bin/musl-gcc";
 
           shellHook = ''
-            echo "iroh-sdwan static release shell"
+            echo "ironet static release shell"
             echo "  scripts/build-deb.sh"
           '';
         };

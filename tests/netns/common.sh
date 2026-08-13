@@ -46,7 +46,7 @@ initialize_identity() {
   shift 2
   mkdir -p "/state/$node"
   local output
-  output=$(iroh-sdwan init \
+  output=$(ironet init \
     --config "/state/$node/config.toml" \
     --state-dir "/state/$node" \
     --network-id "$network_id" \
@@ -56,14 +56,14 @@ initialize_identity() {
 
 seal_node() {
   local node=$1
-  iroh-sdwan seal-config --config "/state/$node/config.toml" >/dev/null
+  ironet seal-config --config "/state/$node/config.toml" >/dev/null
 }
 
 start_daemon() {
   local namespace=$1
   local node=$2
   local variable=$3
-  ip netns exec "$namespace" iroh-sdwand \
+  ip netns exec "$namespace" ironetd \
     --config "/state/$node/config.toml" \
     --socket "/state/$node/control.sock" \
     >"/state/$node/daemon.log" 2>&1 &
@@ -74,7 +74,7 @@ ctl() {
   local namespace=$1
   local node=$2
   shift 2
-  ip netns exec "$namespace" iroh-sdwan \
+  ip netns exec "$namespace" ironet \
     --socket "/state/$node/control.sock" "$@"
 }
 

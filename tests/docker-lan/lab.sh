@@ -25,7 +25,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1200
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$overlay4/32", "$overlay6/128"]
 advertised_prefixes = ["$lan4", "$lan6"]
 
@@ -99,8 +99,8 @@ wait_until "IPv6 routed LAN" ip netns exec lan-host-a ping -6 -c 1 -W 3 fd20:20:
 ip netns exec lan-host-c ping -c 3 -W 3 192.168.10.10
 ip netns exec lan-host-c ping -6 -c 3 -W 3 fd20:10::10
 ip netns exec lan-host-a ping -c 2 -W 3 -M dont -s 4000 192.168.20.10
-ip -n lan-node-a route show table 100 192.168.20.0/24 | grep -q 'dev isw0'
-ip -n lan-node-c -6 route show table 100 fd20:10::/64 | grep -q 'dev isw0'
+ip -n lan-node-a route show table 100 192.168.20.0/24 | grep -q 'dev ironet0'
+ip -n lan-node-c -6 route show table 100 fd20:10::/64 | grep -q 'dev ironet0'
 
 echo "==> proving prefix policy and default-route guardrails"
 ip -n lan-host-a route add 198.18.0.0/24 via 192.168.10.1
@@ -110,11 +110,11 @@ if ip netns exec lan-host-a ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1; then
 fi
 cp /state/node-a/config.toml /state/node-a/default-invalid.toml
 sed -i 's#advertised_prefixes = \["192.168.10.0/24", "fd20:10::/64"\]#advertised_prefixes = ["0.0.0.0/0"]#' /state/node-a/default-invalid.toml
-if iroh-sdwan seal-config --config /state/node-a/default-invalid.toml >/state/default-route.log 2>&1; then
+if ironet seal-config --config /state/node-a/default-invalid.toml >/state/default-route.log 2>&1; then
   echo "default route was accepted without allow_default_routes" >&2
   exit 1
 fi
 grep -q 'allow_default_routes' /state/default-route.log
-test "$(awk '$1 ~ /iroh_sdwan_peer_policy_drops_total/ {sum += $NF} END {print sum+0}' /state/node-a/metrics.prom)" -eq 0
+test "$(awk '$1 ~ /ironet_peer_policy_drops_total/ {sum += $NF} END {print sum+0}' /state/node-a/metrics.prom)" -eq 0
 
 echo "routed LAN network-namespace integration test passed"

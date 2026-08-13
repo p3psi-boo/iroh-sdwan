@@ -24,7 +24,7 @@ bind_addresses = ["0.0.0.0:4000"]
 discovery_enabled = false
 tun_mtu = 65535
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address/32"]
 advertised_prefixes = []
 [node_info]
@@ -101,13 +101,13 @@ test "$flows" -ge 32
 test "$cpu_ticks" -ge 0
 test "$fd_after" -le "$((fd_before + 8))"
 test "$rss_after" -le "$((rss_before + 262144))"
-test "$(awk '$1 ~ /iroh_sdwan_peer_queue_drops_total/ {print $NF}' /state/node-a/metrics.prom)" -eq 0
-test "$(awk '$1 ~ /iroh_sdwan_peer_queue_expired_drops_total/ {print $NF}' /state/node-a/metrics.prom)" -eq 0
-tagged=$(awk '$1 ~ /iroh_sdwan_peer_delivery_tagged_packets_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
-headers=$(awk '$1 ~ /iroh_sdwan_peer_delivery_header_bytes_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
-registers=$(awk '$1 ~ /iroh_sdwan_peer_delivery_registers_sent_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
-reports=$(awk '$1 ~ /iroh_sdwan_peer_delivery_reports_sent_total/ {sum += $NF} END {print sum + 0}' /state/node-b/metrics.prom)
-control_bytes=$(awk '$1 ~ /iroh_sdwan_peer_delivery_control_bytes_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom /state/node-b/metrics.prom)
+test "$(awk '$1 ~ /ironet_peer_queue_drops_total/ {print $NF}' /state/node-a/metrics.prom)" -eq 0
+test "$(awk '$1 ~ /ironet_peer_queue_expired_drops_total/ {print $NF}' /state/node-a/metrics.prom)" -eq 0
+tagged=$(awk '$1 ~ /ironet_peer_delivery_tagged_packets_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
+headers=$(awk '$1 ~ /ironet_peer_delivery_header_bytes_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
+registers=$(awk '$1 ~ /ironet_peer_delivery_registers_sent_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom)
+reports=$(awk '$1 ~ /ironet_peer_delivery_reports_sent_total/ {sum += $NF} END {print sum + 0}' /state/node-b/metrics.prom)
+control_bytes=$(awk '$1 ~ /ironet_peer_delivery_control_bytes_total/ {sum += $NF} END {print sum + 0}' /state/node-a/metrics.prom /state/node-b/metrics.prom)
 echo "delivery tagged=$tagged header_bytes=$headers registers=$registers reports=$reports control_bytes=$control_bytes"
 test "$tagged" -gt 0
 test "$headers" -eq "$((tagged * 12))"

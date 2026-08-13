@@ -46,14 +46,14 @@ pub enum WireDatagram {
 pub fn encode_heartbeat() -> Bytes {
     Envelope::new(MessageType::Heartbeat, Bytes::new())
         .encode()
-        .expect("empty v4 heartbeat envelope is valid")
+        .expect("empty V1 heartbeat envelope is valid")
 }
 
 #[cfg(test)]
 fn encode_connection_refresh() -> Bytes {
     Envelope::new(MessageType::ConnectionRefresh, Bytes::new())
         .encode()
-        .expect("empty v4 refresh envelope is valid")
+        .expect("empty V1 refresh envelope is valid")
 }
 
 pub fn encode_address_candidates(addresses: &[SocketAddr]) -> Result<Bytes> {
@@ -171,10 +171,10 @@ pub fn encode_repair_request(request: &RepairRequest) -> Result<Bytes> {
 
 pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
     let envelope = Envelope::decode(datagram)?;
-    ensure!(envelope.flags == 0, "unsupported v4 datagram flags");
+    ensure!(envelope.flags == 0, "unsupported V1 datagram flags");
     ensure!(
         envelope.extension.is_empty(),
-        "unexpected v4 datagram extension"
+        "unexpected V1 datagram extension"
     );
     match envelope.kind {
         MessageType::IpFragment => Ok(WireDatagram::Frames(vec![envelope.payload])),
@@ -196,7 +196,7 @@ pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
             Ok(WireDatagram::ConnectionRefresh)
         }
         MessageType::AddressCandidates => decode_address_candidates(&envelope.payload),
-        MessageType::FecShard => anyhow::bail!("FEC shard reached the inner v4 decoder"),
+        MessageType::FecShard => anyhow::bail!("FEC shard reached the inner V1 decoder"),
     }
 }
 
@@ -361,7 +361,7 @@ impl Reassembler {
             let envelope = Envelope::decode(Bytes::copy_from_slice(frame))?;
             ensure!(
                 envelope.kind == MessageType::IpFragment,
-                "v4 envelope does not contain an IP fragment"
+                "V1 envelope does not contain an IP fragment"
             );
             return self.push_tagged(&envelope.payload);
         }

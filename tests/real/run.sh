@@ -3,7 +3,7 @@ set -euo pipefail
 
 NAT_HOST=${NAT_HOST:-nat-sjw0}
 SYMMETRIC_HOST=${SYMMETRIC_HOST:-txy-claw}
-STATE_DIR=${STATE_DIR:-/var/lib/iroh-sdwan-trial}
+STATE_DIR=${STATE_DIR:-/var/lib/ironet-trial}
 NAT_V4=${NAT_V4:-10.250.12.2}
 SYMMETRIC_V4=${SYMMETRIC_V4:-10.250.12.1}
 NAT_V6=${NAT_V6:-fd73:9db8:4212::2}
@@ -29,8 +29,8 @@ health() {
   local host=$1 expected_peer=$2
   remote "$host" "
     set -eu
-    test \"\$(systemctl is-active iroh-sdwan-trial.service)\" = active
-    '$STATE_DIR/bin/iroh-sdwan' health --config '$STATE_DIR/config.toml'
+    test \"\$(systemctl is-active ironet-trial.service)\" = active
+    '$STATE_DIR/bin/ironet' health --config '$STATE_DIR/config.toml'
     grep -q 'forbidden_underlay_prefixes = \\[\"200::/7\"\\]' '$STATE_DIR/config.toml'
     python3 - '$STATE_DIR/status.json' '$expected_peer' <<'PY'
 import json, sys
@@ -52,8 +52,8 @@ echo "checking $NAT_HOST <-> $SYMMETRIC_HOST"
 health "$NAT_HOST" "$SYMMETRIC_HOST"
 health "$SYMMETRIC_HOST" "$NAT_HOST"
 
-NAT_SHA=$(remote "$NAT_HOST" "sha256sum '$STATE_DIR/bin/iroh-sdwan'" | awk '{print $1}')
-SYMMETRIC_SHA=$(remote "$SYMMETRIC_HOST" "sha256sum '$STATE_DIR/bin/iroh-sdwan'" | awk '{print $1}')
+NAT_SHA=$(remote "$NAT_HOST" "sha256sum '$STATE_DIR/bin/ironet'" | awk '{print $1}')
+SYMMETRIC_SHA=$(remote "$SYMMETRIC_HOST" "sha256sum '$STATE_DIR/bin/ironet'" | awk '{print $1}')
 test "$NAT_SHA" = "$SYMMETRIC_SHA"
 echo "binary sha256: $NAT_SHA"
 
@@ -65,13 +65,13 @@ remote "$SYMMETRIC_HOST" "ping -n -q -c 20 -i 0.1 '$NAT_V4'"
 remote "$NAT_HOST" "ping -n -q -c 20 -i 0.1 -M do -s 1200 '$SYMMETRIC_V4'"
 remote "$SYMMETRIC_HOST" "ping -n -6 -q -c 20 -i 0.1 -s 1200 '$NAT_V6'"
 
-remote "$NAT_HOST" "'$STATE_DIR/bin/iroh-sdwan' trace --config '$STATE_DIR/config.toml' '$SYMMETRIC_V4'" \
+remote "$NAT_HOST" "'$STATE_DIR/bin/ironet' trace --config '$STATE_DIR/config.toml' '$SYMMETRIC_V4'" \
   | tee "$RESULT_DIR/trace-nat-to-symmetric.txt"
-remote "$SYMMETRIC_HOST" "'$STATE_DIR/bin/iroh-sdwan' trace --config '$STATE_DIR/config.toml' '$NAT_V6'" \
+remote "$SYMMETRIC_HOST" "'$STATE_DIR/bin/ironet' trace --config '$STATE_DIR/config.toml' '$NAT_V6'" \
   | tee "$RESULT_DIR/trace-symmetric-to-nat.txt"
 
 if [[ $RUN_IPERF == 1 ]]; then
-  remote "$NAT_HOST" "nohup iperf3 -s -1 -B '$NAT_V4' -p '$IPERF_PORT' >'/tmp/iroh-sdwan-iperf-$IPERF_PORT.log' 2>&1 </dev/null &"
+  remote "$NAT_HOST" "nohup iperf3 -s -1 -B '$NAT_V4' -p '$IPERF_PORT' >'/tmp/ironet-iperf-$IPERF_PORT.log' 2>&1 </dev/null &"
   sleep 1
   remote "$SYMMETRIC_HOST" "ping -n -q -i 0.1 -c '$((IPERF_SECONDS * 10))' '$NAT_V4'" \
     > "$RESULT_DIR/ping-under-load-symmetric-to-nat.txt" &
@@ -80,7 +80,7 @@ if [[ $RUN_IPERF == 1 ]]; then
     > "$RESULT_DIR/tcp-symmetric-to-nat.json"
   wait "$PING_PID"
 
-  remote "$SYMMETRIC_HOST" "nohup iperf3 -s -1 -B '$SYMMETRIC_V4' -p '$IPERF_PORT' >'/tmp/iroh-sdwan-iperf-$IPERF_PORT.log' 2>&1 </dev/null &"
+  remote "$SYMMETRIC_HOST" "nohup iperf3 -s -1 -B '$SYMMETRIC_V4' -p '$IPERF_PORT' >'/tmp/ironet-iperf-$IPERF_PORT.log' 2>&1 </dev/null &"
   sleep 1
   remote "$NAT_HOST" "ping -n -q -i 0.1 -c '$((IPERF_SECONDS * 10))' '$SYMMETRIC_V4'" \
     > "$RESULT_DIR/ping-under-load-nat-to-symmetric.txt" &

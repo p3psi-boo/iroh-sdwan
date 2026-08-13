@@ -608,7 +608,7 @@ mod tests {
         Arc::new(PeerCounters::new(
             "test".into(),
             SecretKey::from_bytes(&[9; 32]).public(),
-            "isw-test".into(),
+            "ironet-test".into(),
         ))
     }
 

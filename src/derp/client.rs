@@ -285,7 +285,7 @@ async fn http_upgrade(io: &mut DerpIo, server: &DerpServer) -> Result<()> {
         None => host.to_owned(),
     };
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {authority}\r\nConnection: Upgrade\r\nUpgrade: DERP\r\nUser-Agent: iroh-sdwan/{}\r\n\r\n",
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nConnection: Upgrade\r\nUpgrade: DERP\r\nUser-Agent: ironet/{}\r\n\r\n",
         server.url.path(),
         env!("CARGO_PKG_VERSION")
     );
@@ -318,7 +318,7 @@ async fn send_client_info(
     let info = serde_json::to_vec(&ClientInfo {
         version: 2,
         can_ack_pings: true,
-        app_name: "iroh-sdwan",
+        app_name: "ironet",
     })?;
     let nonce = SalsaBox::generate_nonce(&mut OsRng);
     let cipher = SalsaBox::new(&DerpIdentity::crypto_public(server_key), identity.secret());
@@ -349,19 +349,19 @@ mod tests {
         let encoded = serde_json::to_string(&ClientInfo {
             version: 2,
             can_ack_pings: true,
-            app_name: "iroh-sdwan",
+            app_name: "ironet",
         })
         .unwrap();
         assert!(encoded.contains("\"version\":2"));
         assert!(encoded.contains("\"CanAckPings\":true"));
-        assert!(encoded.contains("\"AppName\":\"iroh-sdwan\""));
+        assert!(encoded.contains("\"AppName\":\"ironet\""));
     }
 
     /// Optional live interoperability check against a Go tailscale/derper.
     #[tokio::test]
     #[ignore = "requires network access to a DERP server"]
     async fn interoperates_with_tailscale_derper() {
-        let url = std::env::var("IROH_SDWAN_DERP_TEST_URL")
+        let url = std::env::var("IRONET_DERP_TEST_URL")
             .unwrap_or_else(|_| "https://derp1.tailscale.com".into());
         let server = DerpServer::parse(&url).unwrap();
         probe_server(&server, DerpIdentity::generate(), tls_config().unwrap())
@@ -372,7 +372,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to a DERP server"]
     async fn relays_packet_between_two_clients() {
-        let url = std::env::var("IROH_SDWAN_DERP_TEST_URL")
+        let url = std::env::var("IRONET_DERP_TEST_URL")
             .unwrap_or_else(|_| "https://derp1.tailscale.com".into());
         let server = DerpServer::parse(&url).unwrap();
         let tls = tls_config().unwrap();

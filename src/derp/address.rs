@@ -5,7 +5,7 @@ use iroh_base::CustomAddr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use url::Url;
 
-pub const DERP_TRANSPORT_ID: u64 = u64::from_be_bytes(*b"ISWDERP1");
+pub const DERP_TRANSPORT_ID: u64 = u64::from_be_bytes(*b"IRNDERP1");
 const ADDRESS_VERSION: u8 = 1;
 const ADDRESS_LEN: usize = 1 + 8 + 32;
 
@@ -105,7 +105,7 @@ impl DerpServer {
         );
         url.set_path("/derp");
         let canonical = url.to_string();
-        let digest = blake3::derive_key("iroh-sdwan DERP region URL v1", canonical.as_bytes());
+        let digest = blake3::derive_key("ironet DERP region URL v1", canonical.as_bytes());
         let region_id = RegionId(u64::from_be_bytes(
             digest[..8].try_into().expect("fixed size"),
         ));

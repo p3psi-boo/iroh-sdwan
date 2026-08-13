@@ -56,7 +56,7 @@ identity_file = "/state/$node/identity.key"
 discovery_enabled = false
 tun_mtu = 1280
 max_frame_size = 1400
-node_interface = "isw0"
+node_interface = "ironet0"
 node_addresses = ["$address_v4/32", "$address_v6/128"]
 advertised_prefixes = []
 
@@ -138,7 +138,7 @@ kill -0 "$PID_DERP_2"
 echo "==> creating node and DERP identities"
 declare -A IDS DERP_KEYS
 for node in node-a node-b; do
-  output=$(iroh-sdwan init \
+  output=$(ironet init \
     --config "/state/$node/config.toml" \
     --state-dir "/state/$node" \
     --network-id netns-derp-two-node \
@@ -165,11 +165,11 @@ wait_until "node-a DERP path" sh -c \
 wait_until "node-b DERP path" sh -c \
   'grep -q '\''"ready": true'\'' /state/node-b/status.json && grep -q '\''"selected_path_transport": "derp"'\'' /state/node-b/status.json'
 wait_until "node-a DERP path metrics" grep -Eq \
-  'iroh_sdwan_peer_selected_path_info\{.*transport="derp".*remote=".*server=derp.*"\} 1$' \
+  'ironet_peer_selected_path_info\{.*transport="derp".*remote=".*server=derp.*"\} 1$' \
   /state/node-a/metrics.prom
 for node in node-a node-b; do
   wait_until "$node bidirectional DERP congestion window" sh -c \
-    'awk '\''$1 ~ /iroh_sdwan_peer_path_cwnd_bytes/ && $NF >= 8192 { ready=1 } END { exit !ready }'\'' "$1"' \
+    'awk '\''$1 ~ /ironet_peer_path_cwnd_bytes/ && $NF >= 8192 { ready=1 } END { exit !ready }'\'' "$1"' \
     sh "/state/$node/metrics.prom"
 done
 if ip netns exec derp-a ping -c 1 -W 1 172.31.20.2 >/dev/null 2>&1; then
@@ -183,7 +183,7 @@ ip netns exec derp-b ping -c 4 -W 3 -I 10.211.0.2 10.211.0.1
 ip netns exec derp-a ping -6 -c 4 -W 3 -I fd73:9db8:4211::1 fd73:9db8:4211::2
 ip netns exec derp-a ping -c 2 -W 3 -M do -s 1200 -I 10.211.0.1 10.211.0.2
 ip netns exec derp-a ping -q -c 128 -i 0.005 -W 3 -I 10.211.0.1 10.211.0.2
-grep -Eq 'iroh_sdwan_peer_fec_tx_recovery_shards_total\{.*\} 0$' /state/node-a/metrics.prom
+grep -Eq 'ironet_peer_fec_tx_recovery_shards_total\{.*\} 0$' /state/node-a/metrics.prom
 trace=$(ctl derp-a node-a trace --timeout-ms 5000 10.211.0.2)
 grep -q 'node-b (10.211.0.2)' <<<"$trace"
 if ctl derp-a node-a doctor --config /state/node-a/config.toml \

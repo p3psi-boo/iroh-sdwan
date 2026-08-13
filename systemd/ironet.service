@@ -1,0 +1,41 @@
+[Unit]
+Description=Ironet FlowRouter data plane
+After=network-online.target systemd-sysctl.service
+Wants=network-online.target systemd-sysctl.service
+
+[Service]
+Type=simple
+User=ironet
+Group=ironet
+ExecStartPre=+/bin/sh -ec 'chown root:ironet /etc/ironet; chmod 0750 /etc/ironet; chown root:ironet /etc/ironet/config.toml /etc/ironet/config.toml.blake3; chmod 0640 /etc/ironet/config.toml /etc/ironet/config.toml.blake3; for file in /var/lib/ironet/identity.key /var/lib/ironet/identity.key.derp; do if test -e "$file"; then chown ironet:ironet "$file"; chmod 0600 "$file"; fi; done'
+ExecStartPre=/usr/local/bin/ironet doctor --config /etc/ironet/config.toml
+ExecStart=/usr/local/bin/ironetd --config /etc/ironet/config.toml --socket /run/ironet/control.sock
+ExecReload=/usr/local/bin/ironet reload --socket /run/ironet/control.sock
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=20s
+Environment=RUST_LOG=info
+Environment=IRONET_LOG_FORMAT=json
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ironet
+UMask=0077
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/etc/ironet /run/ironet /var/lib/ironet
+StateDirectory=ironet
+StateDirectoryMode=0700
+RuntimeDirectory=ironet
+RuntimeDirectoryMode=0770
+
+[Install]
+WantedBy=multi-user.target

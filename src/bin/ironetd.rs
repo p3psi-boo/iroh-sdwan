@@ -2,27 +2,27 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use iroh_sdwan::{control::DEFAULT_CONTROL_SOCKET, daemon, logging};
+use ironet::{control::DEFAULT_CONTROL_SOCKET, daemon, logging};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "iroh-sdwand",
+    name = "ironetd",
     version,
-    about = "Privileged iroh-sdwan data-plane daemon"
+    about = "Privileged ironet data-plane daemon"
 )]
 struct Cli {
-    /// Configuration file. May also be set with IROH_SDWAN_CONFIG.
+    /// Configuration file. May also be set with IRONET_CONFIG.
     #[arg(
         short = 'c',
         long,
-        env = "IROH_SDWAN_CONFIG",
-        default_value = "/etc/iroh-sdwan/config.toml"
+        env = "IRONET_CONFIG",
+        default_value = "/etc/ironet/config.toml"
     )]
     config: PathBuf,
-    /// Versioned JSONL control socket. May also be set with IROH_SDWAN_SOCKET.
+    /// Versioned JSONL control socket. May also be set with IRONET_SOCKET.
     #[arg(
         long,
-        env = "IROH_SDWAN_SOCKET",
+        env = "IRONET_SOCKET",
         default_value = DEFAULT_CONTROL_SOCKET
     )]
     socket: PathBuf,
