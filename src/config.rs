@@ -378,7 +378,15 @@ impl Config {
         verify_config_digest(path, raw.as_bytes()).await?;
         let config = Self::decode(path, &raw)?;
         let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
-        Self::resolve_routes(config, routes.routes)
+        let extension_routes = crate::extensions::ExtensionState::load(
+            &crate::extensions::state_path(&config.identity_file),
+        )
+        .await?
+        .route_origins(crate::extensions::now_unix())?;
+        Self::resolve_routes(
+            config,
+            merge_route_origins(routes.routes, extension_routes)?,
+        )
     }
 
     pub async fn load_unsealed(path: &Path) -> Result<Self> {
@@ -387,7 +395,15 @@ impl Config {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let config = Self::decode(path, &raw)?;
         let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
-        Self::resolve_routes(config, routes.routes)
+        let extension_routes = crate::extensions::ExtensionState::load(
+            &crate::extensions::state_path(&config.identity_file),
+        )
+        .await?
+        .route_origins(crate::extensions::now_unix())?;
+        Self::resolve_routes(
+            config,
+            merge_route_origins(routes.routes, extension_routes)?,
+        )
     }
 
     /// Load a sealed main configuration against an in-memory candidate route
@@ -401,7 +417,15 @@ impl Config {
             .with_context(|| format!("failed to read {}", path.display()))?;
         verify_config_digest(path, raw.as_bytes()).await?;
         let config = Self::decode(path, &raw)?;
-        Self::resolve_routes(config, route_origins)
+        let extension_routes = crate::extensions::ExtensionState::load(
+            &crate::extensions::state_path(&config.identity_file),
+        )
+        .await?
+        .route_origins(crate::extensions::now_unix())?;
+        Self::resolve_routes(
+            config,
+            merge_route_origins(route_origins, extension_routes)?,
+        )
     }
 
     /// Resolve the mutable route registry from a sealed main configuration
@@ -993,6 +1017,19 @@ impl Config {
         path.push(".derp");
         PathBuf::from(path)
     }
+}
+
+fn merge_route_origins(
+    mut first: Vec<RouteOriginConfig>,
+    second: Vec<RouteOriginConfig>,
+) -> Result<Vec<RouteOriginConfig>> {
+    first.extend(second);
+    let mut registry = crate::routes::RouteRegistry {
+        version: 1,
+        routes: first,
+    };
+    registry.normalize()?;
+    Ok(registry.routes)
 }
 
 pub fn config_digest_path(path: &Path) -> PathBuf {

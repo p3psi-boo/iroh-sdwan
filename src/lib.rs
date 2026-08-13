@@ -8,6 +8,7 @@ pub mod delivery;
 pub mod deployment;
 pub mod derp;
 pub mod display;
+pub mod extensions;
 pub mod fec;
 pub mod flow_router;
 pub mod identity;

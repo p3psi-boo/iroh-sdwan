@@ -13,6 +13,15 @@ export CARGO_TARGET_DIR
 case "$TARGET" in
   x86_64-unknown-linux-musl)
     DEB_ARCH=amd64
+    TARGET_CC_VAR=CC_x86_64_unknown_linux_musl
+    DEFAULT_TARGET_CC=musl-gcc
+    ;;
+  aarch64-unknown-linux-musl)
+    DEB_ARCH=arm64
+    TARGET_CC_VAR=CC_aarch64_unknown_linux_musl
+    # Native arm64 runners expose musl-gcc under the generic name. Cross
+    # builders can override this with CC_aarch64_unknown_linux_musl.
+    DEFAULT_TARGET_CC=musl-gcc
     ;;
   *)
     echo "unsupported Debian package target: $TARGET" >&2
@@ -37,7 +46,10 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)}
-export CC_x86_64_unknown_linux_musl=${CC_x86_64_unknown_linux_musl:-musl-gcc}
+if [[ -z "${!TARGET_CC_VAR:-}" ]]; then
+  printf -v "$TARGET_CC_VAR" '%s' "$DEFAULT_TARGET_CC"
+  export "$TARGET_CC_VAR"
+fi
 
 for binary in ironet ironetd; do
   cargo rustc \

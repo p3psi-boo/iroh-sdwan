@@ -50,12 +50,14 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(16);
     let (active_config_tx, active_config_rx) = watch::channel(initial.config.clone());
     let (runtime_state_tx, runtime_state_rx) = watch::channel::<Option<Arc<RuntimeState>>>(None);
+    let events = Arc::new(control::EventLog::default());
     let mut supervisor = tokio::spawn(supervise(
         config_path,
         initial,
         active_config_tx,
         command_rx,
         runtime_state_tx,
+        events.clone(),
     ));
     let mut control_server = tokio::spawn(control::serve(
         listener,
@@ -63,6 +65,7 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
         active_config_rx,
         command_tx.clone(),
         runtime_state_rx,
+        events,
     ));
 
     let result = tokio::select! {
@@ -102,6 +105,7 @@ async fn supervise(
     active_config: watch::Sender<Config>,
     mut commands: mpsc::Receiver<DaemonCommand>,
     runtime_state: watch::Sender<Option<Arc<RuntimeState>>>,
+    events: Arc<control::EventLog>,
 ) -> Result<()> {
     let mut generation = 1_u64;
     let mut pending_reload: Option<PendingReload> = None;
@@ -164,6 +168,40 @@ async fn supervise(
                 endpoint_id: current.secret_key.public().to_string(),
             }));
         }
+        events
+            .publish(
+                "daemon.ready",
+                None,
+                serde_json::json!({
+                    "generation": generation,
+                    "endpoint_id": current.secret_key.public().to_string(),
+                }),
+            )
+            .await;
+
+        let next_extension_expiry = match crate::extensions::ExtensionState::load(
+            &crate::extensions::state_path(&current.config.identity_file),
+        )
+        .await
+        {
+            Ok(state) => state.next_expiry(crate::extensions::now_unix()),
+            Err(error) => {
+                warn!(%error, "failed scheduling extension route leases");
+                None
+            }
+        };
+        let expiry_wait = async move {
+            match next_extension_expiry {
+                Some(expires) => {
+                    let delay = expires
+                        .saturating_sub(crate::extensions::now_unix())
+                        .saturating_add(1);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(expiry_wait);
 
         'active: loop {
             tokio::select! {
@@ -221,6 +259,49 @@ async fn supervise(
                             }
                             flatten_task("data plane", runtime_task.await)?;
                             return Err(anyhow!("control command channel stopped"));
+                        }
+                    }
+                }
+                _ = &mut expiry_wait => {
+                    let path = crate::extensions::state_path(&current.config.identity_file);
+                    let state = match crate::extensions::ExtensionState::load(&path).await {
+                        Ok(state) => state,
+                        Err(error) => {
+                            warn!(%error, "failed checking extension route leases");
+                            continue 'active;
+                        }
+                    };
+                    let Some((next, expired)) = state.expire(crate::extensions::now_unix()) else {
+                        continue 'active;
+                    };
+                    if let Err(error) = next.write(&path) {
+                        warn!(%error, "failed expiring extension route leases");
+                        continue 'active;
+                    }
+                    for route in &expired {
+                        events.publish(
+                            "route.expired",
+                            Some(format!("{}/{}", route.owner, route.name)),
+                            serde_json::to_value(route).unwrap_or_default(),
+                        ).await;
+                    }
+                    if let Some(shutdown) = shutdown_tx.take() {
+                        let _ = shutdown.send(());
+                    }
+                    if let Err(error) = flatten_task("data plane", runtime_task.await) {
+                        let _ = state.write(&path);
+                        return Err(error.context("failed reloading after route expiry"));
+                    }
+                    match Generation::load(&config_path).await {
+                        Ok(next_generation) => {
+                            current = next_generation;
+                            generation = generation.saturating_add(1);
+                            tokio::time::sleep(RESTART_SETTLE_DELAY).await;
+                            break 'active;
+                        }
+                        Err(error) => {
+                            let _ = state.write(&path);
+                            return Err(error.context("route expiry produced an invalid generation"));
                         }
                     }
                 }

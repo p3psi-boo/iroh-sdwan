@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify tag and package version
+        if: github.event_name == 'push'
+        run: |
+          version=$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          components: clippy,rustfmt
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify source
+        run: |
+          cargo fmt --check
+          python3 scripts/check-doc-links.py
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: Build Debian package (${{ matrix.deb_arch }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils build-essential dpkg-dev file musl-tools pkg-config systemd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.rust_target }}
+
+      - name: Build and verify package
+        env:
+          TARGET: ${{ matrix.rust_target }}
+        run: |
+          scripts/build-deb.sh
+          package=$(find dist -maxdepth 1 -name 'ironet_*_${{ matrix.deb_arch }}.deb' -print -quit)
+          test -n "$package"
+          test "$(dpkg-deb --field "$package" Architecture)" = "${{ matrix.deb_arch }}"
+          tests/deployment/package.sh "$package"
+          sha256sum "$package" >"$package.sha256"
+
+      - name: Attest package provenance
+        if: github.event_name == 'push'
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.deb
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironet-release-${{ matrix.deb_arch }}
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ironet-release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined checksums
+        run: |
+          cd dist
+          sha256sum -- *.deb | sort -k2 >SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload combined release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironet-release
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.deb dist/*.deb.sha256 dist/SHA256SUMS --generate-notes --verify-tag

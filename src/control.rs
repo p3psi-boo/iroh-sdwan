@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     net::IpAddr,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -13,15 +14,20 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
-    sync::{Semaphore, mpsc, oneshot, watch},
+    sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch},
     time,
 };
 use tracing::{info, warn};
 
 use crate::{
     config::Config,
+    extensions::{self, ExtensionState},
     observability::{PeerStatus, RuntimeStatus, read_status},
     trace::{self, PingResult, PingSample, TraceHop, TraceResult},
+};
+use ironet_extension_sdk::{
+    ApiLimits, ApplyRoutesRequest, Capability, CapabilitySet, DeleteRoutesRequest, EventWatchAck,
+    ExtensionEvent, RouteMutationResult,
 };
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
@@ -31,6 +37,7 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTROL_CONNECTIONS: usize = 64;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRACE_HOP_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_HISTORY_LIMIT: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReloadAck {
@@ -61,6 +68,92 @@ pub enum DaemonCommand {
     Stop { reply: oneshot::Sender<()> },
 }
 
+#[derive(Debug, Default)]
+struct EventLogState {
+    next_cursor: u64,
+    events: VecDeque<ExtensionEvent>,
+}
+
+/// Bounded replay log for extension events. Producers never wait for consumers;
+/// a consumer that falls behind receives `cursor_expired` and resynchronizes
+/// from `get_snapshot`.
+#[derive(Debug, Default)]
+pub struct EventLog {
+    state: Mutex<EventLogState>,
+    changed: Notify,
+}
+
+impl EventLog {
+    pub async fn publish(
+        &self,
+        kind: impl Into<String>,
+        resource: Option<String>,
+        data: Value,
+    ) -> ExtensionEvent {
+        let mut state = self.state.lock().await;
+        state.next_cursor = state.next_cursor.saturating_add(1);
+        let event = ExtensionEvent {
+            cursor: state.next_cursor,
+            emitted_unix_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            kind: kind.into(),
+            resource,
+            data,
+        };
+        state.events.push_back(event.clone());
+        if state.events.len() > EVENT_HISTORY_LIMIT {
+            state.events.pop_front();
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        event
+    }
+
+    async fn bounds(&self) -> EventWatchAck {
+        let state = self.state.lock().await;
+        EventWatchAck {
+            current_cursor: state.next_cursor,
+            oldest_cursor: state
+                .events
+                .front()
+                .map_or(state.next_cursor.saturating_add(1), |event| event.cursor),
+        }
+    }
+
+    async fn after(&self, cursor: u64) -> std::result::Result<Vec<ExtensionEvent>, RpcError> {
+        let state = self.state.lock().await;
+        if cursor > state.next_cursor {
+            return Err(RpcError::new(
+                "cursor_invalid",
+                format!(
+                    "event cursor {cursor} is ahead of current cursor {}; fetch get_snapshot before resuming",
+                    state.next_cursor
+                ),
+            ));
+        }
+        let oldest = state
+            .events
+            .front()
+            .map_or(state.next_cursor.saturating_add(1), |event| event.cursor);
+        if cursor.saturating_add(1) < oldest {
+            return Err(RpcError::new(
+                "cursor_expired",
+                format!(
+                    "event cursor {cursor} is older than retained cursor {oldest}; fetch get_snapshot and resume from the current cursor"
+                ),
+            ));
+        }
+        Ok(state
+            .events
+            .iter()
+            .filter(|event| event.cursor > cursor)
+            .cloned()
+            .collect())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Request {
     version: u16,
@@ -72,6 +165,20 @@ struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum Method {
+    GetCapabilities,
+    GetSnapshot,
+    WatchEvents {
+        after_cursor: Option<u64>,
+    },
+    ListRoutes,
+    ApplyRoutes {
+        #[serde(flatten)]
+        request: ApplyRoutesRequest,
+    },
+    DeleteRoutes {
+        #[serde(flatten)]
+        request: DeleteRoutesRequest,
+    },
     Snapshot,
     Status,
     Peers,
@@ -122,6 +229,11 @@ enum ServerMessage {
         id: u64,
         result: TraceResult,
     },
+    ExtensionEvent {
+        version: u16,
+        id: u64,
+        extension_event: ExtensionEvent,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +280,7 @@ pub async fn serve(
     active_config: watch::Receiver<Config>,
     command_tx: mpsc::Sender<DaemonCommand>,
     runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+    events: Arc<EventLog>,
 ) -> Result<()> {
     let owner_uid = tokio::fs::metadata(&socket_path)
         .await
@@ -196,6 +309,7 @@ pub async fn serve(
         let active_config = active_config.clone();
         let command_tx = command_tx.clone();
         let runtime_state = runtime_state.clone();
+        let events = events.clone();
         tokio::spawn(async move {
             let _slot = slot;
             if let Err(error) = handle_connection(
@@ -205,6 +319,7 @@ pub async fn serve(
                 active_config,
                 command_tx,
                 runtime_state,
+                events,
             )
             .await
             {
@@ -227,6 +342,7 @@ async fn handle_connection(
     active_config: watch::Receiver<Config>,
     command_tx: mpsc::Sender<DaemonCommand>,
     runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+    events: Arc<EventLog>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -274,6 +390,170 @@ async fn handle_connection(
         "control request"
     );
     match request.method {
+        Method::GetCapabilities => {
+            send_result(&mut writer, request.id, &capabilities()).await?;
+        }
+        Method::GetSnapshot => {
+            let state = runtime_state.borrow().clone();
+            match state {
+                Some(state) => match state.live_snapshot().await {
+                    Ok(status) => {
+                        let config = active_config.borrow().clone();
+                        let routes = load_extension_routes(&config).await?;
+                        let cursor = events.bounds().await.current_cursor;
+                        send_result(
+                            &mut writer,
+                            request.id,
+                            &serde_json::json!({
+                                "api_version": CONTROL_PROTOCOL_VERSION,
+                                "event_cursor": cursor,
+                                "runtime": status,
+                                "desired_routes": routes,
+                            }),
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(
+                            &mut writer,
+                            request.id,
+                            RpcError::new("snapshot_failed", error.to_string()),
+                        )
+                        .await?
+                    }
+                },
+                None => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("runtime_unavailable", "data plane is not active"),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::WatchEvents { after_cursor } => {
+            let bounds = events.bounds().await;
+            let mut cursor = after_cursor.unwrap_or(bounds.current_cursor);
+            if let Err(error) = events.after(cursor).await {
+                send_error(&mut writer, request.id, error).await?;
+                return Ok(());
+            }
+            send_result(&mut writer, request.id, &bounds).await?;
+            loop {
+                let notified = events.changed.notified();
+                match events.after(cursor).await {
+                    Ok(pending) => {
+                        for event in pending {
+                            cursor = event.cursor;
+                            send_message(
+                                &mut writer,
+                                &ServerMessage::ExtensionEvent {
+                                    version: CONTROL_PROTOCOL_VERSION,
+                                    id: request.id,
+                                    extension_event: event,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(error) => {
+                        send_error(&mut writer, request.id, error).await?;
+                        return Ok(());
+                    }
+                }
+                notified.await;
+            }
+        }
+        Method::ListRoutes => {
+            let config = active_config.borrow().clone();
+            send_result(
+                &mut writer,
+                request.id,
+                &load_extension_routes(&config).await?,
+            )
+            .await?;
+        }
+        Method::ApplyRoutes { request: change } => {
+            if !can_mutate(peer, owner_uid) {
+                send_error(
+                    &mut writer,
+                    request.id,
+                    RpcError::new(
+                        "permission_denied",
+                        "route mutation requires root or the daemon service user",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let config = active_config.borrow().clone();
+            match mutate_extension_routes(
+                &config,
+                change.dry_run,
+                |state, now| state.apply(&change, now),
+                &command_tx,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if !result.dry_run && result.changed > 0 {
+                        events
+                            .publish("route.applied", None, serde_json::to_value(&result)?)
+                            .await;
+                    }
+                    send_result(&mut writer, request.id, &result).await?
+                }
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("route_rejected", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
+        Method::DeleteRoutes { request: change } => {
+            if !can_mutate(peer, owner_uid) {
+                send_error(
+                    &mut writer,
+                    request.id,
+                    RpcError::new(
+                        "permission_denied",
+                        "route mutation requires root or the daemon service user",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let config = active_config.borrow().clone();
+            match mutate_extension_routes(
+                &config,
+                change.dry_run,
+                |state, now| state.delete(&change, now),
+                &command_tx,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if !result.dry_run && result.changed > 0 {
+                        events
+                            .publish("route.deleted", None, serde_json::to_value(&result)?)
+                            .await;
+                    }
+                    send_result(&mut writer, request.id, &result).await?
+                }
+                Err(error) => {
+                    send_error(
+                        &mut writer,
+                        request.id,
+                        RpcError::new("route_rejected", error.to_string()),
+                    )
+                    .await?
+                }
+            }
+        }
         Method::Snapshot => {
             let state = runtime_state.borrow().clone();
             match state {
@@ -502,6 +782,12 @@ async fn handle_connection(
 
 fn method_name(method: &Method) -> &'static str {
     match method {
+        Method::GetCapabilities => "get_capabilities",
+        Method::GetSnapshot => "get_snapshot",
+        Method::WatchEvents { .. } => "watch_events",
+        Method::ListRoutes => "list_routes",
+        Method::ApplyRoutes { .. } => "apply_routes",
+        Method::DeleteRoutes { .. } => "delete_routes",
         Method::Snapshot => "snapshot",
         Method::Status => "status",
         Method::Peers => "peers",
@@ -510,6 +796,103 @@ fn method_name(method: &Method) -> &'static str {
         Method::Trace { .. } => "trace",
         Method::Reload => "reload",
     }
+}
+
+fn capabilities() -> CapabilitySet {
+    CapabilitySet {
+        api_version: CONTROL_PROTOCOL_VERSION,
+        minimum_api_version: CONTROL_PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").into(),
+        capabilities: vec![
+            capability("snapshot", 1, false, false),
+            capability("events", 1, true, false),
+            capability("desired_routes", 1, false, true),
+            capability("diagnostics", 1, true, false),
+        ],
+        limits: ApiLimits {
+            maximum_request_bytes: MAX_REQUEST_BYTES,
+            maximum_response_bytes: MAX_RESPONSE_BYTES,
+            event_history: EVENT_HISTORY_LIMIT,
+            maximum_route_ttl_seconds: extensions::MAX_ROUTE_TTL_SECONDS,
+        },
+    }
+}
+
+fn capability(name: &str, version: u16, streaming: bool, mutable: bool) -> Capability {
+    Capability {
+        name: name.into(),
+        version,
+        streaming,
+        mutable,
+    }
+}
+
+fn can_mutate(peer: PeerIdentity, owner_uid: u32) -> bool {
+    peer.uid == 0 || peer.uid == owner_uid
+}
+
+async fn load_extension_routes(config: &Config) -> Result<Vec<ironet_extension_sdk::DesiredRoute>> {
+    Ok(
+        ExtensionState::load(&extensions::state_path(&config.identity_file))
+            .await?
+            .list(extensions::now_unix()),
+    )
+}
+
+async fn mutate_extension_routes(
+    config: &Config,
+    dry_run: bool,
+    mutate: impl FnOnce(&ExtensionState, u64) -> Result<extensions::Mutation>,
+    command_tx: &mpsc::Sender<DaemonCommand>,
+) -> Result<RouteMutationResult> {
+    let path = extensions::state_path(&config.identity_file);
+    let previous = ExtensionState::load(&path).await?;
+    let mutation = mutate(&previous, extensions::now_unix())?;
+    let result = mutation.result;
+    validate_extension_candidate(config, &mutation.state)?;
+    if dry_run || !mutation.persist {
+        return Ok(result);
+    }
+    mutation.state.write(&path)?;
+    if !mutation.reload {
+        return Ok(result);
+    }
+    let (reply, response) = oneshot::channel();
+    command_tx
+        .send(DaemonCommand::Reload { reply })
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon supervisor stopped"))?;
+    if let Err(error) = response.await.context("daemon dropped reload response")? {
+        previous
+            .write(&path)
+            .context("failed restoring extension desired state")?;
+        bail!(
+            "daemon {}: {}; restored previous desired state",
+            error.code,
+            error.message
+        );
+    }
+    Ok(result)
+}
+
+fn validate_extension_candidate(config: &Config, state: &ExtensionState) -> Result<()> {
+    let mut candidate = config.clone();
+    let routes = std::fs::read_to_string(config.route_registry_path())
+        .ok()
+        .map(|raw| crate::routes::RouteRegistry::parse(&raw))
+        .transpose()?
+        .unwrap_or_default()
+        .routes;
+    let mut registry = crate::routes::RouteRegistry {
+        routes,
+        ..Default::default()
+    };
+    registry
+        .routes
+        .extend(state.route_origins(extensions::now_unix())?);
+    registry.normalize()?;
+    candidate.route_origins = registry.routes;
+    candidate.validate()
 }
 
 async fn load_status(config: &Config) -> Result<RuntimeStatus> {
@@ -673,7 +1056,8 @@ async fn request_result<T: DeserializeOwned>(path: &Path, method: Method) -> Res
         ServerMessage::PingSample { .. }
         | ServerMessage::PingDone { .. }
         | ServerMessage::TraceHop { .. }
-        | ServerMessage::TraceDone { .. } => {
+        | ServerMessage::TraceDone { .. }
+        | ServerMessage::ExtensionEvent { .. } => {
             bail!("daemon returned a streaming event for a non-streaming request")
         }
     }
@@ -787,7 +1171,8 @@ where
             }
             ServerMessage::Result { .. }
             | ServerMessage::TraceHop { .. }
-            | ServerMessage::TraceDone { .. } => {
+            | ServerMessage::TraceDone { .. }
+            | ServerMessage::ExtensionEvent { .. } => {
                 bail!("daemon returned a non-ping result")
             }
         }
@@ -866,7 +1251,10 @@ where
             }
             ServerMessage::Result { .. }
             | ServerMessage::PingSample { .. }
-            | ServerMessage::PingDone { .. } => bail!("daemon returned a non-trace result"),
+            | ServerMessage::PingDone { .. }
+            | ServerMessage::ExtensionEvent { .. } => {
+                bail!("daemon returned a non-trace result")
+            }
         }
     }
 }
@@ -972,6 +1360,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         let error = status(&socket).await.unwrap_err();
@@ -992,6 +1381,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         let requests: [&[u8]; 2] = [
@@ -1029,6 +1419,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
@@ -1121,6 +1512,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         assert!(peers(&socket).await.unwrap().is_empty());
@@ -1159,6 +1551,7 @@ mod tests {
             active_rx,
             command_tx,
             state_rx,
+            Arc::new(EventLog::default()),
         ));
 
         let status = snapshot(&socket).await.unwrap();
@@ -1185,6 +1578,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         let mut sequences = Vec::new();
@@ -1214,6 +1608,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
 
         let mut idle = Vec::with_capacity(MAX_CONTROL_CONNECTIONS);
@@ -1256,6 +1651,7 @@ mod tests {
             active_rx,
             command_tx,
             watch::channel(None).1,
+            Arc::new(EventLog::default()),
         ));
         let client_socket = socket.clone();
         let client = tokio::spawn(async move { reload(&client_socket).await });
@@ -1273,5 +1669,79 @@ mod tests {
         assert_eq!(ack.generation, 2);
         assert_eq!(ack.endpoint_id, "endpoint");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn extension_capabilities_and_event_replay_are_versioned() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind(&socket).await.unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(test_config(directory.path()));
+        let events = Arc::new(EventLog::default());
+        events
+            .publish("daemon.ready", None, serde_json::json!({"generation": 1}))
+            .await;
+        let server = tokio::spawn(serve(
+            listener,
+            socket.clone(),
+            active_rx,
+            command_tx,
+            watch::channel(None).1,
+            events,
+        ));
+
+        let capabilities = ironet_extension_sdk::Client::new(&socket)
+            .capabilities()
+            .await
+            .unwrap();
+        assert_eq!(capabilities.api_version, CONTROL_PROTOCOL_VERSION);
+        assert!(
+            capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "events" && capability.streaming)
+        );
+
+        let (id, mut reader) = connect(
+            &socket,
+            Method::WatchEvents {
+                after_cursor: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: ServerMessage = serde_json::from_slice(
+            &read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(ack, ServerMessage::Result { id: response, .. } if response == id));
+        let event: ServerMessage = serde_json::from_slice(
+            &read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            ServerMessage::ExtensionEvent { extension_event, .. }
+                if extension_event.kind == "daemon.ready" && extension_event.cursor == 1
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn event_history_requires_snapshot_after_cursor_expiry() {
+        let events = EventLog::default();
+        for sequence in 0..=EVENT_HISTORY_LIMIT {
+            events
+                .publish("test", None, serde_json::json!({"sequence": sequence}))
+                .await;
+        }
+        let error = events.after(0).await.unwrap_err();
+        assert_eq!(error.code, "cursor_expired");
+        assert_eq!(events.bounds().await.oldest_cursor, 2);
     }
 }

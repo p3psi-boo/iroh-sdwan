@@ -1911,6 +1911,7 @@ dependencies = [
  "ipnet",
  "iroh",
  "iroh-base",
+ "ironet-extension-sdk",
  "n0-watcher",
  "noq-proto",
  "noq-udp",
@@ -1930,6 +1931,15 @@ dependencies = [
  "tun-rs",
  "url",
  "webpki-roots",
+]
+
+[[package]]
+name = "ironet-extension-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

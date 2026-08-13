@@ -119,6 +119,7 @@ sudo ironet reload
 - [运行与运维](docs/运行与运维.md)
 - [开发与测试](docs/开发与测试.md)
 - [架构与路由模型](docs/架构与路由模型.md)
+- [扩展开发：控制 API、事件与期望状态](docs/扩展开发.md)
 - [实施计划](PLAN.md)
 
 ## 开发
@@ -149,7 +150,8 @@ tests/netns/run-all.sh
 ├── scripts/      安装、卸载、Debian 打包与发布脚本
 ├── tests/        单元测试、网络命名空间集成测试和真实网络测试
 ├── docs/         面向使用者和维护者的文档
-└── .forgejo/     Forgejo CI 与发布工作流
+├── .forgejo/     Forgejo CI 与发布工作流
+└── .github/      GitHub CI、双架构 Debian 打包与发布工作流
 ```
 
 ## 许可
