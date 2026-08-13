@@ -36,7 +36,7 @@ use crate::{
         CapacityProbeStart, ProbeReceiver, ProbeRequest, ProbeStatusSnapshot, append_probe_hop,
         encode_probe, forward_next_hop, reverse_next_hop,
     },
-    config::{Config, PeerConfig, RelayConfig},
+    config::{AttachmentMode, Config, DialRole, PeerConfig, RelayConfig},
     delivery::{
         DELIVERY_ROUTE_TEMPLATE_TTL, DELIVERY_SESSION_TTL, DELIVERY_TAG_WIRE_BYTES,
         DeliveryMessage, DeliveryReceiver, DeliveryReport, DeliverySessionRegister, DeliverySource,
@@ -56,6 +56,10 @@ use crate::{
     },
     packet::{FlowKey, PacketInfo, decrement_hop_limit_validated, inspect_ip_packet},
     path_selection::{RELAY_HOLD_DOWN, WanPathSelector},
+    protocol::{
+        feature,
+        session::{LinkAuthentication, NegotiatedSession, SessionPolicy, negotiate_connection},
+    },
     system::{
         cleanup_node_interface, cleanup_routing, prepare_node_interface, prepare_routing,
         routing_table, sync_overlay_routes,
@@ -488,16 +492,22 @@ where
 
     let local_id = secret_key.public();
     config.validate_local_id(local_id)?;
-    let tunnel = Arc::new(OverlayTunnel::create(
-        config.node_interface.clone(),
-        config.tun_mtu,
-    )?);
-    prepare_node_interface(&config).await?;
-    if let Err(error) = prepare_routing(&config).await {
-        let _ = cleanup_routing(&config).await;
-        let _ = cleanup_node_interface(&config).await;
-        return Err(error);
-    }
+    let tunnel = if config.attachment == AttachmentMode::Tun {
+        let tunnel = Arc::new(OverlayTunnel::create(
+            config.node_interface.clone(),
+            config.tun_mtu,
+        )?);
+        prepare_node_interface(&config).await?;
+        if let Err(error) = prepare_routing(&config).await {
+            let _ = cleanup_routing(&config).await;
+            let _ = cleanup_node_interface(&config).await;
+            return Err(error);
+        }
+        Some(tunnel)
+    } else {
+        info!("starting userspace-only transit node without a TUN attachment");
+        None
+    };
     let result = run_data_plane(
         &config,
         secret_key,
@@ -511,8 +521,14 @@ where
     if let Some(runtime_state) = runtime_state {
         runtime_state.send_replace(None);
     }
-    let routing_cleanup = cleanup_routing(&config).await;
-    let interface_cleanup = cleanup_node_interface(&config).await;
+    let (routing_cleanup, interface_cleanup) = if config.attachment == AttachmentMode::Tun {
+        (
+            cleanup_routing(&config).await,
+            cleanup_node_interface(&config).await,
+        )
+    } else {
+        (Ok(()), Ok(()))
+    };
     match (result, routing_cleanup, interface_cleanup) {
         (Err(error), _, _) => Err(error),
         (Ok(()), Err(error), _) => Err(error.context("failed cleaning overlay routing state")),
@@ -525,7 +541,7 @@ async fn run_data_plane(
     config: &Config,
     secret_key: SecretKey,
     local_id: EndpointId,
-    tunnel: Arc<OverlayTunnel>,
+    tunnel: Option<Arc<OverlayTunnel>>,
     shutdown: impl Future<Output = Result<()>>,
     ready: Option<oneshot::Sender<()>>,
     runtime_state_tx: Option<tokio::sync::watch::Sender<Option<Arc<RuntimeState>>>>,
@@ -588,7 +604,7 @@ async fn run_data_plane(
         info!(
             peer = %peer.name,
             endpoint_id = %peer.endpoint_id,
-            interface = %tunnel.name,
+            attachment = %tunnel.as_ref().map_or("none", |tunnel| tunnel.name.as_str()),
             "peer transport ready"
         );
         peers.insert(peer.endpoint_id, Arc::new(peer));
@@ -622,7 +638,11 @@ async fn run_data_plane(
     let runtime_state = Arc::new(RuntimeState::new(
         local_id,
         routing_table(config),
-        config.all_remote_prefixes().collect(),
+        if tunnel.is_some() {
+            config.all_remote_prefixes().collect()
+        } else {
+            Vec::new()
+        },
         peer_counters,
         mesh_runtime.clone(),
         CapacityObservability::new(
@@ -643,7 +663,7 @@ async fn run_data_plane(
         let connector = peer.clone();
         tasks.spawn(async move { connector.maintain_connection().await });
     }
-    {
+    if let Some(tunnel) = tunnel.clone() {
         let tunnel = tunnel.clone();
         let route_tx = route_tx.clone();
         tasks.spawn(async move { tunnel_to_router(tunnel, route_tx).await });
@@ -807,7 +827,7 @@ async fn tunnel_to_router(
 
 async fn inbound_to_router(
     config: Config,
-    tunnel: Arc<OverlayTunnel>,
+    tunnel: Option<Arc<OverlayTunnel>>,
     mut inbound_rx: mpsc::Receiver<InboundPacket>,
     route_tx: mpsc::Sender<RouteRequest>,
     capacity_tx: mpsc::Sender<CapacityEvent>,
@@ -825,6 +845,10 @@ async fn inbound_to_router(
             .all_advertised_prefixes()
             .any(|prefix| prefix.contains(&info.destination));
         if local_destination {
+            let Some(tunnel) = &tunnel else {
+                debug!(destination = %info.destination, "dropping local packet without an attachment");
+                continue;
+            };
             tunnel
                 .device
                 .send(&inbound.packet)
@@ -2063,6 +2087,13 @@ fn underlay_exclusion_prefixes(config: &Config) -> Vec<IpNet> {
         .collect()
 }
 
+fn underlay_publish_exclusion_prefixes(config: &Config) -> Vec<IpNet> {
+    underlay_exclusion_prefixes(config)
+        .into_iter()
+        .chain(config.private_locator_prefixes())
+        .collect()
+}
+
 async fn build_endpoint(
     config: &Config,
     secret_key: SecretKey,
@@ -2120,8 +2151,9 @@ async fn build_endpoint(
         .send_observed_address_reports(false)
         .receive_observed_address_reports(false)
         .build();
-    let hidden_prefixes = Arc::new(underlay_exclusion_prefixes(config));
-    let path_selector = WanPathSelector::new(hidden_prefixes.as_ref().clone());
+    let path_exclusions = underlay_exclusion_prefixes(config);
+    let hidden_prefixes = Arc::new(underlay_publish_exclusion_prefixes(config));
+    let path_selector = WanPathSelector::new(path_exclusions);
     let address_filter = if config.discovery_enabled {
         AddrFilter::new(move |addresses| {
             Cow::Owned(
@@ -2147,10 +2179,11 @@ async fn build_endpoint(
         .path_selector(Arc::new(path_selector))
         .transport_config(transport)
         .addr_filter(address_filter);
-    if !config.bind_addresses.is_empty() {
+    let bind_addresses = config.endpoint_bind_addresses().collect::<Vec<_>>();
+    if !bind_addresses.is_empty() {
         builder = builder.clear_ip_transports();
-        for address in &config.bind_addresses {
-            builder = builder.bind_addr(*address)?;
+        for address in bind_addresses {
+            builder = builder.bind_addr(address)?;
         }
     }
     if !config.discovery_enabled {
@@ -2450,7 +2483,7 @@ impl DynamicMeshManager {
                 continue;
             };
             let _admission = self.admission_lock.lock().await;
-            if let Err(error) = self.create_dynamic(presence.clone(), None).await {
+            if let Err(error) = self.create_dynamic(presence.clone(), None, None).await {
                 self.planner.lock().await.activation_failed(endpoint_id);
                 warn!(%endpoint_id, %error, "failed activating dynamic mesh peer");
             } else {
@@ -2462,6 +2495,25 @@ impl DynamicMeshManager {
 
     async fn accept_unknown(&self, connection: Connection) -> Result<()> {
         let endpoint_id = connection.remote_id();
+        let session = negotiate_connection(
+            &connection,
+            &SessionPolicy {
+                network_id: self.config.network_id.clone(),
+                local_id: self.local_id,
+                remote_id: endpoint_id,
+                max_datagram_size: u32::from(self.config.max_frame_size),
+                max_control_size: 32 * 1024,
+                features: feature::core_offers(
+                    self.config.routing.transit_enabled,
+                    self.config.fec.enabled,
+                    self.config.mesh.enabled,
+                    false,
+                ),
+                link: None,
+            },
+        )
+        .await
+        .context("dynamic peer v4 admission handshake failed")?;
         if let Some(address) = connection.paths().iter().find_map(|path| {
             if let TransportAddr::Ip(address) = path.remote_addr() {
                 Some(*address)
@@ -2492,7 +2544,8 @@ impl DynamicMeshManager {
             self.peers.read().await.len() < self.config.mesh.max_peers,
             "bounded mesh peer limit reached"
         );
-        self.create_dynamic(presence, Some(connection)).await?;
+        self.create_dynamic(presence, Some(connection), Some(session))
+            .await?;
         self.planner
             .lock()
             .await
@@ -2505,11 +2558,13 @@ impl DynamicMeshManager {
         &self,
         presence: SignedPresence,
         connection: Option<Connection>,
+        negotiated: Option<NegotiatedSession>,
     ) -> Result<()> {
         let endpoint_id = presence.body.owner;
         if let Some(peer) = self.peers.read().await.get(&endpoint_id).cloned() {
             if let Some(connection) = connection {
-                peer.install_connection(connection).await?;
+                peer.install_connection_with_session(connection, negotiated)
+                    .await?;
             }
             return Ok(());
         }
@@ -2563,7 +2618,9 @@ impl DynamicMeshManager {
             },
         );
         if let Some(connection) = connection
-            && let Err(error) = peer.install_connection(connection).await
+            && let Err(error) = peer
+                .install_connection_with_session(connection, negotiated)
+                .await
         {
             self.remove_dynamic(endpoint_id).await;
             return Err(error);
@@ -2656,6 +2713,8 @@ struct Peer {
     endpoint_addr: EndpointAddr,
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
+    session_policy: SessionPolicy,
+    negotiated_session: StdRwLock<Option<NegotiatedSession>>,
     inbound_packets: mpsc::Sender<InboundPacket>,
     capacity_events: mpsc::Sender<CapacityEvent>,
     connection: Mutex<Option<Connection>>,
@@ -2681,6 +2740,10 @@ struct Peer {
     remote_prefixes: Arc<Vec<IpNet>>,
     allowed_source_prefixes: Arc<Vec<IpNet>>,
     forbidden_underlay_prefixes: Arc<Vec<IpNet>>,
+    allowed_local_underlay_prefixes: Arc<Vec<IpNet>>,
+    allowed_remote_underlay_prefixes: Arc<Vec<IpNet>>,
+    private_remote_addresses: Arc<Vec<std::net::SocketAddr>>,
+    private_link_exclusive: bool,
     next_packet_id: AtomicU64,
     reassembler: Mutex<Reassembler>,
     repair_cache: Mutex<RepairCache>,
@@ -2754,12 +2817,24 @@ impl Peer {
         connection_mode: ConnectionMode,
     ) -> Result<Self> {
         let dial_outbound = local_id < peer.endpoint_id;
+        let link = config.link_for_peer(peer.endpoint_id);
+        let connection_mode = match link.map(|link| link.dial) {
+            Some(DialRole::Active) => ConnectionMode::Outbound,
+            Some(DialRole::Passive) => ConnectionMode::Inbound,
+            _ => connection_mode,
+        };
 
         let mut endpoint_addr = EndpointAddr::new(peer.endpoint_id);
-        for addr in &peer.direct_addresses {
+        let configured_addresses = link.map_or(peer.direct_addresses.as_slice(), |link| {
+            link.remote_addresses.as_slice()
+        });
+        for addr in configured_addresses {
             endpoint_addr = endpoint_addr.with_ip_addr(*addr);
         }
-        if peer.relay_urls.is_empty() {
+        if link.is_some() {
+            // A pairwise locator contract is deliberately not augmented with
+            // endpoint discovery, relay or DERP addresses.
+        } else if peer.relay_urls.is_empty() {
             for relay in services.inherited_relays {
                 endpoint_addr = endpoint_addr.with_relay_url(relay.clone());
             }
@@ -2768,7 +2843,9 @@ impl Peer {
                 endpoint_addr = endpoint_addr.with_relay_url(relay.parse()?);
             }
         }
-        if let (Some(transport), Some(public_key)) = (services.derp_transport, peer.derp_public_key)
+        if link.is_none()
+            && let (Some(transport), Some(public_key)) =
+                (services.derp_transport, peer.derp_public_key)
         {
             endpoint_addr = endpoint_addr.with_addrs(
                 transport
@@ -2781,7 +2858,11 @@ impl Peer {
         let counters = Arc::new(PeerCounters::new(
             peer.name.clone(),
             peer.endpoint_id,
-            config.node_interface.clone(),
+            if config.attachment == AttachmentMode::Tun {
+                config.node_interface.clone()
+            } else {
+                "none".into()
+            },
         ));
         let frame_size_ceiling = usize::from(config.max_frame_size);
         let effective_frame_size = frame_size_ceiling.min(1_200);
@@ -2830,6 +2911,29 @@ impl Peer {
             endpoint_addr,
             endpoint,
             alpn,
+            session_policy: SessionPolicy {
+                network_id: config.network_id.clone(),
+                local_id,
+                remote_id: peer.endpoint_id,
+                max_datagram_size: u32::from(config.max_frame_size),
+                max_control_size: 32 * 1024,
+                features: feature::core_offers(
+                    config.routing.transit_enabled,
+                    config.fec.enabled,
+                    config.mesh.enabled && link.is_none(),
+                    link.is_some(),
+                ),
+                link: link.map(|link| {
+                    let decoded = hex::decode(&link.auth_key).expect("validated pairwise auth key");
+                    let mut secret = [0_u8; 32];
+                    secret.copy_from_slice(&decoded);
+                    LinkAuthentication {
+                        link_id: link.id.clone(),
+                        secret,
+                    }
+                }),
+            },
+            negotiated_session: StdRwLock::new(None),
             inbound_packets: services.inbound_packets,
             capacity_events: services.capacity_events,
             connection: Mutex::new(None),
@@ -2845,9 +2949,10 @@ impl Peer {
             discovered_direct_addresses: Mutex::new(HashSet::new()),
             dial_outbound,
             connection_mode,
-            relay_bootstrap_enabled: config.discovery_enabled
+            relay_bootstrap_enabled: link.is_none()
+                && config.discovery_enabled
                 && (!config.relay.urls.is_empty() || !peer.relay_urls.is_empty()),
-            candidate_exchange_enabled: config.discovery_enabled,
+            candidate_exchange_enabled: link.is_none() && config.discovery_enabled,
             trace_responder: services.trace_responder,
             enforce_overlay_prefixes: config.packet_policy.enforce_overlay_prefixes,
             transit_enabled: config.routing.transit_enabled,
@@ -2856,6 +2961,16 @@ impl Peer {
             remote_prefixes: Arc::new(config.all_remote_prefixes().collect()),
             allowed_source_prefixes: Arc::new(peer.allowed_source_prefixes.clone()),
             forbidden_underlay_prefixes: Arc::new(underlay_exclusion_prefixes(config)),
+            allowed_local_underlay_prefixes: Arc::new(
+                link.map_or_else(Vec::new, |link| link.allowed_local_prefixes.clone()),
+            ),
+            allowed_remote_underlay_prefixes: Arc::new(
+                link.map_or_else(Vec::new, |link| link.allowed_remote_prefixes.clone()),
+            ),
+            private_remote_addresses: Arc::new(
+                link.map_or_else(Vec::new, |link| link.remote_addresses.clone()),
+            ),
+            private_link_exclusive: link.is_some(),
             next_packet_id: AtomicU64::new(1),
             reassembler: Mutex::new(Reassembler::with_max_buffered_bytes(
                 reassembly_buffer_limit,
@@ -2924,6 +3039,20 @@ impl Peer {
                     continue;
                 }
             };
+            if self.private_link_exclusive
+                && let Some(reason) = private_link_path_violation(
+                    &connection,
+                    &self.allowed_local_underlay_prefixes,
+                    &self.allowed_remote_underlay_prefixes,
+                    &self.private_remote_addresses,
+                )
+            {
+                warn!(peer = %self.name, %reason, "closing connection after private link path migration");
+                connection.close(8_u8.into(), b"private link path migration");
+                self.requeue_work(work).await;
+                self.clear_connection(connection.stable_id()).await;
+                continue;
+            }
             if let Some((address, prefix)) =
                 forbidden_selected_path(&connection, &self.forbidden_underlay_prefixes)
             {
@@ -3088,7 +3217,7 @@ impl Peer {
             if !aggregation_delay.is_zero() {
                 tokio::time::sleep(aggregation_delay).await;
             }
-            let mut batch_len = 10 + 2 + wire_frames[0].len();
+            let mut batch_len = 16 + wire_frames[0].len();
             while let Some(remaining) =
                 inner_maximum.checked_sub(batch_len + 2 + MAX_PACKET_FRAME_HEADER_LEN)
             {
@@ -3393,6 +3522,9 @@ impl Peer {
 
     async fn dial_addr(&self) -> EndpointAddr {
         let mut endpoint_addr = self.endpoint_addr.clone();
+        if self.private_link_exclusive {
+            return endpoint_addr;
+        }
         endpoint_addr = endpoint_addr.with_addrs(
             self.discovered_direct_addresses
                 .lock()
@@ -3548,6 +3680,14 @@ impl Peer {
     }
 
     async fn install_connection(self: &Arc<Self>, connection: Connection) -> Result<()> {
+        self.install_connection_with_session(connection, None).await
+    }
+
+    async fn install_connection_with_session(
+        self: &Arc<Self>,
+        connection: Connection,
+        negotiated_session: Option<NegotiatedSession>,
+    ) -> Result<()> {
         if self.shutting_down.load(Ordering::Acquire) {
             connection.close(0_u8.into(), b"peer shutting down");
             bail!("peer {} is shutting down", self.name);
@@ -3581,6 +3721,32 @@ impl Peer {
                 self.name
             );
         }
+        if self.private_link_exclusive
+            && let Some(reason) = private_link_path_violation(
+                &connection,
+                &self.allowed_local_underlay_prefixes,
+                &self.allowed_remote_underlay_prefixes,
+                &self.private_remote_addresses,
+            )
+        {
+            connection.close(8_u8.into(), b"private link path violation");
+            bail!(
+                "peer {} violated private link path contract: {reason}",
+                self.name
+            );
+        }
+        let negotiated = match negotiated_session {
+            Some(session) => session,
+            None => match negotiate_connection(&connection, &self.session_policy).await {
+                Ok(session) => session,
+                Err(error) => {
+                    connection.close(9_u8.into(), b"v4 session negotiation failed");
+                    return Err(error).with_context(|| {
+                        format!("v4 session negotiation with {} failed", self.name)
+                    });
+                }
+            },
+        };
         let mut slot = self.connection.lock().await;
         if self.connection_mode == ConnectionMode::Canonical
             && connection.side() != canonical_side
@@ -3593,6 +3759,22 @@ impl Peer {
         }
         let old = slot.replace(connection.clone());
         drop(slot);
+        *self
+            .negotiated_session
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(negotiated.clone());
+        self.counters
+            .protocol_major
+            .store(u64::from(crate::protocol::MAJOR), Ordering::Relaxed);
+        self.counters
+            .protocol_minor
+            .store(u64::from(negotiated.minor), Ordering::Relaxed);
+        self.counters
+            .negotiated_features
+            .store(negotiated.features.len() as u64, Ordering::Relaxed);
+        self.counters
+            .private_link
+            .store(negotiated.link_id.is_some(), Ordering::Relaxed);
         if let Some(encoder) = &self.fec_encoder {
             let unprotected = encoder.lock().await.reset();
             self.counters
@@ -3608,7 +3790,14 @@ impl Peer {
         {
             old.close(0_u8.into(), b"replaced");
         }
-        info!(peer = %self.name, "peer connection active");
+        info!(
+            peer = %self.name,
+            protocol_major = crate::protocol::MAJOR,
+            protocol_minor = negotiated.minor,
+            features = negotiated.features.len(),
+            link_id = negotiated.link_id.as_deref().unwrap_or("public"),
+            "peer connection active"
+        );
         self.counters.connected.store(true, Ordering::Relaxed);
         self.counters
             .connection_events
@@ -3645,6 +3834,18 @@ impl Peer {
                 tokio::select! {
                     result = receive_connection.read_datagram() => match result {
                     Ok(datagram) => {
+                        if peer.private_link_exclusive
+                            && let Some(reason) = private_link_path_violation(
+                                &receive_connection,
+                                &peer.allowed_local_underlay_prefixes,
+                                &peer.allowed_remote_underlay_prefixes,
+                                &peer.private_remote_addresses,
+                            )
+                        {
+                            warn!(peer = %peer.name, %reason, "closing connection after private link path migration");
+                            receive_connection.close(8_u8.into(), b"private link path migration");
+                            break;
+                        }
                         if let Some((address, prefix)) = forbidden_selected_path(
                             &receive_connection,
                             &peer.forbidden_underlay_prefixes,
@@ -4421,6 +4622,35 @@ fn forbidden_selected_path(
         {
             return Some(forbidden);
         }
+    }
+    None
+}
+
+fn private_link_path_violation(
+    connection: &Connection,
+    allowed_local: &[IpNet],
+    allowed_remote: &[IpNet],
+    exact_remote: &[std::net::SocketAddr],
+) -> Option<String> {
+    let paths = connection.paths();
+    let selected = paths.iter().find(|path| path.is_selected())?;
+    let TransportAddr::Ip(remote) = selected.remote_addr() else {
+        return Some("selected a relay or custom transport".into());
+    };
+    if !exact_remote.contains(remote) {
+        return Some(format!("selected unconfigured remote locator {remote}"));
+    }
+    if !allowed_remote
+        .iter()
+        .any(|prefix| prefix.contains(&remote.ip()))
+    {
+        return Some(format!("remote locator {remote} is outside its allowlist"));
+    }
+    let LocalTransportAddr::Ip(Some(local)) = selected.local_addr() else {
+        return Some("selected a non-IP or unknown local locator".into());
+    };
+    if !allowed_local.is_empty() && !allowed_local.iter().any(|prefix| prefix.contains(local)) {
+        return Some(format!("local locator {local} is outside its allowlist"));
     }
     None
 }

@@ -1,14 +1,14 @@
 use crate::PROTOCOL_NAME;
 
 pub fn network_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"iroh-sdwan-network-alpn-v3\0", "")
+    network_alpn_with_context(network_id, b"iroh-sdwan-network-alpn-v4\0", "")
 }
 
 /// Separate ALPN for short-lived reachability/RTT probes. Keeping probes off
 /// the data-plane ALPN prevents an exploratory handshake from replacing an
 /// established overlay connection for the same endpoint.
 pub fn network_probe_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"iroh-sdwan-mesh-probe-alpn-v2\0", "/probe")
+    network_alpn_with_context(network_id, b"iroh-sdwan-mesh-probe-alpn-v4\0", "/probe")
 }
 
 fn network_alpn_with_context(network_id: &str, context: &[u8], suffix: &str) -> Vec<u8> {

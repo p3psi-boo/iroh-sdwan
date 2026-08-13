@@ -30,7 +30,7 @@ use crate::{
     derp::DerpPublicKey,
 };
 
-pub const PRESENCE_VERSION: u16 = 3;
+pub const PRESENCE_VERSION: u16 = 4;
 pub const DIRECTORY_CAPACITY: usize = 4_096;
 pub const MAX_ENDPOINT_CANDIDATES: usize = 8;
 pub const MAX_RELAY_URLS: usize = 4;
@@ -54,9 +54,9 @@ const GOSSIP_INTERVAL: Duration = Duration::from_secs(15);
 const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_STREAMS_PER_MINUTE: usize = 256;
 const PROBES_PER_MINUTE: usize = 128;
-const CONTROL_MAGIC: &str = "iroh-sdwan-mesh-presence-v2";
-const RENDEZVOUS_MAGIC: &str = "iroh-sdwan-mesh-rendezvous-v1";
-const PROBE_MAGIC: &str = "iroh-sdwan-mesh-probe-v1";
+const CONTROL_MAGIC: &str = "iroh-sdwan-v4/node-record/1";
+const RENDEZVOUS_MAGIC: &str = "iroh-sdwan-v4/rendezvous/1";
+const PROBE_MAGIC: &str = "iroh-sdwan-v4/mesh-probe/1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDEZVOUS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
 const MAX_RENDEZVOUS_TTL: Duration = Duration::from_secs(120);
@@ -125,7 +125,7 @@ impl PresenceBody {
 
     fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1024);
-        field(&mut out, b"iroh-sdwan-presence-v3");
+        field(&mut out, b"iroh-sdwan-node-record-v4");
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.network_fingerprint);
         out.extend_from_slice(self.owner.as_bytes());
@@ -582,6 +582,7 @@ impl MeshRuntime {
         let sequence = reserve_sequence(&sequence_file, now)?;
         let mut hidden_underlay_prefixes = config.forbidden_underlay_prefixes.clone();
         hidden_underlay_prefixes.extend(config.all_overlay_prefixes());
+        hidden_underlay_prefixes.extend(config.private_locator_prefixes());
         let local_presence = build_local_presence(
             config,
             &secret_key,
@@ -1840,7 +1841,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::config::{
-        FecConfig, MeshConfig, ObservabilityConfig, PacketPolicyConfig, RelayConfig, RoutingConfig,
+        AttachmentMode, FecConfig, MeshConfig, ObservabilityConfig, PacketPolicyConfig,
+        RelayConfig, RoutingConfig,
     };
 
     use super::*;
@@ -1852,6 +1854,7 @@ mod tests {
             bind_addresses: Vec::new(),
             forbidden_underlay_prefixes: Vec::new(),
             discovery_enabled: true,
+            attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
             node_interface: "isw0".into(),
@@ -1864,6 +1867,7 @@ mod tests {
             }),
             relay: RelayConfig::default(),
             peers: Vec::new(),
+            links: Vec::new(),
             route_origins: Vec::new(),
             routing: RoutingConfig::default(),
             mesh: MeshConfig::default(),

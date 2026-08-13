@@ -7,22 +7,16 @@ use std::{
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 
-use crate::capacity_probe::{CapacityProbeMessage, PROBE_MAGIC, decode_probe};
-use crate::delivery::{
-    DELIVERY_MAGIC, DELIVERY_TAG_WIRE_BYTES, DeliveryMessage, DeliveryTag, decode_delivery,
-};
+use crate::capacity_probe::{CapacityProbeMessage, decode_probe};
+use crate::delivery::{DELIVERY_TAG_WIRE_BYTES, DeliveryMessage, DeliveryTag, decode_delivery};
+use crate::protocol::envelope::{Envelope, HEADER_LEN as ENVELOPE_HEADER_LEN, MessageType};
 
-const MAGIC: &[u8; 8] = b"ISWIP3\0\0";
-const BATCH_MAGIC: &[u8; 8] = b"ISWBT2\0\0";
-const REPAIR_MAGIC: &[u8; 8] = b"ISWRQ2\0\0";
-const HEARTBEAT_MAGIC: &[u8; 8] = b"ISWHB2\0\0";
-const REFRESH_MAGIC: &[u8; 8] = b"ISWRF2\0\0";
-const ADDRESSES_MAGIC: &[u8; 8] = b"ISWAD2\0\0";
-const HEADER_LEN: usize = 24;
-pub const MAX_PACKET_FRAME_HEADER_LEN: usize = HEADER_LEN + DELIVERY_TAG_WIRE_BYTES;
+const HEADER_LEN: usize = 16;
+pub const MAX_PACKET_FRAME_HEADER_LEN: usize =
+    ENVELOPE_HEADER_LEN + HEADER_LEN + DELIVERY_TAG_WIRE_BYTES;
 const FLAG_DELIVERY_TAG: u16 = 1;
-const BATCH_HEADER_LEN: usize = 10;
-const REPAIR_HEADER_LEN: usize = 18;
+const BATCH_HEADER_LEN: usize = 2;
+const REPAIR_HEADER_LEN: usize = 10;
 const ASSEMBLY_TTL: Duration = Duration::from_secs(10);
 const EXPIRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_ASSEMBLIES: usize = 4_096;
@@ -50,12 +44,16 @@ pub enum WireDatagram {
 }
 
 pub fn encode_heartbeat() -> Bytes {
-    Bytes::from_static(HEARTBEAT_MAGIC)
+    Envelope::new(MessageType::Heartbeat, Bytes::new())
+        .encode()
+        .expect("empty v4 heartbeat envelope is valid")
 }
 
 #[cfg(test)]
 fn encode_connection_refresh() -> Bytes {
-    Bytes::from_static(REFRESH_MAGIC)
+    Envelope::new(MessageType::ConnectionRefresh, Bytes::new())
+        .encode()
+        .expect("empty v4 refresh envelope is valid")
 }
 
 pub fn encode_address_candidates(addresses: &[SocketAddr]) -> Result<Bytes> {
@@ -64,14 +62,11 @@ pub fn encode_address_candidates(addresses: &[SocketAddr]) -> Result<Bytes> {
         addresses.len() <= MAX_ADDRESS_CANDIDATES,
         "too many address candidates"
     );
-    let length = ADDRESSES_MAGIC.len()
-        + 2
-        + addresses
-            .iter()
-            .map(|address| if address.is_ipv4() { 7 } else { 19 })
-            .sum::<usize>();
+    let length = 2 + addresses
+        .iter()
+        .map(|address| if address.is_ipv4() { 7 } else { 19 })
+        .sum::<usize>();
     let mut bytes = Vec::with_capacity(length);
-    bytes.extend_from_slice(ADDRESSES_MAGIC);
     bytes.extend_from_slice(&(addresses.len() as u16).to_be_bytes());
     for address in addresses {
         match address.ip() {
@@ -86,7 +81,7 @@ pub fn encode_address_candidates(addresses: &[SocketAddr]) -> Result<Bytes> {
         }
         bytes.extend_from_slice(&address.port().to_be_bytes());
     }
-    Ok(Bytes::from(bytes))
+    Envelope::new(MessageType::AddressCandidates, bytes).encode()
 }
 
 #[cfg(test)]
@@ -106,14 +101,16 @@ pub fn encode_packet_tagged(
         "packet exceeds wire protocol maximum"
     );
     let header_len = HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES);
-    ensure!(maximum > header_len, "QUIC datagram limit is too small");
+    ensure!(
+        maximum > ENVELOPE_HEADER_LEN + header_len,
+        "QUIC datagram limit is too small"
+    );
 
-    let chunk_size = maximum - header_len;
+    let chunk_size = maximum - ENVELOPE_HEADER_LEN - header_len;
     let mut frames = Vec::with_capacity(packet.len().div_ceil(chunk_size));
     for (index, chunk) in packet.chunks(chunk_size).enumerate() {
         let offset = index * chunk_size;
-        let mut frame = Vec::with_capacity(header_len + chunk.len());
-        frame.extend_from_slice(MAGIC);
+        let mut frame = Vec::with_capacity(ENVELOPE_HEADER_LEN + header_len + chunk.len());
         frame.extend_from_slice(&packet_id.to_be_bytes());
         frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
         frame.extend_from_slice(&(offset as u16).to_be_bytes());
@@ -124,7 +121,7 @@ pub fn encode_packet_tagged(
             frame.extend_from_slice(&tag.sequence.to_be_bytes());
         }
         frame.extend_from_slice(chunk);
-        frames.push(Bytes::from(frame));
+        frames.push(Envelope::new(MessageType::IpFragment, frame).encode()?);
     }
     Ok(frames)
 }
@@ -140,16 +137,18 @@ pub fn encode_batch(frames: &[Bytes], maximum: usize) -> Result<Bytes> {
             .iter()
             .map(|frame| 2_usize.saturating_add(frame.len()))
             .sum::<usize>();
-    ensure!(length <= maximum, "overlay batch exceeds path limit");
+    ensure!(
+        length + ENVELOPE_HEADER_LEN <= maximum,
+        "overlay batch exceeds path limit"
+    );
     let mut batch = Vec::with_capacity(length);
-    batch.extend_from_slice(BATCH_MAGIC);
     batch.extend_from_slice(&(frames.len() as u16).to_be_bytes());
     for frame in frames {
         ensure!(frame.len() <= u16::MAX as usize, "batch frame is too large");
         batch.extend_from_slice(&(frame.len() as u16).to_be_bytes());
         batch.extend_from_slice(frame);
     }
-    Ok(Bytes::from(batch))
+    Envelope::new(MessageType::IpBatch, batch).encode()
 }
 
 pub fn encode_repair_request(request: &RepairRequest) -> Result<Bytes> {
@@ -162,57 +161,54 @@ pub fn encode_repair_request(request: &RepairRequest) -> Result<Bytes> {
         "repair request has too many offsets"
     );
     let mut bytes = Vec::with_capacity(REPAIR_HEADER_LEN + request.missing_offsets.len() * 2);
-    bytes.extend_from_slice(REPAIR_MAGIC);
     bytes.extend_from_slice(&request.packet_id.to_be_bytes());
     bytes.extend_from_slice(&(request.missing_offsets.len() as u16).to_be_bytes());
     for offset in &request.missing_offsets {
         bytes.extend_from_slice(&offset.to_be_bytes());
     }
-    Ok(Bytes::from(bytes))
+    Envelope::new(MessageType::RepairRequest, bytes).encode()
 }
 
 pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
-    ensure!(datagram.len() >= MAGIC.len(), "truncated overlay datagram");
-    if &datagram[..MAGIC.len()] == MAGIC {
-        return Ok(WireDatagram::Frames(vec![datagram]));
-    }
-    if datagram.as_ref() == HEARTBEAT_MAGIC {
-        return Ok(WireDatagram::Heartbeat);
-    }
-    if datagram.as_ref() == REFRESH_MAGIC {
-        return Ok(WireDatagram::ConnectionRefresh);
-    }
-    if &datagram[..PROBE_MAGIC.len()] == PROBE_MAGIC {
-        return Ok(WireDatagram::CapacityProbe(decode_probe(&datagram)?));
-    }
-    if &datagram[..DELIVERY_MAGIC.len()] == DELIVERY_MAGIC {
-        return Ok(WireDatagram::Delivery(decode_delivery(&datagram)?));
-    }
-    if &datagram[..ADDRESSES_MAGIC.len()] == ADDRESSES_MAGIC {
-        return decode_address_candidates(&datagram);
-    }
-    if &datagram[..REPAIR_MAGIC.len()] == REPAIR_MAGIC {
-        return decode_repair_request(&datagram);
-    }
+    let envelope = Envelope::decode(datagram)?;
+    ensure!(envelope.flags == 0, "unsupported v4 datagram flags");
     ensure!(
-        &datagram[..BATCH_MAGIC.len()] == BATCH_MAGIC,
-        "invalid overlay datagram magic"
+        envelope.extension.is_empty(),
+        "unexpected v4 datagram extension"
     );
-    decode_batch(datagram)
+    match envelope.kind {
+        MessageType::IpFragment => Ok(WireDatagram::Frames(vec![envelope.payload])),
+        MessageType::IpBatch => decode_batch(envelope.payload),
+        MessageType::RepairRequest => decode_repair_request(&envelope.payload),
+        MessageType::CapacityProbe => Ok(WireDatagram::CapacityProbe(decode_probe(
+            &envelope.payload,
+        )?)),
+        MessageType::Delivery => Ok(WireDatagram::Delivery(decode_delivery(&envelope.payload)?)),
+        MessageType::Heartbeat => {
+            ensure!(
+                envelope.payload.is_empty(),
+                "heartbeat payload is not empty"
+            );
+            Ok(WireDatagram::Heartbeat)
+        }
+        MessageType::ConnectionRefresh => {
+            ensure!(envelope.payload.is_empty(), "refresh payload is not empty");
+            Ok(WireDatagram::ConnectionRefresh)
+        }
+        MessageType::AddressCandidates => decode_address_candidates(&envelope.payload),
+        MessageType::FecShard => anyhow::bail!("FEC shard reached the inner v4 decoder"),
+    }
 }
 
 fn decode_address_candidates(datagram: &[u8]) -> Result<WireDatagram> {
-    ensure!(
-        datagram.len() >= ADDRESSES_MAGIC.len() + 2,
-        "truncated address candidates"
-    );
-    let count = usize::from(u16::from_be_bytes(datagram[8..10].try_into().unwrap()));
+    ensure!(datagram.len() >= 2, "truncated address candidates");
+    let count = usize::from(u16::from_be_bytes(datagram[0..2].try_into().unwrap()));
     ensure!(
         (1..=MAX_ADDRESS_CANDIDATES).contains(&count),
         "invalid address candidate count"
     );
 
-    let mut cursor = 10;
+    let mut cursor = 2;
     let mut addresses = Vec::with_capacity(count);
     for _ in 0..count {
         ensure!(
@@ -254,8 +250,8 @@ fn decode_repair_request(datagram: &[u8]) -> Result<WireDatagram> {
         datagram.len() >= REPAIR_HEADER_LEN,
         "invalid repair request length"
     );
-    let packet_id = u64::from_be_bytes(datagram[8..16].try_into().unwrap());
-    let count = usize::from(u16::from_be_bytes(datagram[16..18].try_into().unwrap()));
+    let packet_id = u64::from_be_bytes(datagram[0..8].try_into().unwrap());
+    let count = usize::from(u16::from_be_bytes(datagram[8..10].try_into().unwrap()));
     ensure!(
         (1..=MAX_REPAIR_OFFSETS).contains(&count),
         "invalid repair offset count"
@@ -279,7 +275,7 @@ fn decode_batch(datagram: Bytes) -> Result<WireDatagram> {
         datagram.len() >= BATCH_HEADER_LEN,
         "truncated overlay batch"
     );
-    let count = usize::from(u16::from_be_bytes(datagram[8..10].try_into().unwrap()));
+    let count = usize::from(u16::from_be_bytes(datagram[0..2].try_into().unwrap()));
     ensure!(count >= 2, "overlay batch contains too few frames");
     let mut frames = Vec::with_capacity(count);
     let mut cursor = BATCH_HEADER_LEN;
@@ -289,9 +285,21 @@ fn decode_batch(datagram: Bytes) -> Result<WireDatagram> {
             datagram[cursor..cursor + 2].try_into().unwrap(),
         ));
         cursor += 2;
-        ensure!(length >= HEADER_LEN, "invalid batch frame length");
+        ensure!(
+            length >= ENVELOPE_HEADER_LEN + HEADER_LEN,
+            "invalid batch frame length"
+        );
         ensure!(cursor + length <= datagram.len(), "truncated batch frame");
-        frames.push(datagram.slice(cursor..cursor + length));
+        let frame = Envelope::decode(datagram.slice(cursor..cursor + length))?;
+        ensure!(
+            frame.kind == MessageType::IpFragment,
+            "batch item is not an IP fragment"
+        );
+        ensure!(
+            frame.flags == 0 && frame.extension.is_empty(),
+            "unsupported batched fragment envelope"
+        );
+        frames.push(frame.payload);
         cursor += length;
     }
     ensure!(cursor == datagram.len(), "trailing bytes in overlay batch");
@@ -349,16 +357,20 @@ impl Reassembler {
     }
 
     pub fn push_tagged(&mut self, frame: &[u8]) -> Result<Option<ReassembledPacket>> {
+        if frame.starts_with(crate::protocol::envelope::MAGIC) {
+            let envelope = Envelope::decode(Bytes::copy_from_slice(frame))?;
+            ensure!(
+                envelope.kind == MessageType::IpFragment,
+                "v4 envelope does not contain an IP fragment"
+            );
+            return self.push_tagged(&envelope.payload);
+        }
         ensure!(frame.len() >= HEADER_LEN, "truncated overlay frame");
-        ensure!(
-            &frame[..MAGIC.len()] == MAGIC,
-            "invalid overlay frame magic"
-        );
-        let packet_id = u64::from_be_bytes(frame[8..16].try_into().unwrap());
-        let total_len = usize::from(u16::from_be_bytes(frame[16..18].try_into().unwrap()));
-        let offset = usize::from(u16::from_be_bytes(frame[18..20].try_into().unwrap()));
-        let fragment_len = usize::from(u16::from_be_bytes(frame[20..22].try_into().unwrap()));
-        let flags = u16::from_be_bytes(frame[22..24].try_into().unwrap());
+        let packet_id = u64::from_be_bytes(frame[0..8].try_into().unwrap());
+        let total_len = usize::from(u16::from_be_bytes(frame[8..10].try_into().unwrap()));
+        let offset = usize::from(u16::from_be_bytes(frame[10..12].try_into().unwrap()));
+        let fragment_len = usize::from(u16::from_be_bytes(frame[12..14].try_into().unwrap()));
+        let flags = u16::from_be_bytes(frame[14..16].try_into().unwrap());
         ensure!(
             flags & !FLAG_DELIVERY_TAG == 0,
             "unsupported overlay frame flags"
@@ -369,8 +381,8 @@ impl Reassembler {
                 "truncated delivery tag"
             );
             Some(DeliveryTag {
-                session_id: u64::from_be_bytes(frame[24..32].try_into().unwrap()),
-                sequence: u32::from_be_bytes(frame[32..36].try_into().unwrap()),
+                session_id: u64::from_be_bytes(frame[16..24].try_into().unwrap()),
+                sequence: u32::from_be_bytes(frame[24..28].try_into().unwrap()),
             })
         } else {
             None
@@ -666,7 +678,7 @@ mod tests {
         reassembler.push(&frames[0]).unwrap();
         let expected = vec![RepairRequest {
             packet_id: 77,
-            missing_offsets: vec![976],
+            missing_offsets: vec![972],
         }];
         assert_eq!(reassembler.repair_requests(Duration::ZERO, 1), expected);
         assert_eq!(reassembler.repair_requests(Duration::ZERO, 1), expected);

@@ -9,6 +9,10 @@ identity_file = "/var/lib/iroh-sdwan/identity.key"
 # forbidden_underlay_prefixes = ["200::/7"]
 # 所有 peer 都有固定直连地址且不需要外部发现时，设为 false。
 discovery_enabled = true
+# `none` 不创建 TUN，也不执行 ip route/sysctl；适用于无 CAP_NET_ADMIN 的
+# LXC/Docker/VPS 纯中转节点。该模式必须启用 routing.transit_enabled，且不能
+# 配置 node_addresses/advertised_prefixes。默认值为 `tun`。
+attachment = "tun"
 # 这是虚拟接口自动调整的上限，不是启动 MTU 或底层 MTU。接口从 1280
 # 起步，只会在持续稳定的 LAN 路径上升高；遇到 WAN RTT、丢包或队列过期时
 # 回到 1280。
@@ -97,6 +101,24 @@ report_interval_secs = 10
 # mesh 开启时此静态源清单可省略：远端签名 Presence 会携带所有者前缀
 # 和中转能力。
 # allowed_source_prefixes = ["21.0.0.2/32", "21::2/128"]
+
+# 私有点到点承载（IEPL/IPLC/内网交付/端口转发）使用 pairwise link contract。
+# 下面的地址只存在于本机配置，不会写入签名 NodeRecord、Presence 或候选交换。
+# 对应 peer 不再填写 direct_addresses、relay_urls 或 derp_public_key。
+# [[links]]
+# id = "iepl-ab-01"
+# name = "iepl-ab"
+# peer_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
+# class = "private-circuit"
+# visibility = "pairwise"
+# dial = "active" # 对端填 passive，或双方均使用 auto
+# exclusive = true
+# fallback = false
+# local_bind = "10.255.0.1:4000"
+# remote_addresses = ["10.255.0.2:4000"]
+# allowed_local_prefixes = ["10.255.0.1/32"]
+# allowed_remote_prefixes = ["10.255.0.2/32"]
+# auth_key = "REPLACE_WITH_64_HEX_PAIRWISE_SECRET"
 
 # 静态远端路由不写入本文件。使用 `iroh-sdwan route add/import` 管理
 # identity_file 同目录的 routes.toml；`route list/remove` 可查询和删除。

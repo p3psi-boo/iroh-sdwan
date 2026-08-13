@@ -16,8 +16,8 @@ use iroh::EndpointId;
 use iroh_sdwan::{
     address::network_alpn,
     config::{
-        Config, FecConfig, ObservabilityConfig, PacketPolicyConfig, PeerConfig, RelayConfig,
-        RoutingConfig,
+        AttachmentMode, Config, FecConfig, ObservabilityConfig, PacketPolicyConfig, PeerConfig,
+        RelayConfig, RoutingConfig,
     },
     control::{self, DEFAULT_CONTROL_SOCKET},
     deployment,
@@ -1007,6 +1007,7 @@ async fn init(
         bind_addresses: Vec::new(),
         forbidden_underlay_prefixes: Vec::new(),
         discovery_enabled: true,
+        attachment: AttachmentMode::Tun,
         tun_mtu: u16::MAX,
         max_frame_size: 1400,
         node_interface: "isw0".into(),
@@ -1018,6 +1019,7 @@ async fn init(
             servers: answers.derp_servers,
         },
         peers: answers.peers,
+        links: Vec::new(),
         route_origins: Vec::new(),
         routing: RoutingConfig {
             transit_enabled: answers.transit_enabled,

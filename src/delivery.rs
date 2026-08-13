@@ -13,8 +13,8 @@ use bytes::Bytes;
 use iroh::EndpointId;
 
 use crate::capacity::RouteKey;
+use crate::protocol::envelope::{Envelope, MessageType};
 
-pub const DELIVERY_MAGIC: &[u8; 8] = b"ISWDL3\0\0";
 pub const MAX_DELIVERY_SESSIONS: usize = 4_096;
 pub const DELIVERY_SESSION_TTL: Duration = Duration::from_secs(10);
 /// A completed active probe's fixed hop list may seed later delivery sessions.
@@ -70,7 +70,6 @@ pub enum DeliveryMessage {
 pub fn encode_delivery(message: &DeliveryMessage) -> Result<Bytes> {
     validate_delivery(message)?;
     let mut out = Vec::new();
-    out.extend_from_slice(DELIVERY_MAGIC);
     match message {
         DeliveryMessage::Register(message) => {
             out.push(TYPE_REGISTER);
@@ -96,29 +95,36 @@ pub fn encode_delivery(message: &DeliveryMessage) -> Result<Bytes> {
             out.extend_from_slice(&message.receiver_elapsed_micros.to_be_bytes());
         }
     }
-    Ok(Bytes::from(out))
+    Envelope::new(MessageType::Delivery, out).encode()
 }
 
 pub fn decode_delivery(bytes: &[u8]) -> Result<DeliveryMessage> {
-    ensure!(bytes.len() >= 17, "truncated delivery message");
-    ensure!(&bytes[..8] == DELIVERY_MAGIC, "invalid delivery magic");
-    let kind = bytes[8];
-    let session_id = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
+    if bytes.starts_with(crate::protocol::envelope::MAGIC) {
+        let envelope = Envelope::decode(Bytes::copy_from_slice(bytes))?;
+        ensure!(
+            envelope.kind == MessageType::Delivery,
+            "v4 envelope does not contain a delivery message"
+        );
+        return decode_delivery(&envelope.payload);
+    }
+    ensure!(bytes.len() >= 9, "truncated delivery message");
+    let kind = bytes[0];
+    let session_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
     let message = match kind {
         TYPE_REGISTER => {
-            ensure!(bytes.len() >= 122, "truncated delivery registration");
-            let origin = decode_endpoint(&bytes[17..49])?;
-            let destination = decode_endpoint(&bytes[49..81])?;
-            let first_hop = decode_endpoint(&bytes[81..113])?;
-            let path_epoch = u64::from_be_bytes(bytes[113..121].try_into().unwrap());
-            let count = usize::from(bytes[121]);
+            ensure!(bytes.len() >= 114, "truncated delivery registration");
+            let origin = decode_endpoint(&bytes[9..41])?;
+            let destination = decode_endpoint(&bytes[41..73])?;
+            let first_hop = decode_endpoint(&bytes[73..105])?;
+            let path_epoch = u64::from_be_bytes(bytes[105..113].try_into().unwrap());
+            let count = usize::from(bytes[113]);
             ensure!(count <= MAX_DELIVERY_HOPS, "too many delivery hops");
             ensure!(
-                bytes.len() == 122 + count * 32,
+                bytes.len() == 114 + count * 32,
                 "delivery registration length mismatch"
             );
             let mut forward_hops = Vec::with_capacity(count);
-            for chunk in bytes[122..].chunks_exact(32) {
+            for chunk in bytes[114..].chunks_exact(32) {
                 forward_hops.push(decode_endpoint(chunk)?);
             }
             DeliveryMessage::Register(DeliverySessionRegister {
@@ -131,16 +137,16 @@ pub fn decode_delivery(bytes: &[u8]) -> Result<DeliveryMessage> {
             })
         }
         TYPE_REPORT => {
-            ensure!(bytes.len() == 117, "delivery report length mismatch");
+            ensure!(bytes.len() == 109, "delivery report length mismatch");
             DeliveryMessage::Report(DeliveryReport {
                 session_id,
-                origin: decode_endpoint(&bytes[17..49])?,
-                destination: decode_endpoint(&bytes[49..81])?,
-                path_epoch: u64::from_be_bytes(bytes[81..89].try_into().unwrap()),
-                delivered_bytes: u64::from_be_bytes(bytes[89..97].try_into().unwrap()),
-                delivered_packets: u64::from_be_bytes(bytes[97..105].try_into().unwrap()),
-                duplicate_or_gap_count: u32::from_be_bytes(bytes[105..109].try_into().unwrap()),
-                receiver_elapsed_micros: u64::from_be_bytes(bytes[109..117].try_into().unwrap()),
+                origin: decode_endpoint(&bytes[9..41])?,
+                destination: decode_endpoint(&bytes[41..73])?,
+                path_epoch: u64::from_be_bytes(bytes[73..81].try_into().unwrap()),
+                delivered_bytes: u64::from_be_bytes(bytes[81..89].try_into().unwrap()),
+                delivered_packets: u64::from_be_bytes(bytes[89..97].try_into().unwrap()),
+                duplicate_or_gap_count: u32::from_be_bytes(bytes[97..101].try_into().unwrap()),
+                receiver_elapsed_micros: u64::from_be_bytes(bytes[101..109].try_into().unwrap()),
             })
         }
         _ => bail!("unknown delivery message type"),

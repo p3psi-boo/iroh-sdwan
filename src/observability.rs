@@ -28,6 +28,10 @@ pub struct PeerCounters {
     pub name: String,
     pub endpoint_id: EndpointId,
     pub interface: String,
+    pub protocol_major: AtomicU64,
+    pub protocol_minor: AtomicU64,
+    pub negotiated_features: AtomicU64,
+    pub private_link: AtomicBool,
     pub connected: AtomicBool,
     pub connection_events: AtomicU64,
     pub connection_errors: AtomicU64,
@@ -109,6 +113,10 @@ impl PeerCounters {
             name,
             endpoint_id,
             interface,
+            protocol_major: AtomicU64::new(0),
+            protocol_minor: AtomicU64::new(0),
+            negotiated_features: AtomicU64::new(0),
+            private_link: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             connection_events: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
@@ -496,6 +504,14 @@ pub struct PeerStatus {
     pub name: String,
     pub endpoint_id: String,
     pub interface: String,
+    #[serde(default)]
+    pub protocol_major: u64,
+    #[serde(default)]
+    pub protocol_minor: u64,
+    #[serde(default)]
+    pub negotiated_features: u64,
+    #[serde(default)]
+    pub private_link: bool,
     pub connected: bool,
     pub connection_events: u64,
     #[serde(default)]
@@ -695,6 +711,10 @@ fn peer_snapshot(peer: &PeerCounters) -> PeerStatus {
         name: peer.name.clone(),
         endpoint_id: peer.endpoint_id.to_string(),
         interface: peer.interface.clone(),
+        protocol_major: peer.protocol_major.load(Ordering::Relaxed),
+        protocol_minor: peer.protocol_minor.load(Ordering::Relaxed),
+        negotiated_features: peer.negotiated_features.load(Ordering::Relaxed),
+        private_link: peer.private_link.load(Ordering::Relaxed),
         connected: peer.connected.load(Ordering::Relaxed),
         connection_events: peer.connection_events.load(Ordering::Relaxed),
         connection_errors: peer.connection_errors.load(Ordering::Relaxed),
@@ -891,6 +911,16 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
         output.push_str(&format!(
             "iroh_sdwan_peer_connected{{{labels}}} {}\n",
             u8::from(peer.connected)
+        ));
+        output.push_str(&format!(
+            "iroh_sdwan_peer_protocol_info{{{labels},major=\"{}\",minor=\"{}\",private_link=\"{}\"}} 1\n",
+            peer.protocol_major,
+            peer.protocol_minor,
+            peer.private_link,
+        ));
+        output.push_str(&format!(
+            "iroh_sdwan_peer_negotiated_features{{{labels}}} {}\n",
+            peer.negotiated_features
         ));
         for (name, value) in [
             ("connection_events_total", peer.connection_events),

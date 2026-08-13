@@ -172,7 +172,7 @@ ctl ns-a node-a health --quiet
 ctl ns-a node-a status --output json | grep -q '"ready": true'
 ctl ns-a node-a peers --output json | grep -q '"name": "node-b"'
 timeout 3s script -qec \
-  'ip netns exec ns-a iroh-sdwan --socket /state/node-a/control.sock tui --interval-ms 200' \
+  'ip netns exec ns-a iroh-sdwan --config /state/node-a/config.toml --socket /state/node-a/control.sock tui --interval-ms 200' \
   /state/node-a/tui.typescript >/dev/null 2>&1 || test "$?" -eq 124
 grep -q 'iroh-sdwan' /state/node-a/tui.typescript
 ctl ns-a node-a ping --count 2 --timeout-ms 2000 10.200.0.3 | grep -q '2 transmitted, 2 received'

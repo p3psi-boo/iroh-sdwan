@@ -511,8 +511,18 @@ impl RepairCache {
                     .frames
                     .iter()
                     .filter(|frame| {
-                        let offset = u16::from_be_bytes(frame[18..20].try_into().unwrap());
-                        request.missing_offsets.contains(&offset)
+                        crate::protocol::envelope::Envelope::decode((*frame).clone())
+                            .ok()
+                            .filter(|envelope| {
+                                envelope.kind == crate::protocol::envelope::MessageType::IpFragment
+                            })
+                            .and_then(|envelope| {
+                                envelope
+                                    .payload
+                                    .get(10..12)
+                                    .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+                            })
+                            .is_some_and(|offset| request.missing_offsets.contains(&offset))
                     })
                     .cloned()
                     .collect()
@@ -875,7 +885,7 @@ mod tests {
         cache.insert(2, &frames);
         let request = RepairRequest {
             packet_id: 2,
-            missing_offsets: vec![976],
+            missing_offsets: vec![972],
         };
         assert_eq!(cache.get(&request).unwrap(), vec![frames[1].clone()]);
     }

@@ -24,6 +24,10 @@ pub struct Config {
     pub forbidden_underlay_prefixes: Vec<IpNet>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub discovery_enabled: bool,
+    /// Local data-plane attachment. `none` turns the process into a pure
+    /// userspace transit node and does not require CAP_NET_ADMIN or /dev/net/tun.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub attachment: AttachmentMode,
     #[serde(
         default = "default_tun_mtu",
         skip_serializing_if = "is_default_tun_mtu"
@@ -49,6 +53,10 @@ pub struct Config {
     pub relay: RelayConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
+    /// Pairwise transport contracts. Locators in this section are local-only
+    /// and are never copied into the signed mesh directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkConfig>,
     /// Resolved static routes. New configurations keep these in the sibling
     /// routes.toml registry; deserializing this field remains migration-only.
     #[serde(default, skip_serializing)]
@@ -65,6 +73,72 @@ pub struct Config {
     pub fec: FecConfig,
     #[serde(default, skip_serializing_if = "is_default")]
     pub observability: ObservabilityConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttachmentMode {
+    #[default]
+    Tun,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkClass {
+    #[default]
+    PrivateCircuit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkVisibility {
+    #[default]
+    Pairwise,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DialRole {
+    #[default]
+    Auto,
+    Active,
+    Passive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkConfig {
+    /// Stable identifier shared by exactly the two endpoints.
+    pub id: String,
+    pub name: String,
+    pub peer_id: EndpointId,
+    #[serde(default)]
+    pub class: LinkClass,
+    #[serde(default)]
+    pub visibility: LinkVisibility,
+    #[serde(default)]
+    pub dial: DialRole,
+    /// Private circuits are exclusive by default: path migration may not
+    /// escape to discovery, relay, DERP or peer-observed public addresses.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub exclusive: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback: bool,
+    /// Optional local socket delivered by the circuit provider. This is a path
+    /// allowlist, not an endpoint-wide bind directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_bind: Option<SocketAddr>,
+    /// Pairwise locators, including RFC1918/RFC4193 delivery and private port
+    /// forwards. They are deliberately absent from Presence/NodeRecord.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_addresses: Vec<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_local_prefixes: Vec<IpNet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_remote_prefixes: Vec<IpNet>,
+    /// 32-byte hexadecimal pairwise secret used by the v4 session transcript.
+    pub auth_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,8 +441,12 @@ impl Config {
             !self.network_id.trim().is_empty(),
             "network_id cannot be empty"
         );
-        // 1280 is the IPv6 minimum link MTU.
-        ensure!(self.tun_mtu >= 1280, "tun_mtu must be at least 1280");
+        // 1280 is the IPv6 minimum link MTU. Transit-only nodes do not create
+        // an interface, but keep validating the wire frame ceiling below.
+        if self.attachment == AttachmentMode::Tun {
+            ensure!(self.tun_mtu >= 1280, "tun_mtu must be at least 1280");
+            validate_interface_name(&self.node_interface)?;
+        }
         ensure!(
             self.max_frame_size >= 256,
             "max_frame_size must be at least 256"
@@ -390,7 +468,6 @@ impl Config {
                 && self.fec.decoder_ttl_millis <= 60_000,
             "fec.decoder_ttl_millis must be at least block_timeout_millis and at most 60000"
         );
-        validate_interface_name(&self.node_interface)?;
         ensure!(
             (2..32_766).contains(&self.routing.rule_priority),
             "routing.rule_priority must be between 2 and 32765"
@@ -427,6 +504,7 @@ impl Config {
         );
         self.validate_bind_addresses()?;
         self.validate_node_info()?;
+        self.validate_attachment()?;
 
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
@@ -440,6 +518,15 @@ impl Config {
                 peer.name
             );
             ensure!(ids.insert(peer.endpoint_id), "duplicate peer endpoint_id");
+            let private_link = self.link_for_peer(peer.endpoint_id).is_some();
+            ensure!(
+                !private_link
+                    || (peer.direct_addresses.is_empty()
+                        && peer.relay_urls.is_empty()
+                        && peer.derp_public_key.is_none()),
+                "peer {} uses a private link and cannot also publish public/relay locators",
+                peer.name
+            );
             if let Some(key) = peer.derp_public_key {
                 ensure!(
                     derp_public_keys.insert(key),
@@ -477,6 +564,8 @@ impl Config {
                 peer.name
             );
         }
+
+        self.validate_links(&ids)?;
 
         ensure!(
             !self.packet_policy.enforce_overlay_prefixes
@@ -568,8 +657,9 @@ impl Config {
             ensure!(
                 self.peers
                     .iter()
-                    .all(|peer| !peer.direct_addresses.is_empty()),
-                "default routes require static direct_addresses for every peer"
+                    .all(|peer| !peer.direct_addresses.is_empty()
+                        || self.link_for_peer(peer.endpoint_id).is_some()),
+                "default routes require a static public or pairwise locator for every peer"
             );
         }
 
@@ -625,10 +715,6 @@ impl Config {
             "node_info.name cannot be empty"
         );
         ensure!(
-            !self.node_addresses.is_empty(),
-            "node_info requires at least one node_addresses entry"
-        );
-        ensure!(
             node_info.metadata.keys().all(|key| !key.trim().is_empty()),
             "node_info metadata keys cannot be empty"
         );
@@ -637,6 +723,153 @@ impl Config {
             "encoded node_info cannot exceed 800 bytes"
         );
         Ok(())
+    }
+
+    fn validate_attachment(&self) -> Result<()> {
+        if self.attachment == AttachmentMode::None {
+            ensure!(
+                self.node_addresses.is_empty() && self.advertised_prefixes.is_empty(),
+                "attachment = none cannot own node_addresses or advertised_prefixes"
+            );
+            ensure!(
+                self.routing.transit_enabled,
+                "attachment = none requires routing.transit_enabled = true"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_links(&self, peer_ids: &HashSet<EndpointId>) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut peers = HashSet::new();
+        let mut remotes = HashSet::new();
+        for link in &self.links {
+            ensure!(!link.id.trim().is_empty(), "link id cannot be empty");
+            ensure!(link.id.len() <= 128, "link {} id is too long", link.name);
+            ensure!(!link.name.trim().is_empty(), "link name cannot be empty");
+            ensure!(ids.insert(&link.id), "duplicate link id {}", link.id);
+            ensure!(
+                names.insert(&link.name),
+                "duplicate link name {}",
+                link.name
+            );
+            ensure!(
+                peers.insert(link.peer_id),
+                "peer {} has more than one link contract",
+                link.peer_id
+            );
+            ensure!(
+                peer_ids.contains(&link.peer_id),
+                "link {} references an unknown peer",
+                link.name
+            );
+            ensure!(
+                link.exclusive,
+                "private link {} must be exclusive",
+                link.name
+            );
+            ensure!(
+                !link.fallback,
+                "private link {} cannot enable public fallback",
+                link.name
+            );
+            ensure!(
+                !link.remote_addresses.is_empty(),
+                "private link {} requires remote_addresses",
+                link.name
+            );
+            ensure!(
+                hex::decode(&link.auth_key).is_ok_and(|key| key.len() == 32),
+                "link {} auth_key must be 32-byte hexadecimal",
+                link.name
+            );
+            if let Some(local) = link.local_bind {
+                ensure!(
+                    local.port() != 0,
+                    "link {} local_bind has port zero",
+                    link.name
+                );
+                ensure!(
+                    !link.allowed_local_prefixes.is_empty(),
+                    "link {} local_bind requires allowed_local_prefixes",
+                    link.name
+                );
+                ensure!(
+                    link.allowed_local_prefixes
+                        .iter()
+                        .any(|prefix| prefix.contains(&local.ip())),
+                    "link {} local_bind is outside allowed_local_prefixes",
+                    link.name
+                );
+                ensure!(
+                    self.bind_addresses.is_empty()
+                        || self.bind_addresses.iter().any(|address| address == &local),
+                    "link {} local_bind must match the endpoint bind address when bind_addresses is configured",
+                    link.name
+                );
+            }
+            for remote in &link.remote_addresses {
+                ensure!(
+                    remote.port() != 0,
+                    "link {} remote address has port zero",
+                    link.name
+                );
+                ensure!(
+                    remotes.insert(*remote),
+                    "private remote address {remote} is assigned to multiple links"
+                );
+                ensure!(
+                    !link.allowed_remote_prefixes.is_empty(),
+                    "link {} requires allowed_remote_prefixes",
+                    link.name
+                );
+                ensure!(
+                    link.allowed_remote_prefixes
+                        .iter()
+                        .any(|prefix| prefix.contains(&remote.ip())),
+                    "link {} remote address {remote} is outside allowed_remote_prefixes",
+                    link.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn link_for_peer(&self, peer_id: EndpointId) -> Option<&LinkConfig> {
+        self.links.iter().find(|link| link.peer_id == peer_id)
+    }
+
+    pub fn private_locator_prefixes(&self) -> impl Iterator<Item = IpNet> + '_ {
+        self.links.iter().flat_map(|link| {
+            link.allowed_local_prefixes
+                .iter()
+                .chain(&link.allowed_remote_prefixes)
+                .copied()
+        })
+    }
+
+    pub fn static_underlay_addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.peers
+            .iter()
+            .flat_map(|peer| peer.direct_addresses.iter().copied())
+            .chain(
+                self.links
+                    .iter()
+                    .flat_map(|link| link.remote_addresses.iter().copied()),
+            )
+    }
+
+    pub fn endpoint_bind_addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.bind_addresses
+            .iter()
+            .copied()
+            .chain(self.links.iter().filter_map(|link| {
+                self.bind_addresses
+                    .is_empty()
+                    .then_some(link.local_bind)
+                    .flatten()
+            }))
     }
 
     fn validate_relay(&self) -> Result<()> {
@@ -961,13 +1194,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_info_requires_a_node_address() {
+    fn transit_node_info_does_not_require_an_attachment_address() {
         let config = Config {
             network_id: "example".into(),
             identity_file: "identity.key".into(),
             bind_addresses: Vec::new(),
             forbidden_underlay_prefixes: Vec::new(),
             discovery_enabled: true,
+            attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
             node_interface: "isw0".into(),
@@ -980,6 +1214,7 @@ mod tests {
             }),
             relay: RelayConfig::default(),
             peers: Vec::new(),
+            links: Vec::new(),
             route_origins: Vec::new(),
             routing: RoutingConfig::default(),
             mesh: MeshConfig::default(),
@@ -988,13 +1223,7 @@ mod tests {
             observability: ObservabilityConfig::default(),
         };
 
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires at least one node_addresses entry")
-        );
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1168,6 +1397,64 @@ mod tests {
 
         config.routing.transit_enabled = true;
         assert!(!config.requires_forwarding());
+    }
+
+    #[test]
+    fn attachment_none_is_a_transit_only_configuration() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.attachment = AttachmentMode::None;
+        config.node_addresses.clear();
+        config.advertised_prefixes.clear();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires routing.transit_enabled")
+        );
+        config.routing.transit_enabled = true;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn pairwise_link_rejects_public_fallback_and_accepts_private_locator() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.node_info = None;
+        let endpoint_id = SecretKey::from_bytes(&[41; 32]).public();
+        config.peers.push(PeerConfig {
+            name: "private-b".into(),
+            endpoint_id,
+            transit_enabled: true,
+            direct_addresses: Vec::new(),
+            relay_urls: Vec::new(),
+            derp_public_key: None,
+            allowed_source_prefixes: Vec::new(),
+        });
+        config.links.push(LinkConfig {
+            id: "iepl-ab".into(),
+            name: "iepl-ab".into(),
+            peer_id: endpoint_id,
+            class: LinkClass::PrivateCircuit,
+            visibility: LinkVisibility::Pairwise,
+            dial: DialRole::Active,
+            exclusive: true,
+            fallback: false,
+            local_bind: Some("10.255.0.1:4000".parse().unwrap()),
+            remote_addresses: vec!["10.255.0.2:4000".parse().unwrap()],
+            allowed_local_prefixes: vec!["10.255.0.1/32".parse().unwrap()],
+            allowed_remote_prefixes: vec!["10.255.0.2/32".parse().unwrap()],
+            auth_key: "11".repeat(32),
+        });
+        config.validate().unwrap();
+
+        config.peers[0].direct_addresses = vec!["203.0.113.20:4000".parse().unwrap()];
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot also publish")
+        );
     }
 
     #[test]

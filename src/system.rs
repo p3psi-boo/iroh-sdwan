@@ -51,8 +51,8 @@ pub async fn cleanup_node_interface(config: &Config) -> Result<()> {
 pub async fn prepare_routing(config: &Config) -> Result<()> {
     let priority = config.routing.rule_priority.to_string();
     let underlay_priority = config.routing.rule_priority.saturating_sub(1).to_string();
-    for address in config.peers.iter().flat_map(|peer| &peer.direct_addresses) {
-        let (family, prefix) = host_prefix(*address);
+    for address in config.static_underlay_addresses() {
+        let (family, prefix) = host_prefix(address);
         run_ip_allow_failure(&[
             family,
             "rule",
@@ -222,8 +222,8 @@ pub async fn cleanup_routing(config: &Config) -> Result<()> {
     let table = routing_table(config).to_string();
     let priority = config.routing.rule_priority.to_string();
     let underlay_priority = config.routing.rule_priority.saturating_sub(1).to_string();
-    for address in config.peers.iter().flat_map(|peer| &peer.direct_addresses) {
-        let (family, prefix) = host_prefix(*address);
+    for address in config.static_underlay_addresses() {
+        let (family, prefix) = host_prefix(address);
         run_ip_allow_failure(&[
             family,
             "rule",

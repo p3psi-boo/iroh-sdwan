@@ -17,6 +17,7 @@ pub mod mesh;
 pub mod observability;
 pub mod packet;
 pub mod path_selection;
+pub mod protocol;
 pub mod routes;
 pub mod runtime;
 pub mod system;
@@ -26,4 +27,6 @@ pub mod tui;
 pub mod tunnel;
 pub mod wire;
 
-pub const PROTOCOL_NAME: &str = "iroh-sdwan/ip/3";
+/// Clean-slate wire generation. V3 nodes intentionally negotiate a different
+/// ALPN and can therefore never accidentally exchange v4 frames.
+pub const PROTOCOL_NAME: &str = "iroh-sdwan/ip/4";

@@ -14,8 +14,8 @@ use bytes::Bytes;
 use iroh::EndpointId;
 
 use crate::capacity::{FRESH_TTL, RouteKey};
+use crate::protocol::envelope::{Envelope, MessageType};
 
-pub const PROBE_MAGIC: &[u8; 8] = b"ISWCP3\0\0";
 pub const MAX_PROBE_HOPS: usize = 16;
 pub const MAX_PROBE_PACKET_COUNT: u16 = 256;
 pub const MAX_PROBE_PAYLOAD_SIZE: u16 = 1_200;
@@ -31,7 +31,7 @@ const TYPE_START: u8 = 1;
 const TYPE_READY: u8 = 2;
 const TYPE_PACKET: u8 = 3;
 const TYPE_REPORT: u8 = 4;
-const FIXED_ID_FIELDS: usize = 8 + 1 + 8 + 32 + 32;
+const FIXED_ID_FIELDS: usize = 1 + 8 + 32 + 32;
 
 pub type ProbeId = u64;
 
@@ -101,7 +101,6 @@ impl CapacityProbeMessage {
 pub fn encode_probe(message: &CapacityProbeMessage) -> Result<Bytes> {
     validate_probe(message)?;
     let mut out = Vec::new();
-    out.extend_from_slice(PROBE_MAGIC);
     match message {
         CapacityProbeMessage::Start(message) => {
             encode_common(
@@ -158,21 +157,28 @@ pub fn encode_probe(message: &CapacityProbeMessage) -> Result<Bytes> {
         }
     }
     ensure!(out.len() <= MAX_PROBE_BYTES, "probe message exceeds budget");
-    Ok(Bytes::from(out))
+    Envelope::new(MessageType::CapacityProbe, out).encode()
 }
 
 pub fn decode_probe(bytes: &[u8]) -> Result<CapacityProbeMessage> {
+    if bytes.starts_with(crate::protocol::envelope::MAGIC) {
+        let envelope = Envelope::decode(Bytes::copy_from_slice(bytes))?;
+        ensure!(
+            envelope.kind == MessageType::CapacityProbe,
+            "v4 envelope does not contain a capacity probe"
+        );
+        return decode_probe(&envelope.payload);
+    }
     ensure!(bytes.len() >= FIXED_ID_FIELDS, "truncated capacity probe");
-    ensure!(&bytes[..8] == PROBE_MAGIC, "invalid capacity probe magic");
     ensure!(
         bytes.len() <= MAX_PROBE_BYTES,
         "probe message exceeds budget"
     );
-    let kind = bytes[8];
-    let probe_id = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
-    let origin = decode_endpoint(&bytes[17..49])?;
-    let destination = decode_endpoint(&bytes[49..81])?;
-    let mut cursor = 81;
+    let kind = bytes[0];
+    let probe_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+    let origin = decode_endpoint(&bytes[9..41])?;
+    let destination = decode_endpoint(&bytes[41..73])?;
+    let mut cursor = 73;
     let message = match kind {
         TYPE_START => {
             ensure!(cursor + 5 <= bytes.len(), "truncated probe start");
