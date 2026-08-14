@@ -30,7 +30,7 @@ wait_until() {
 }
 
 endpoint_id() {
-  sed -n 's/^endpoint_id = //p' <<<"$1"
+  sed -n 's/^[[:space:]]*"endpoint_id": "\([^"]*\)",*$/\1/p' <<<"$1"
 }
 
 ctl_a() {
@@ -140,12 +140,15 @@ ip netns exec ns-nat iptables -t nat -A POSTROUTING \
 echo "==> creating identities and sealed configurations"
 declare -A IDS
 for node in node-a node-b; do
-  output=$(ironet init \
+  output=$(ironet network create docker-nat-wan \
     --config "$STATE_DIR/$node/config.toml" \
     --state-dir "$STATE_DIR/$node" \
-    --network-id docker-nat-wan)
+    --node-name "$node" \
+    --no-start \
+    --output json)
   IDS[$node]=$(endpoint_id "$output")
   test -n "${IDS[$node]}"
+  rm -f "$STATE_DIR/$node/network.toml" "$STATE_DIR/$node/network-authority.key"
 done
 write_config node-a 10.220.0.1 node-b 10.220.0.2 \
   "${IDS[node-b]}" 172.28.10.254:41002

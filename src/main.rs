@@ -1,38 +1,41 @@
 use std::{
     collections::HashSet,
-    fmt::{Display, Write as _},
-    io::{BufRead, IsTerminal, Write},
+    fmt::Write as _,
+    io::{IsTerminal, Write},
     net::{IpAddr, SocketAddr},
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
-    str::FromStr,
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 use iroh::EndpointId;
 use ironet::{
     address::network_alpn,
-    config::{
-        AttachmentMode, Config, FecConfig, ObservabilityConfig, PacketPolicyConfig, PeerConfig,
-        RelayConfig, RoutingConfig,
-    },
+    config::Config,
     control::{self, DEFAULT_CONTROL_SOCKET},
     deployment,
-    derp::{DerpPublicKey, identity::DerpIdentity, probe_server, tls_config},
+    derp::{identity::DerpIdentity, probe_server, tls_config},
     display, identity, logging,
     observability::{PeerStatus, RuntimeStatus},
+    product,
     routes::RouteRegistry,
     trace::{self, PingResult},
     tui,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "ironet", version, about)]
+#[command(
+    name = "ironet",
+    version,
+    about = "Create, join, and operate an ironet overlay network",
+    long_about = "Create, join, and operate an ironet IP overlay network between Linux machines.\n\nA network contains nodes. Each node has an overlay address. An invite contains the network and peer information required by another machine to join. A node can also advertise subnets or forward overlay traffic between peers.\n\nSetup commands write the configuration and network state. The ironet daemon reads the configuration and provides the network interface. Runtime commands communicate with the daemon through its control socket.",
+    after_help = "Common workflow:\n  ironet network create NAME\n  ironet invite create --address IP:PORT\n  ironet join INVITE\n\nInspect the network:\n  ironet network show\n  ironet node list\n  ironet status\n  ironet peers\n\nUse `ironet COMMAND --help` for command-specific behavior and examples. Use `--output json` or `--output jsonl` for machine-readable output."
+)]
 struct Cli {
-    /// Configuration file. May also be set with IRONET_CONFIG.
+    /// Path to the daemon configuration file.
     #[arg(
         short = 'c',
         long,
@@ -41,7 +44,7 @@ struct Cli {
         default_value = "/etc/ironet/config.toml"
     )]
     config: PathBuf,
-    /// Daemon control socket. May also be set with IRONET_SOCKET.
+    /// Path to the daemon control socket.
     #[arg(
         long,
         global = true,
@@ -49,11 +52,19 @@ struct Cli {
         default_value = DEFAULT_CONTROL_SOCKET
     )]
     socket: PathBuf,
-    /// Reduce operational logging and suppress successful health output.
+    /// Directory containing network state and identity files.
+    #[arg(
+        long,
+        global = true,
+        env = "IRONET_STATE_DIR",
+        default_value = "/var/lib/ironet"
+    )]
+    state_dir: PathBuf,
+    /// Suppress informational logs; `health` also suppresses successful output.
     #[arg(short, long, global = true)]
     quiet: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -67,100 +78,200 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a node identity and initial configuration.
-    Init {
-        #[arg(long, default_value = "/var/lib/ironet")]
-        state_dir: PathBuf,
-        /// Shared network join secret. Omit on the first node to generate one;
-        /// pass the printed value when initialising additional nodes.
-        #[arg(long)]
-        network_id: Option<String>,
-        /// Tailscale DERP URL; repeat once per region.
-        #[arg(long = "derp-server")]
-        derp_servers: Vec<String>,
-        /// Do not ask setup questions. Values not supplied on the command line
-        /// use their defaults.
-        #[arg(long)]
-        non_interactive: bool,
+    /// Create, show, or leave a network.
+    ///
+    /// These commands manage the network configuration and the membership of this
+    /// machine. Use `network create` once for the first node. Other machines use
+    /// `join` with an invite.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
     },
-    /// Print the deterministic interface and address plan.
+    /// Create, list, or revoke invites.
+    ///
+    /// The machine that created the network issues invites. Each invite is signed,
+    /// expires at a fixed time, and identifies the node allowed to use it.
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
+    /// Add this machine to an existing network by using an invite.
+    ///
+    /// The command validates the invite, writes the local configuration and identity,
+    /// assigns an overlay address, and starts the service unless `--no-start` is set.
+    /// With no invite argument on an interactive terminal, the command prompts for it.
+    #[command(
+        after_help = "Examples:\n  ironet join 'ironet://join/v1/...'\n  ironet join --invite-file invite.txt\n  cat invite.txt | ironet join --invite-file - --output json"
+    )]
+    Join {
+        /// Invite URL; omit it to use `--invite-file` or the interactive prompt.
+        #[arg(value_name = "INVITE")]
+        invite: Option<String>,
+        /// Read the invite URL from a file; use `-` to read standard input.
+        #[arg(long, conflicts_with = "invite", value_name = "PATH")]
+        invite_file: Option<PathBuf>,
+        /// Set this node's name; the default is the machine hostname.
+        #[arg(long, value_name = "NAME")]
+        node_name: Option<String>,
+        /// Reuse an identity retained by `network leave --keep-identity`.
+        #[arg(long)]
+        reuse_identity: bool,
+        /// Write the configuration and state without starting the service.
+        #[arg(long)]
+        no_start: bool,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// List nodes or change local node membership.
+    ///
+    /// `node list` combines local configuration with the daemon's current peer state.
+    /// Rename and remove operations update this machine's configuration.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+    /// Manage subnets reachable through this node.
+    ///
+    /// Published subnets are advertised to other nodes as routes through this node.
+    Subnet {
+        #[command(subcommand)]
+        command: SubnetCommand,
+    },
+    /// Control forwarding of overlay traffic between peers.
+    ///
+    /// Transit affects traffic received from one overlay peer and sent to another.
+    /// Subnets reachable through this node are managed separately with `subnet`.
+    Transit {
+        #[command(subcommand)]
+        command: TransitCommand,
+    },
+    /// Show the interface and address plan derived from the configuration.
+    #[command(hide = true)]
     Inspect,
-    /// Measure end-to-end RTT over the FlowRouter-selected overlay path.
+    /// Check reachability and round-trip time to an overlay address.
+    ///
+    /// Probes follow the same overlay route used for data traffic. The command returns
+    /// a non-zero status when no probe reaches the destination.
+    #[command(after_help = "Example:\n  ironet ping 10.42.0.8 --count 4 --timeout-ms 1000")]
     Ping {
-        /// Destination node IPv4 or IPv6 overlay address.
+        /// Destination IPv4 or IPv6 overlay address.
+        #[arg(value_name = "ADDRESS")]
         target: IpAddr,
-        #[arg(short = 'n', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=20))]
+        /// Number of probes to send.
+        #[arg(short = 'n', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=20), value_name = "NUMBER")]
         count: u16,
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        /// Timeout for each probe, in milliseconds.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=60_000), value_name = "MILLISECONDS")]
         timeout_ms: u64,
-        /// Output for humans, a JSON document, or a compact JSON line.
+        /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
         output: OutputFormat,
     },
-    /// Print live adjacency state and measured path metrics.
+    /// Show peer connection state and path measurements.
+    ///
+    /// Output includes peer identity, connection state, selected transport, latency,
+    /// loss, queue use, and packet counters from the daemon status.
     Peers {
-        /// Output for humans, a JSON array, or one JSON object per peer.
+        /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
         output: OutputFormat,
     },
-    /// Trace the FlowRouter-selected overlay path and print each node's configured node_info.
+    /// Show the node-by-node overlay path to an address.
+    ///
+    /// Each responding hop includes its overlay address, round-trip time, and node name
+    /// when available. A timeout is reported for a hop that does not respond.
+    #[command(after_help = "Example:\n  ironet trace 10.42.0.8 --max-hops 8 --timeout-ms 1000")]
     Trace {
-        /// Destination node IPv4 or IPv6 overlay address.
+        /// Destination IPv4 or IPv6 overlay address.
+        #[arg(value_name = "ADDRESS")]
         target: IpAddr,
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=255))]
+        /// Maximum number of overlay hops to inspect.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=255), value_name = "NUMBER")]
         max_hops: u8,
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        /// Timeout for each hop, in milliseconds.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=60_000), value_name = "MILLISECONDS")]
         timeout_ms: u64,
-        /// Output for humans, a JSON document, or one JSON object per hop.
+        /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
         output: OutputFormat,
     },
-    /// Print the last atomically published runtime status.
+    /// Show the latest status published by the daemon.
+    ///
+    /// Status includes readiness, uptime, installed routes, peer connections, network
+    /// discovery, path capacity, and packet forwarding counters.
     Status {
-        /// Output for humans or for pipelines.
+        /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
         output: OutputFormat,
-        /// Legacy alias for --output json.
+        /// Use JSON output; retained as an alias for `--output json`.
         #[arg(long)]
         json: bool,
     },
-    /// Open the interactive operations console for peers, routes, and diagnostics.
+    /// Open a terminal view of status, peers, routes, and diagnostics.
+    ///
+    /// The view reads daemon state repeatedly and does not change the configuration.
     #[command(visible_alias = "top")]
     Tui {
-        /// Refresh interval in milliseconds.
-        #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(200..=60_000))]
+        /// Refresh interval, in milliseconds.
+        #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(200..=60_000), value_name = "MILLISECONDS")]
         interval_ms: u64,
     },
-    /// Exit successfully only when the runtime is ready and its status is fresh.
+    /// Check whether the daemon is ready.
+    ///
+    /// Exit status is zero only when daemon status is recent, required routes are
+    /// installed, and configured peers are connected. Intended for service checks.
     Health,
-    /// Validate and atomically activate the current configuration.
+    /// Reload a validated configuration in the running daemon.
+    #[command(hide = true)]
     Reload,
-    /// Validate configuration, identity, route policy, and the local endpoint ID.
+    /// Validate the configuration, identity, routes, and local endpoint ID.
+    #[command(hide = true)]
     Validate,
-    /// Validate a manually edited configuration and write its integrity digest.
+    /// Validate a configuration file and write its integrity digest.
+    #[command(hide = true)]
     SealConfig,
-    /// Atomically install a validated configuration and retain a previous copy.
+    /// Install a validated configuration and retain the previous file.
+    #[command(hide = true)]
     InstallConfig {
-        #[arg(long)]
+        /// Configuration file to validate and install.
+        #[arg(long, value_name = "PATH")]
         source: PathBuf,
     },
-    /// Swap the active configuration with its validated previous copy.
+    /// Replace the active configuration with its previous validated copy.
+    #[command(hide = true)]
     RollbackConfig,
-    /// Copy the configured node identity into a new mode-0600 backup.
+    /// Copy the node identity to a new file with mode 0600.
+    #[command(hide = true)]
     BackupIdentity {
-        #[arg(long)]
+        /// Path for the new identity backup.
+        #[arg(long, value_name = "PATH")]
         output: PathBuf,
     },
-    /// Restore an identity only when the destination does not exist.
+    /// Restore an identity when the destination file does not exist.
+    #[command(hide = true)]
     RestoreIdentity {
-        #[arg(long)]
+        /// Identity backup to restore.
+        #[arg(long, value_name = "PATH")]
         source: PathBuf,
-        #[arg(long, default_value = "/var/lib/ironet/identity.key")]
+        /// Destination identity file.
+        #[arg(
+            long,
+            default_value = "/var/lib/ironet/identity.key",
+            value_name = "PATH"
+        )]
         identity_file: PathBuf,
     },
-    /// Check host prerequisites and underlay reachability without changing state.
+    /// Check configuration, host requirements, and peer reachability.
+    ///
+    /// The command validates local files and system settings, then checks configured
+    /// direct and relay addresses. It does not change configuration or network state.
     Doctor,
-    /// Manage the independent static route registry.
+    /// Manage routes stored outside the main configuration file.
+    ///
+    /// Route changes update `routes.toml`. By default, changes are sent to the running
+    /// daemon; use `--defer` to apply them during a later reload.
+    #[command(hide = true)]
     Route {
         #[command(subcommand)]
         command: RouteCommand,
@@ -168,50 +279,262 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-enum RouteCommand {
-    /// Add one or more prefixes for a configured peer name or endpoint ID.
-    Add {
-        #[arg(required = true, value_name = "PREFIX")]
-        prefixes: Vec<IpNet>,
-        /// Final owner of these prefixes: a configured peer name or endpoint ID.
-        #[arg(long, value_name = "PEER_OR_ENDPOINT_ID")]
-        owner: String,
-        /// Validate and preview the change without saving it.
+enum NetworkCommand {
+    /// Create a network and configure this machine as its first node.
+    ///
+    /// Writes the node identity, network state, daemon configuration, route file, and
+    /// configuration digest. The address pool and node name use defaults when omitted.
+    /// Starts the system service unless `--no-start` is set.
+    #[command(
+        after_help = "Examples:\n  ironet network create office\n  ironet network create office --node-name gateway-a --listen 203.0.113.10:4000\n  ironet network create lab --address-pool 10.42.0.0/16 --no-start --output json"
+    )]
+    Create {
+        /// Name used to identify the network in local status and invites.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Set this node's name; the default is the machine hostname.
+        #[arg(long, value_name = "NAME")]
+        node_name: Option<String>,
+        /// IPv4 CIDR used for overlay addresses; the default is selected automatically.
+        #[arg(long, value_name = "CIDR")]
+        address_pool: Option<ipnet::Ipv4Net>,
+        /// Add a Tailscale DERP server URL; repeat the option for multiple servers.
+        #[arg(long = "derp-server", value_name = "URL")]
+        derp_servers: Vec<String>,
+        /// Bind a fixed UDP address; repeat the option for multiple addresses.
+        #[arg(long = "listen", value_name = "IP:PORT")]
+        bind_addresses: Vec<SocketAddr>,
+        /// Reuse an identity retained by `network leave --keep-identity`.
         #[arg(long)]
-        dry_run: bool,
-        /// Save now and apply on the next daemon reload.
-        #[arg(long, visible_alias = "no-reload")]
-        defer: bool,
-    },
-    /// Merge routes from TOML or `<endpoint-id> <prefix>...` text.
-    Import {
-        /// Import file, or `-` to read from standard input.
-        source: PathBuf,
-        /// Replace the registry instead of merging it.
+        reuse_identity: bool,
+        /// Write the configuration and state without starting the service.
         #[arg(long)]
-        replace: bool,
-        /// Validate and preview the change without saving it.
-        #[arg(long)]
-        dry_run: bool,
-        /// Save now and apply on the next daemon reload.
-        #[arg(long, visible_alias = "no-reload")]
-        defer: bool,
-    },
-    /// List routes from routes.toml.
-    #[command(visible_alias = "ls")]
-    List {
+        no_start: bool,
+        /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
         output: OutputFormat,
     },
-    /// Remove prefixes or all routes owned by a configured peer/endpoint ID.
-    #[command(visible_alias = "rm")]
+    /// Show the network and this node's stored identity and address.
+    ///
+    /// Reads local configuration and network state. The daemon does not need to be
+    /// running.
+    Show {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Remove this machine's network configuration and state.
+    ///
+    /// Stops the service by default, then removes the configuration, digest, route
+    /// file, network state, and keys. Use `--keep-identity` only when the same node
+    /// identity must be reused later.
+    #[command(
+        after_help = "Examples:\n  ironet network leave --yes\n  ironet network leave --yes --keep-identity"
+    )]
+    Leave {
+        /// Confirm removal of this machine's network files.
+        #[arg(long)]
+        yes: bool,
+        /// Keep the node identity file for later reuse.
+        #[arg(long)]
+        keep_identity: bool,
+        /// Leave service state unchanged before removing network files.
+        #[arg(long)]
+        no_stop: bool,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InviteCommand {
+    /// Create an invite for one node to join the network.
+    ///
+    /// Only the machine that created the network has the signing key required for this
+    /// command. The invite contains its expiry, the new node identity, network data,
+    /// and bootstrap addresses. Creating an invite does not restart the daemon.
+    #[command(
+        after_help = "Examples:\n  ironet invite create\n  ironet invite create --expires 30m --address 203.0.113.10:4000\n  ironet invite create --address 192.0.2.10:4000 --address '[2001:db8::10]:4000' --output json"
+    )]
+    Create {
+        /// Time before the invite expires, such as `30m`, `1h`, or `2d`.
+        #[arg(long, default_value = "1h", value_name = "DURATION")]
+        expires: String,
+        /// Add an address that the joining node can use to reach this node.
+        #[arg(long = "address", value_name = "IP:PORT")]
+        addresses: Vec<SocketAddr>,
+        /// Require an existing endpoint ID instead of generating a new node identity.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node_id: Option<EndpointId>,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// List invites issued by this machine.
+    ///
+    /// Shows each invite ID, expiry, and whether it has been revoked. Invite URLs are
+    /// not stored and are therefore not included.
+    List {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Reject future connection attempts that use an invite ID.
+    ///
+    /// Revocation takes effect for subsequent connection handshakes. It does not
+    /// interrupt a connection that is already active.
+    Revoke {
+        /// Invite ID shown by `invite create` or `invite list`.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCommand {
+    /// List the local node, configured peers, and connected nodes.
+    ///
+    /// Local configuration is always shown. When the daemon is running, nodes learned
+    /// from current peer connections are included.
+    List {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Change this node's name in the local configuration and network state.
+    ///
+    /// The endpoint ID and overlay address do not change. The running daemon is
+    /// reloaded when available.
+    Rename {
+        /// New name for this node.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Remove a node from this machine's peer and membership state.
+    ///
+    /// The selector may be a node name or endpoint ID. Removal blocks automatic
+    /// admission of the same endpoint on this machine. The operation requires `--yes`.
     Remove {
-        #[arg(required = true, value_name = "PREFIX_OR_OWNER")]
-        selectors: Vec<String>,
-        /// Validate and preview the change without saving it.
+        /// Node name or endpoint ID to remove.
+        #[arg(value_name = "NODE")]
+        node: String,
+        /// Confirm the membership change.
+        #[arg(long)]
+        yes: bool,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SubnetCommand {
+    /// Advertise a subnet as reachable through this node.
+    ///
+    /// The CIDR is added to this node's advertised prefixes. This command does not
+    /// create routes or enable packet forwarding outside ironet.
+    Publish {
+        /// IPv4 or IPv6 subnet in CIDR notation.
+        #[arg(value_name = "CIDR")]
+        prefix: IpNet,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// List subnets advertised by this node.
+    List {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Stop advertising a subnet through this node.
+    Unpublish {
+        /// IPv4 or IPv6 subnet in CIDR notation.
+        #[arg(value_name = "CIDR")]
+        prefix: IpNet,
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TransitCommand {
+    /// Allow this node to forward overlay traffic between peers.
+    ///
+    /// Updates the local configuration and reloads the daemon when available.
+    Enable {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Stop this node from forwarding overlay traffic between peers.
+    ///
+    /// Traffic addressed to this node and traffic for its published subnets are not
+    /// changed by this setting.
+    Disable {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    /// Add routes whose destination is reached through a peer.
+    Add {
+        /// One or more destination subnets in CIDR notation.
+        #[arg(required = true, value_name = "PREFIX")]
+        prefixes: Vec<IpNet>,
+        /// Peer name or endpoint ID that owns the destination subnets.
+        #[arg(long, value_name = "PEER_OR_ENDPOINT_ID")]
+        owner: String,
+        /// Validate and print the change without saving it.
         #[arg(long)]
         dry_run: bool,
-        /// Save now and apply on the next daemon reload.
+        /// Save the change without sending it to the running daemon.
+        #[arg(long, visible_alias = "no-reload")]
+        defer: bool,
+    },
+    /// Import routes from TOML or `<endpoint-id> <prefix>...` text.
+    Import {
+        /// File to import; use `-` to read standard input.
+        #[arg(value_name = "PATH")]
+        source: PathBuf,
+        /// Replace existing routes instead of merging imported routes.
+        #[arg(long)]
+        replace: bool,
+        /// Validate and print the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save the change without sending it to the running daemon.
+        #[arg(long, visible_alias = "no-reload")]
+        defer: bool,
+    },
+    /// List routes stored in `routes.toml`.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Select the output format.
+        #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
+        output: OutputFormat,
+    },
+    /// Remove destination subnets or all routes owned by a peer.
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// CIDR, peer name, or endpoint ID to remove.
+        #[arg(required = true, value_name = "PREFIX_OR_OWNER")]
+        selectors: Vec<String>,
+        /// Validate and print the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save the change without sending it to the running daemon.
         #[arg(long, visible_alias = "no-reload")]
         defer: bool,
     },
@@ -223,37 +546,48 @@ async fn main() -> Result<()> {
     logging::init(cli.quiet);
     let config = cli.config;
     let socket = cli.socket;
+    let state_dir = cli.state_dir;
 
     match cli.command {
-        Command::Init {
-            state_dir,
-            network_id,
-            derp_servers,
-            non_interactive,
-        } => {
-            init(
-                &config,
-                &state_dir,
-                network_id,
-                derp_servers,
-                non_interactive,
-            )
-            .await
+        None => overview(&config, &socket, &state_dir).await,
+        Some(Command::Network { command }) => {
+            network_command(&config, &socket, &state_dir, command).await
         }
-        Command::Inspect => inspect(&config).await,
-        Command::Ping {
+        Some(Command::Invite { command }) => invite_command(&config, &state_dir, command).await,
+        Some(Command::Join {
+            invite,
+            invite_file,
+            node_name,
+            reuse_identity,
+            no_start,
+            output,
+        }) => {
+            let invite = read_invite(invite, invite_file)?;
+            let summary =
+                product::join_network(&config, &state_dir, &invite, node_name, reuse_identity)
+                    .await?;
+            let started = start_service(&config, &socket, &state_dir, no_start).await?;
+            print_network_summary(&summary, output, Some(started))
+        }
+        Some(Command::Node { command }) => {
+            node_command(&config, &socket, &state_dir, command).await
+        }
+        Some(Command::Subnet { command }) => subnet_command(&config, &socket, command).await,
+        Some(Command::Transit { command }) => transit_command(&config, &socket, command).await,
+        Some(Command::Inspect) => inspect(&config).await,
+        Some(Command::Ping {
             target,
             count,
             timeout_ms,
             output,
-        } => ping(&socket, target, count, timeout_ms, output).await,
-        Command::Peers { output } => peers(&socket, output).await,
-        Command::Trace {
+        }) => ping(&socket, target, count, timeout_ms, output).await,
+        Some(Command::Peers { output }) => peers(&socket, output).await,
+        Some(Command::Trace {
             target,
             max_hops,
             timeout_ms,
             output,
-        } => {
+        }) => {
             let result = control::trace_with(
                 &socket,
                 target,
@@ -275,35 +609,531 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Status { output, json } => {
+        Some(Command::Status { output, json }) => {
             status(&socket, if json { OutputFormat::Json } else { output }).await
         }
-        Command::Tui { interval_ms } => {
+        Some(Command::Tui { interval_ms }) => {
             tui::run(&config, &socket, Duration::from_millis(interval_ms)).await
         }
-        Command::Health => health(&socket, cli.quiet).await,
-        Command::Reload => {
+        Some(Command::Health) => health(&socket, cli.quiet).await,
+        Some(Command::Reload) => {
             let ack = control::reload(&socket).await?;
             println!("reloaded generation={}", ack.generation);
             println!("endpoint_id={}", ack.endpoint_id);
             Ok(())
         }
-        Command::Validate => validate(&config).await,
-        Command::SealConfig => {
+        Some(Command::Validate) => validate(&config).await,
+        Some(Command::SealConfig) => {
             deployment::seal(&config).await?;
             println!("sealed = {}", config.display());
             Ok(())
         }
-        Command::InstallConfig { source } => deployment::install(&source, &config).await,
-        Command::RollbackConfig => deployment::rollback(&config).await,
-        Command::BackupIdentity { output } => backup_identity(&config, &output).await,
-        Command::RestoreIdentity {
+        Some(Command::InstallConfig { source }) => deployment::install(&source, &config).await,
+        Some(Command::RollbackConfig) => deployment::rollback(&config).await,
+        Some(Command::BackupIdentity { output }) => backup_identity(&config, &output).await,
+        Some(Command::RestoreIdentity {
             source,
             identity_file,
-        } => restore_identity(&source, &identity_file),
-        Command::Doctor => doctor(&config).await,
-        Command::Route { command } => route(&config, &socket, command).await,
+        }) => restore_identity(&source, &identity_file),
+        Some(Command::Doctor) => doctor(&config).await,
+        Some(Command::Route { command }) => route(&config, &socket, command).await,
     }
+}
+
+async fn overview(config: &Path, socket: &Path, state_dir: &Path) -> Result<()> {
+    if !product::state_path(state_dir).exists() || !config.exists() {
+        return print_unconfigured(OutputFormat::Human);
+    }
+    let summary = product::show_network(config, state_dir).await?;
+    println!("Network: {}", summary.network);
+    println!("Node:    {}", summary.node);
+    println!("Address: {}", summary.address);
+    match control::snapshot(socket).await {
+        Ok(status) => {
+            println!(
+                "State:   {}",
+                if status.ready { "ready" } else { "starting" }
+            );
+            println!(
+                "Peers:   {} connected",
+                status.peers.iter().filter(|peer| peer.connected).count()
+            );
+        }
+        Err(_) => {
+            println!("State:   stopped");
+            println!("Start:   sudo systemctl enable --now ironet");
+        }
+    }
+    Ok(())
+}
+
+fn print_unconfigured(output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Human => println!(
+            "This machine has not joined an ironet network.\n\nCreate a new network:\n  sudo ironet network create <name>\n\nJoin an existing network:\n  sudo ironet join <invite>"
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "configured": false,
+                "state": "unconfigured",
+                "actions": {
+                    "create": "sudo ironet network create <name>",
+                    "join": "sudo ironet join <invite>"
+                }
+            }))?
+        ),
+        OutputFormat::Jsonl => println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"configured": false, "state": "unconfigured"})
+            )?
+        ),
+    }
+    Ok(())
+}
+
+async fn network_command(
+    config: &Path,
+    socket: &Path,
+    state_dir: &Path,
+    command: NetworkCommand,
+) -> Result<()> {
+    match command {
+        NetworkCommand::Create {
+            name,
+            node_name,
+            address_pool,
+            derp_servers,
+            bind_addresses,
+            reuse_identity,
+            no_start,
+            output,
+        } => {
+            let summary = product::create_network(
+                config,
+                state_dir,
+                &name,
+                product::CreateNetworkOptions {
+                    node_name,
+                    address_pool,
+                    derp_servers,
+                    bind_addresses,
+                    reuse_identity,
+                },
+            )
+            .await?;
+            let started = start_service(config, socket, state_dir, no_start).await?;
+            print_network_summary(&summary, output, Some(started))
+        }
+        NetworkCommand::Show { output } => {
+            let summary = product::show_network(config, state_dir).await?;
+            print_network_summary(&summary, output, None)
+        }
+        NetworkCommand::Leave {
+            yes,
+            keep_identity,
+            no_stop,
+            output,
+        } => {
+            ensure!(
+                yes,
+                "network leave removes local network state; rerun with --yes"
+            );
+            if !no_stop {
+                stop_service().await?;
+            }
+            let removed = product::leave_network(config, state_dir, keep_identity)?;
+            match output {
+                OutputFormat::Human => println!(
+                    "✓ Left the network and removed {} state files",
+                    removed.len()
+                ),
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"left": true, "removed": removed})
+                    )?
+                ),
+                OutputFormat::Jsonl => println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({"left": true, "removed": removed}))?
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn invite_command(config: &Path, state_dir: &Path, command: InviteCommand) -> Result<()> {
+    match command {
+        InviteCommand::Create {
+            expires,
+            addresses,
+            node_id,
+            output,
+        } => {
+            let lifetime = product::parse_duration(&expires)?;
+            let invite =
+                product::create_invite(config, state_dir, Some(lifetime), addresses, node_id)?;
+            match output {
+                OutputFormat::Human => {
+                    println!("{}", invite.token);
+                    eprintln!(
+                        "Invite {} expires at {}",
+                        invite.id,
+                        display::unix_timestamp(invite.expires_unix_secs)
+                    );
+                }
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&invite)?),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&invite)?),
+            }
+            Ok(())
+        }
+        InviteCommand::List { output } => {
+            let invites = product::list_invites(state_dir)?;
+            match output {
+                OutputFormat::Human => {
+                    if invites.is_empty() {
+                        println!("No invites.\nCreate one with: sudo ironet invite create");
+                    } else {
+                        println!("{:<26} {:<10} EXPIRES", "ID", "STATE");
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        for invite in invites {
+                            let state = if invite.revoked {
+                                "revoked"
+                            } else if invite.expires_unix_secs < now {
+                                "expired"
+                            } else {
+                                "active"
+                            };
+                            println!(
+                                "{:<26} {:<10} {}",
+                                invite.id,
+                                state,
+                                display::unix_timestamp(invite.expires_unix_secs)
+                            );
+                        }
+                    }
+                }
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&invites)?),
+                OutputFormat::Jsonl => {
+                    for invite in invites {
+                        println!("{}", serde_json::to_string(&invite)?);
+                    }
+                }
+            }
+            Ok(())
+        }
+        InviteCommand::Revoke { id, output } => {
+            let changed = product::revoke_invite(state_dir, &id)?;
+            // Admission reads the authority registry for every new handshake, so invite
+            // changes take effect immediately without restarting the data plane.
+            print_change(output, "invite", &id, changed, true)
+        }
+    }
+}
+
+async fn node_command(
+    config: &Path,
+    socket: &Path,
+    state_dir: &Path,
+    command: NodeCommand,
+) -> Result<()> {
+    match command {
+        NodeCommand::List { output } => {
+            let mut nodes = product::list_nodes(config, state_dir).await?;
+            if socket.exists()
+                && let Ok(live) = control::snapshot(socket).await.map(|status| status.peers)
+            {
+                for peer in live {
+                    if !nodes
+                        .iter()
+                        .any(|node| node.endpoint_id == peer.endpoint_id)
+                    {
+                        nodes.push(product::NodeSummary {
+                            name: peer.name,
+                            endpoint_id: peer.endpoint_id,
+                            local: false,
+                            removed: false,
+                        });
+                    }
+                }
+            }
+            nodes.sort_by_key(|node| (!node.local, node.name.clone(), node.endpoint_id.clone()));
+            match output {
+                OutputFormat::Human => {
+                    println!("{:<20} {:<7} ENDPOINT ID", "NAME", "LOCAL");
+                    for node in nodes {
+                        println!(
+                            "{:<20} {:<7} {}{}",
+                            node.name,
+                            node.local,
+                            node.endpoint_id,
+                            if node.removed { " (removed)" } else { "" }
+                        );
+                    }
+                }
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&nodes)?),
+                OutputFormat::Jsonl => {
+                    for node in nodes {
+                        println!("{}", serde_json::to_string(&node)?);
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Rename { name, output } => {
+            let changed = product::rename_local_node(config, state_dir, &name).await?;
+            let applied = reload_if_running(socket).await?;
+            print_change(output, "node_name", &name, changed, applied)
+        }
+        NodeCommand::Remove { node, yes, output } => {
+            ensure!(
+                yes,
+                "node removal changes adjacency state; rerun with --yes"
+            );
+            let removed = match product::remove_node(config, state_dir, &node).await {
+                Ok(removed) => removed,
+                Err(configured_error) => {
+                    let live = control::peers(socket).await.unwrap_or_default();
+                    let peer = live
+                        .into_iter()
+                        .find(|peer| peer.name == node || peer.endpoint_id == node)
+                        .with_context(|| {
+                            format!("{configured_error}; no live node matches {node}")
+                        })?;
+                    let endpoint = peer.endpoint_id.parse::<EndpointId>()?;
+                    product::remove_node_endpoint(config, state_dir, endpoint, &peer.name).await?
+                }
+            };
+            let (name, changed) = removed;
+            let applied = reload_if_running(socket).await?;
+            print_change(output, "node", &name, changed, applied)
+        }
+    }
+}
+
+async fn subnet_command(config: &Path, socket: &Path, command: SubnetCommand) -> Result<()> {
+    match command {
+        SubnetCommand::Publish { prefix, output } => {
+            let mut change = product::publish_subnet(config, prefix).await?;
+            change.applied = reload_if_running(socket).await?;
+            print_capability_change(output, &change)
+        }
+        SubnetCommand::List { output } => {
+            let subnets = product::list_subnets(config).await?;
+            match output {
+                OutputFormat::Human => {
+                    if subnets.is_empty() {
+                        println!(
+                            "No local subnets are published.\nPublish one with: sudo ironet subnet publish <prefix>"
+                        );
+                    } else {
+                        for subnet in subnets {
+                            println!("{subnet}");
+                        }
+                    }
+                }
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&subnets)?),
+                OutputFormat::Jsonl => {
+                    for subnet in subnets {
+                        println!("{}", serde_json::to_string(&subnet)?);
+                    }
+                }
+            }
+            Ok(())
+        }
+        SubnetCommand::Unpublish { prefix, output } => {
+            let mut change = product::unpublish_subnet(config, prefix).await?;
+            change.applied = reload_if_running(socket).await?;
+            print_capability_change(output, &change)
+        }
+    }
+}
+
+async fn transit_command(config: &Path, socket: &Path, command: TransitCommand) -> Result<()> {
+    let (enabled, output) = match command {
+        TransitCommand::Enable { output } => (true, output),
+        TransitCommand::Disable { output } => (false, output),
+    };
+    let mut change = product::set_transit(config, enabled).await?;
+    change.applied = reload_if_running(socket).await?;
+    print_capability_change(output, &change)
+}
+
+fn read_invite(invite: Option<String>, invite_file: Option<PathBuf>) -> Result<String> {
+    if let Some(invite) = invite {
+        return Ok(invite);
+    }
+    let Some(path) = invite_file else {
+        ensure!(
+            std::io::stdin().is_terminal(),
+            "join requires an invite URL or --invite-file"
+        );
+        eprint!("Paste invite: ");
+        std::io::stderr().flush()?;
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value)?;
+        ensure!(!value.trim().is_empty(), "invite cannot be empty");
+        return Ok(value.trim().into());
+    };
+    if path == Path::new("-") {
+        let mut value = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)?;
+        Ok(value.trim().into())
+    } else {
+        Ok(std::fs::read_to_string(&path)
+            .with_context(|| format!("failed reading invite {}", path.display()))?
+            .trim()
+            .into())
+    }
+}
+
+fn print_network_summary(
+    summary: &product::NetworkSummary,
+    output: OutputFormat,
+    started: Option<bool>,
+) -> Result<()> {
+    match output {
+        OutputFormat::Human => {
+            if started.is_none() {
+                println!("Network:  {}", summary.network);
+                println!("Node:     {}", summary.node);
+                println!("Address:  {}", summary.address);
+                println!("Endpoint: {}", summary.endpoint_id);
+                return Ok(());
+            } else if summary.created {
+                println!("✓ Created network \"{}\"", summary.network);
+            } else {
+                println!("✓ Joined network \"{}\"", summary.network);
+            }
+            println!("✓ Added this machine as \"{}\"", summary.node);
+            println!("✓ Assigned overlay address {}", summary.address);
+            match started {
+                Some(true) => println!("✓ ironet is running"),
+                Some(false) => println!("State created; service start was skipped"),
+                None => {}
+            }
+            if summary.created {
+                println!("\nAdd another machine:\n  sudo ironet invite create");
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"network": summary, "service_started": started})
+            )?
+        ),
+        OutputFormat::Jsonl => println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"network": summary, "service_started": started})
+            )?
+        ),
+    }
+    Ok(())
+}
+
+fn print_capability_change(output: OutputFormat, change: &product::CapabilityChange) -> Result<()> {
+    match output {
+        OutputFormat::Human => {
+            let verb = if change.changed {
+                "Updated"
+            } else {
+                "Already configured"
+            };
+            println!("✓ {verb} {} {}", change.capability, change.value);
+            if !change.applied {
+                println!("Apply with: sudo systemctl restart ironet");
+            }
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(change)?),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(change)?),
+    }
+    Ok(())
+}
+
+fn print_change(
+    output: OutputFormat,
+    resource: &str,
+    value: &str,
+    changed: bool,
+    applied: bool,
+) -> Result<()> {
+    let change = product::CapabilityChange {
+        capability: resource.into(),
+        value: value.into(),
+        changed,
+        applied,
+    };
+    print_capability_change(output, &change)
+}
+
+async fn reload_if_running(socket: &Path) -> Result<bool> {
+    if !socket.exists() {
+        return Ok(false);
+    }
+    if control::health(socket).await.is_err() {
+        return Ok(false);
+    }
+    control::reload(socket).await?;
+    Ok(true)
+}
+
+async fn start_service(
+    config: &Path,
+    socket: &Path,
+    state_dir: &Path,
+    no_start: bool,
+) -> Result<bool> {
+    if no_start {
+        return Ok(false);
+    }
+    ensure!(
+        config == Path::new("/etc/ironet/config.toml")
+            && socket == Path::new(DEFAULT_CONTROL_SOCKET)
+            && state_dir == Path::new("/var/lib/ironet"),
+        "automatic service start uses the system paths; pass --no-start for custom --config, --socket, or --state-dir values"
+    );
+    let status = tokio::process::Command::new("systemctl")
+        .args(["enable", "--now", "ironet"])
+        .status()
+        .await
+        .context(
+            "failed to start ironet with systemctl; rerun with --no-start on non-systemd hosts",
+        )?;
+    ensure!(
+        status.success(),
+        "systemctl failed to start ironet; inspect `systemctl status ironet`"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if control::health(socket).await.is_ok() {
+            break;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "ironet service started but did not become ready; inspect `systemctl status ironet`"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(true)
+}
+
+async fn stop_service() -> Result<()> {
+    let status = tokio::process::Command::new("systemctl")
+        .args(["disable", "--now", "ironet"])
+        .status()
+        .await
+        .context(
+            "failed to stop ironet with systemctl; rerun with --no-stop on non-systemd hosts",
+        )?;
+    ensure!(status.success(), "systemctl failed to stop ironet");
+    Ok(())
 }
 
 async fn route(config_path: &Path, socket_path: &Path, command: RouteCommand) -> Result<()> {
@@ -1035,332 +1865,6 @@ fn ensure_sysctl(path: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
-async fn init(
-    config_path: &Path,
-    state_dir: &Path,
-    network_id: Option<String>,
-    derp_servers: Vec<String>,
-    non_interactive: bool,
-) -> Result<()> {
-    if config_path.exists() {
-        bail!("configuration already exists at {}", config_path.display());
-    }
-
-    let interactive = !non_interactive && std::io::stdin().is_terminal();
-    let answers = if interactive {
-        println!("Interactive node setup (press Enter to accept an empty/default value).");
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        let mut writer = std::io::stdout();
-        collect_init_answers(&mut reader, &mut writer, network_id, derp_servers)?
-    } else {
-        InitAnswers {
-            network_id,
-            derp_servers,
-            node_addresses: Vec::new(),
-            advertised_prefixes: Vec::new(),
-            transit_enabled: false,
-            peers: Vec::new(),
-        }
-    };
-
-    let identity_file = state_dir.join("identity.key");
-    let network_id = answers
-        .network_id
-        .unwrap_or_else(|| hex::encode(iroh::SecretKey::generate().to_bytes()));
-    let config = Config {
-        network_id,
-        identity_file: identity_file.clone(),
-        bind_addresses: Vec::new(),
-        forbidden_underlay_prefixes: Vec::new(),
-        discovery_enabled: true,
-        attachment: AttachmentMode::Tun,
-        tun_mtu: u16::MAX,
-        max_frame_size: 1400,
-        node_interface: "ironet0".into(),
-        node_addresses: answers.node_addresses,
-        advertised_prefixes: answers.advertised_prefixes,
-        node_info: None,
-        relay: RelayConfig {
-            urls: Vec::new(),
-            discovery_urls: Vec::new(),
-            servers: answers.derp_servers,
-        },
-        peers: answers.peers,
-        links: Vec::new(),
-        route_origins: Vec::new(),
-        routing: RoutingConfig {
-            transit_enabled: answers.transit_enabled,
-            ..RoutingConfig::default()
-        },
-        mesh: Default::default(),
-        packet_policy: PacketPolicyConfig::default(),
-        fec: FecConfig::default(),
-        observability: ObservabilityConfig::default(),
-    };
-    let route_file = config.route_registry_path();
-    if route_file.exists() {
-        bail!("route registry already exists at {}", route_file.display());
-    }
-    config.validate()?;
-    let secret_key = identity::load_or_create(&identity_file)?;
-    config.validate_local_id(secret_key.public())?;
-    let derp_public_key = if config.relay.derp_enabled() {
-        Some(ironet::derp::identity::load_or_create(&config.derp_identity_file())?.public_key())
-    } else {
-        None
-    };
-    if let Some(parent) = config_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let encoded = toml::to_string_pretty(&config)?;
-    deployment::atomic_write(config_path, encoded.as_bytes(), 0o600)?;
-    RouteRegistry::default().write(&route_file)?;
-    deployment::seal(config_path).await?;
-    println!("network_id = {}", config.network_id);
-    println!("endpoint_id = {}", secret_key.public());
-    println!("identity_file = {}", config.identity_file.display());
-    if let Some(key) = derp_public_key {
-        println!("derp_public_key = {key}");
-    }
-    println!("config = {}", config_path.display());
-    println!("route_file = {}", route_file.display());
-    Ok(())
-}
-
-#[derive(Debug)]
-struct InitAnswers {
-    network_id: Option<String>,
-    derp_servers: Vec<String>,
-    node_addresses: Vec<IpNet>,
-    advertised_prefixes: Vec<IpNet>,
-    transit_enabled: bool,
-    peers: Vec<PeerConfig>,
-}
-
-fn collect_init_answers<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    network_id: Option<String>,
-    derp_servers: Vec<String>,
-) -> Result<InitAnswers> {
-    let network_id = match network_id {
-        Some(value) => Some(value),
-        None => non_empty(prompt_line(
-            reader,
-            writer,
-            "Network ID (blank creates a new network): ",
-        )?),
-    };
-    let derp_servers = if derp_servers.is_empty() {
-        prompt_strings(
-            reader,
-            writer,
-            "DERP server URLs, comma-separated (blank disables DERP): ",
-        )?
-    } else {
-        derp_servers
-    };
-    let node_addresses = prompt_values(
-        reader,
-        writer,
-        "Node overlay addresses, comma-separated (for example 21.0.0.2/32): ",
-        "overlay address",
-    )?;
-    let advertised_prefixes = prompt_values(
-        reader,
-        writer,
-        "Local LAN/service prefixes to advertise, comma-separated (optional): ",
-        "advertised prefix",
-    )?;
-    let transit_enabled = prompt_bool(
-        reader,
-        writer,
-        "Forward traffic between overlay peers?",
-        false,
-    )?;
-
-    let mut peers = Vec::new();
-    loop {
-        let endpoint_id = prompt_optional_value::<_, _, EndpointId>(
-            reader,
-            writer,
-            "Bootstrap peer endpoint ID (blank finishes peer setup): ",
-            "endpoint ID",
-        )?;
-        let Some(endpoint_id) = endpoint_id else {
-            break;
-        };
-        let default_name = format!("bootstrap-{}", peers.len() + 1);
-        let entered_name = prompt_line(reader, writer, &format!("Peer name [{default_name}]: "))?;
-        let name = non_empty(entered_name).unwrap_or(default_name);
-        let direct_addresses = prompt_values::<_, _, SocketAddr>(
-            reader,
-            writer,
-            "Direct addresses, comma-separated (optional, address:port): ",
-            "direct address",
-        )?;
-        let (relay_urls, derp_public_key) = if derp_servers.is_empty() {
-            (
-                prompt_strings(
-                    reader,
-                    writer,
-                    "Peer relay URLs, comma-separated (optional; use at least two): ",
-                )?,
-                None,
-            )
-        } else {
-            let key = prompt_required_value::<_, _, DerpPublicKey>(
-                reader,
-                writer,
-                "Peer DERP public key: ",
-                "DERP public key",
-            )?;
-            (Vec::new(), Some(key))
-        };
-        peers.push(PeerConfig {
-            name,
-            endpoint_id,
-            transit_enabled: false,
-            direct_addresses,
-            relay_urls,
-            derp_public_key,
-            allowed_source_prefixes: Vec::new(),
-        });
-    }
-
-    Ok(InitAnswers {
-        network_id,
-        derp_servers,
-        node_addresses,
-        advertised_prefixes,
-        transit_enabled,
-        peers,
-    })
-}
-
-fn prompt_line<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-) -> Result<String> {
-    writer.write_all(prompt.as_bytes())?;
-    writer.flush()?;
-    let mut value = String::new();
-    ensure!(
-        reader.read_line(&mut value)? != 0,
-        "interactive input closed"
-    );
-    Ok(value.trim().to_owned())
-}
-
-fn prompt_strings<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-) -> Result<Vec<String>> {
-    Ok(split_values(&prompt_line(reader, writer, prompt)?))
-}
-
-fn prompt_values<R, W, T>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-    value_name: &str,
-) -> Result<Vec<T>>
-where
-    R: BufRead,
-    W: Write,
-    T: FromStr,
-    T::Err: Display,
-{
-    loop {
-        let values = split_values(&prompt_line(reader, writer, prompt)?);
-        let parsed: Result<Vec<_>, _> = values.iter().map(|value| value.parse::<T>()).collect();
-        match parsed {
-            Ok(values) => return Ok(values),
-            Err(error) => writeln!(writer, "Invalid {value_name}: {error}. Please try again.")?,
-        }
-    }
-}
-
-fn prompt_optional_value<R, W, T>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-    value_name: &str,
-) -> Result<Option<T>>
-where
-    R: BufRead,
-    W: Write,
-    T: FromStr,
-    T::Err: Display,
-{
-    loop {
-        let value = prompt_line(reader, writer, prompt)?;
-        if value.is_empty() {
-            return Ok(None);
-        }
-        match value.parse() {
-            Ok(value) => return Ok(Some(value)),
-            Err(error) => writeln!(writer, "Invalid {value_name}: {error}. Please try again.")?,
-        }
-    }
-}
-
-fn prompt_required_value<R, W, T>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-    value_name: &str,
-) -> Result<T>
-where
-    R: BufRead,
-    W: Write,
-    T: FromStr,
-    T::Err: Display,
-{
-    loop {
-        if let Some(value) = prompt_optional_value(reader, writer, prompt, value_name)? {
-            return Ok(value);
-        }
-        writeln!(writer, "{value_name} is required. Please try again.")?;
-    }
-}
-
-fn prompt_bool<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    prompt: &str,
-    default: bool,
-) -> Result<bool> {
-    let suffix = if default { "[Y/n]" } else { "[y/N]" };
-    loop {
-        let value = prompt_line(reader, writer, &format!("{prompt} {suffix}: "))?;
-        match value.to_ascii_lowercase().as_str() {
-            "" => return Ok(default),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => writeln!(writer, "Enter y or n.")?,
-        }
-    }
-}
-
-fn split_values(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn non_empty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
-}
-
 async fn inspect(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path).await?;
     let secret_key = identity::load(&config.identity_file)?;
@@ -1427,10 +1931,29 @@ async fn inspect(config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use ironet::{
         config::NodeInfo, mesh::MeshStatus, observability::RouteStatus, trace::PingSample,
     };
-    use std::io::Cursor;
+
+    fn assert_command_help_is_complete(command: &clap::Command) {
+        assert!(
+            command.get_about().is_some(),
+            "{} has no command description",
+            command.get_name()
+        );
+        for argument in command.get_arguments() {
+            assert!(
+                argument.get_help().is_some(),
+                "{} argument {} has no description",
+                command.get_name(),
+                argument.get_id()
+            );
+        }
+        for child in command.get_subcommands() {
+            assert_command_help_is_complete(child);
+        }
+    }
 
     fn sample_peer() -> PeerStatus {
         serde_json::from_value(serde_json::json!({
@@ -1503,7 +2026,7 @@ mod tests {
         assert_eq!(cli.config, PathBuf::from("/tmp/node.toml"));
         assert_eq!(cli.socket, PathBuf::from(DEFAULT_CONTROL_SOCKET));
         match cli.command {
-            Command::Trace { output, .. } => assert_eq!(output, OutputFormat::Jsonl),
+            Some(Command::Trace { output, .. }) => assert_eq!(output, OutputFormat::Jsonl),
             command => panic!("expected trace command, got {command:?}"),
         }
     }
@@ -1513,6 +2036,90 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ironet", "status", "--socket", "/tmp/control.sock"]).unwrap();
         assert_eq!(cli.socket, PathBuf::from("/tmp/control.sock"));
+    }
+
+    #[test]
+    fn help_explains_the_network_model_and_common_workflow() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        for required in [
+            "A network contains nodes",
+            "Each node has an overlay address",
+            "ironet network create NAME",
+            "ironet invite create --address IP:PORT",
+            "ironet join INVITE",
+            "--output json",
+        ] {
+            assert!(help.contains(required), "root help is missing {required:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_and_argument_has_a_description() {
+        assert_command_help_is_complete(&Cli::command());
+    }
+
+    #[test]
+    fn product_commands_expose_user_intent_without_init_vocabulary() {
+        let create = Cli::try_parse_from([
+            "ironet",
+            "network",
+            "create",
+            "production",
+            "--node-name",
+            "edge-a",
+            "--no-start",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Some(Command::Network {
+                command: NetworkCommand::Create { .. }
+            })
+        ));
+
+        let join = Cli::try_parse_from([
+            "ironet",
+            "join",
+            "ironet://join/v1/00",
+            "--node-name",
+            "edge-b",
+            "--no-start",
+        ])
+        .unwrap();
+        assert!(matches!(join.command, Some(Command::Join { .. })));
+        assert!(Cli::try_parse_from(["ironet", "init"]).is_err());
+    }
+
+    #[test]
+    fn product_mutations_are_explicit_and_machine_readable() {
+        for args in [
+            vec![
+                "ironet",
+                "subnet",
+                "publish",
+                "192.168.50.0/24",
+                "--output",
+                "json",
+            ],
+            vec!["ironet", "transit", "enable", "--output", "json"],
+            vec![
+                "ironet", "node", "remove", "edge-b", "--yes", "--output", "json",
+            ],
+            vec![
+                "ironet",
+                "invite",
+                "create",
+                "--expires",
+                "30m",
+                "--output",
+                "json",
+            ],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
     }
 
     #[test]
@@ -1531,12 +2138,12 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Command::Ping {
+            Some(Command::Ping {
                 target,
                 count,
                 timeout_ms,
                 output,
-            } => {
+            }) => {
                 assert_eq!(target, "21.0.0.2".parse::<IpAddr>().unwrap());
                 assert_eq!(count, 6);
                 assert_eq!(timeout_ms, 2_500);
@@ -1550,7 +2157,7 @@ mod tests {
     fn peers_supports_json_lines_output() {
         let cli = Cli::try_parse_from(["ironet", "peers", "--output", "jsonl"]).unwrap();
         match cli.command {
-            Command::Peers { output } => assert_eq!(output, OutputFormat::Jsonl),
+            Some(Command::Peers { output }) => assert_eq!(output, OutputFormat::Jsonl),
             command => panic!("expected peers command, got {command:?}"),
         }
     }
@@ -1567,7 +2174,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Route {
+            Some(Command::Route {
                 command:
                     RouteCommand::Import {
                         source,
@@ -1575,7 +2182,7 @@ mod tests {
                         dry_run,
                         defer,
                     },
-            } => {
+            }) => {
                 assert_eq!(source, PathBuf::from("site.routes"));
                 assert!(replace);
                 assert!(!dry_run);
@@ -1587,9 +2194,9 @@ mod tests {
         let cli = Cli::try_parse_from(["ironet", "route", "remove", "10.0.0.0/24", "10.1.0.0/24"])
             .unwrap();
         match cli.command {
-            Command::Route {
+            Some(Command::Route {
                 command: RouteCommand::Remove { selectors, .. },
-            } => assert_eq!(selectors, ["10.0.0.0/24", "10.1.0.0/24"]),
+            }) => assert_eq!(selectors, ["10.0.0.0/24", "10.1.0.0/24"]),
             command => panic!("expected route remove, got {command:?}"),
         }
 
@@ -1605,7 +2212,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Route {
+            Some(Command::Route {
                 command:
                     RouteCommand::Add {
                         prefixes,
@@ -1613,7 +2220,7 @@ mod tests {
                         dry_run,
                         ..
                     },
-            } => {
+            }) => {
                 assert_eq!(prefixes.len(), 2);
                 assert_eq!(owner, "branch-b");
                 assert!(dry_run);
@@ -1629,7 +2236,7 @@ mod tests {
     fn tui_accepts_bounded_refresh_interval_and_top_alias() {
         let cli = Cli::try_parse_from(["ironet", "tui", "--interval-ms", "500"]).unwrap();
         match cli.command {
-            Command::Tui { interval_ms } => assert_eq!(interval_ms, 500),
+            Some(Command::Tui { interval_ms }) => assert_eq!(interval_ms, 500),
             command => panic!("expected tui command, got {command:?}"),
         }
         assert!(Cli::try_parse_from(["ironet", "top"]).is_ok());
@@ -1735,42 +2342,5 @@ mod tests {
         assert_eq!(jsonl.lines().count(), 1);
         let decoded: RuntimeStatus = serde_json::from_str(&jsonl).unwrap();
         assert_eq!(decoded.peers.len(), 1);
-    }
-
-    #[test]
-    fn interactive_init_collects_node_routing_answers() {
-        let input = b"\n\n21.0.0.2/32, 21::2/128\n192.168.20.0/24\ny\n\n";
-        let mut reader = Cursor::new(input);
-        let mut output = Vec::new();
-
-        let answers = collect_init_answers(&mut reader, &mut output, None, Vec::new()).unwrap();
-
-        assert!(answers.network_id.is_none());
-        assert!(answers.derp_servers.is_empty());
-        assert_eq!(answers.node_addresses.len(), 2);
-        assert_eq!(answers.advertised_prefixes.len(), 1);
-        assert!(answers.transit_enabled);
-        assert!(answers.peers.is_empty());
-    }
-
-    #[test]
-    fn interactive_init_reprompts_invalid_values() {
-        let input = b"\nnot-a-prefix\n21.0.0.2/32\n\nmaybe\nn\n\n";
-        let mut reader = Cursor::new(input);
-        let mut output = Vec::new();
-
-        let answers = collect_init_answers(
-            &mut reader,
-            &mut output,
-            Some("shared-network".into()),
-            Vec::new(),
-        )
-        .unwrap();
-
-        assert_eq!(answers.node_addresses.len(), 1);
-        assert!(!answers.transit_enabled);
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Invalid overlay address"));
-        assert!(output.contains("Enter y or n"));
     }
 }

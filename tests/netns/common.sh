@@ -14,7 +14,7 @@ wait_until() {
 }
 
 endpoint_id() {
-  sed -n 's/^endpoint_id = //p' <<<"$1"
+  sed -n 's/^[[:space:]]*"endpoint_id": "\([^"]*\)",*$/\1/p' <<<"$1"
 }
 
 create_namespace() {
@@ -46,12 +46,17 @@ initialize_identity() {
   shift 2
   mkdir -p "/state/$node"
   local output
-  output=$(ironet init \
+  output=$(ironet network create "$network_id" \
     --config "/state/$node/config.toml" \
     --state-dir "/state/$node" \
-    --network-id "$network_id" \
+    --node-name "$node" \
+    --no-start \
+    --output json \
     "$@")
-  endpoint_id "$output"
+  local id
+  id=$(endpoint_id "$output")
+  rm -f "/state/$node/network.toml" "/state/$node/network-authority.key"
+  printf '%s\n' "$id"
 }
 
 seal_node() {

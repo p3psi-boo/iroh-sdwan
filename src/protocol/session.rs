@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -37,6 +38,11 @@ pub struct SessionPolicy {
     pub max_control_size: u32,
     pub features: Vec<FeatureOffer>,
     pub link: Option<LinkAuthentication>,
+    /// Invite used to admit the local identity. Creator and legacy configurations omit it.
+    pub local_invite_id: Option<String>,
+    /// Present only on the network authority. Maps issued invite IDs to member identity and
+    /// revocation state.
+    pub authority_invites: Option<BTreeMap<String, (EndpointId, bool)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +67,8 @@ struct Hello {
     features: Vec<FeatureOffer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invite_id: Option<String>,
     membership_proof: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_proof: Option<[u8; 32]>,
@@ -79,6 +87,8 @@ struct HelloAck {
     features: Vec<NegotiatedFeature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invite_id: Option<String>,
     membership_proof: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_proof: Option<[u8; 32]>,
@@ -157,6 +167,7 @@ async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
         max_control_size: policy.max_control_size.min(hello.max_control_size),
         features,
         link_id: policy.link.as_ref().map(|link| link.link_id.clone()),
+        invite_id: policy.local_invite_id.clone(),
         membership_proof: [0; 32],
         link_proof: None,
     };
@@ -187,6 +198,7 @@ fn make_hello(policy: &SessionPolicy, nonce: [u8; 32]) -> Hello {
         max_control_size: policy.max_control_size,
         features: policy.features.clone(),
         link_id: policy.link.as_ref().map(|link| link.link_id.clone()),
+        invite_id: policy.local_invite_id.clone(),
         membership_proof: [0; 32],
         link_proof: None,
     };
@@ -226,6 +238,7 @@ fn validate_hello(policy: &SessionPolicy, hello: &Hello) -> Result<()> {
         ),
         "invalid v1 network membership proof"
     );
+    validate_invite(policy, hello.invite_id.as_deref())?;
     validate_link_hello(policy, hello)
 }
 
@@ -252,8 +265,25 @@ fn validate_ack(policy: &SessionPolicy, hello: &Hello, ack: &HelloAck) -> Result
         constant_time_eq(&ack.membership_proof, &ack_proof(&policy.network_id, ack)),
         "invalid v1 acknowledgement membership proof"
     );
+    validate_invite(policy, ack.invite_id.as_deref())?;
     validate_selection(&policy.features, &ack.features)?;
     validate_link_ack(policy, ack)
+}
+
+fn validate_invite(policy: &SessionPolicy, invite_id: Option<&str>) -> Result<()> {
+    let Some(invites) = &policy.authority_invites else {
+        return Ok(());
+    };
+    let invite_id = invite_id.context("network authority requires an issued member invite")?;
+    let (member, revoked) = invites
+        .get(invite_id)
+        .with_context(|| format!("unknown member invite {invite_id}"))?;
+    ensure!(!revoked, "member invite {invite_id} has been revoked");
+    ensure!(
+        *member == policy.remote_id,
+        "member invite {invite_id} belongs to a different node identity"
+    );
+    Ok(())
 }
 
 fn validate_link_hello(policy: &SessionPolicy, hello: &Hello) -> Result<()> {
@@ -353,6 +383,7 @@ fn hello_unsigned(hello: &Hello) -> Vec<u8> {
         max_control_size: hello.max_control_size,
         features: hello.features.clone(),
         link_id: hello.link_id.clone(),
+        invite_id: hello.invite_id.clone(),
         membership_proof: [0; 32],
         link_proof: None,
     })
@@ -371,6 +402,7 @@ fn ack_unsigned(ack: &HelloAck) -> Vec<u8> {
         max_control_size: ack.max_control_size,
         features: ack.features.clone(),
         link_id: ack.link_id.clone(),
+        invite_id: ack.invite_id.clone(),
         membership_proof: [0; 32],
         link_proof: None,
     })
@@ -496,6 +528,8 @@ mod tests {
             max_control_size: 32 * 1024,
             features: feature::core_offers(true, true, true, false),
             link: None,
+            local_invite_id: None,
+            authority_invites: None,
         }
     }
 
@@ -509,6 +543,40 @@ mod tests {
             negotiate_connection(client, client_policy),
             negotiate_connection(server, server_policy)
         )
+    }
+
+    #[test]
+    fn authority_binds_invites_to_members_and_enforces_revocation() {
+        let authority = iroh::SecretKey::generate().public();
+        let member = iroh::SecretKey::generate().public();
+        let mut member_policy = policy("network-a", member, authority);
+        member_policy.local_invite_id = Some("invite-a".into());
+        let hello = make_hello(&member_policy, [7; 32]);
+
+        let mut authority_policy = policy("network-a", authority, member);
+        authority_policy.authority_invites =
+            Some(BTreeMap::from([("invite-a".into(), (member, false))]));
+        validate_hello(&authority_policy, &hello).unwrap();
+
+        authority_policy.authority_invites =
+            Some(BTreeMap::from([("invite-a".into(), (member, true))]));
+        assert!(
+            validate_hello(&authority_policy, &hello)
+                .unwrap_err()
+                .to_string()
+                .contains("revoked")
+        );
+
+        authority_policy.authority_invites = Some(BTreeMap::from([(
+            "invite-a".into(),
+            (iroh::SecretKey::generate().public(), false),
+        )]));
+        assert!(
+            validate_hello(&authority_policy, &hello)
+                .unwrap_err()
+                .to_string()
+                .contains("different node identity")
+        );
     }
 
     #[tokio::test]
@@ -686,6 +754,7 @@ mod tests {
             max_control_size: 0,
             features: feature::negotiate(&policy.features, &hello.features).unwrap(),
             link_id: None,
+            invite_id: None,
             membership_proof: [0; 32],
             link_proof: None,
         };

@@ -34,5 +34,6 @@ sysctl --system >/dev/null
 systemctl daemon-reload
 echo "installed $PREFIX/bin/ironet"
 echo "installed $PREFIX/bin/ironetd"
-echo "next: initialise or install $CONFIG_DIR/config.toml, then run:"
-echo "  systemctl enable --now ironet"
+echo "next: create a network or join one with an invite:"
+echo "  ironet network create <name>"
+echo "  ironet join <invite>"

@@ -15,6 +15,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+node_a_status_ready() {
+  ctl ns-a node-a status --output json | jq -e '.ready' >/dev/null
+}
+
 write_config() {
   local node=$1
   local address_v4=$2
@@ -168,8 +172,8 @@ wait_until "aggregation flood queue drain" ip netns exec ns-a \
   ping -c 1 -W 2 -M do -s 1200 -I 10.200.0.1 10.200.0.3
 ip netns exec ns-a ping -c 2 -W 2 -M do -s 1200 -I 10.200.0.1 10.200.0.3
 ip netns exec ns-a ping -6 -c 2 -W 2 -s 1200 -I fd73:9db8:4200::1 fd73:9db8:4200::3
-ctl ns-a node-a health --quiet
-ctl ns-a node-a status --output json | grep -q '"ready": true'
+wait_until "node-a health after aggregation flood" ctl ns-a node-a health --quiet
+wait_until "node-a published ready status" node_a_status_ready
 ctl ns-a node-a peers --output json | grep -q '"name": "node-b"'
 timeout 3s script -qec \
   'ip netns exec ns-a ironet --config /state/node-a/config.toml --socket /state/node-a/control.sock tui --interval-ms 200' \

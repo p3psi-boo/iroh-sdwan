@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown},
     path::{Path, PathBuf},
 };
 
@@ -85,16 +85,37 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed creating {}", parent.display()))?;
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!("refusing to replace non-regular file {}", path.display());
+            }
+            Some((
+                metadata.uid(),
+                metadata.gid(),
+                metadata.permissions().mode() & 0o777,
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed inspecting {}", path.display()));
+        }
+    };
     let temporary = temporary_path(path);
     let _ = std::fs::remove_file(&temporary);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(mode)
+        .mode(existing.map_or(mode, |(_, _, mode)| mode))
         .open(&temporary)
         .with_context(|| format!("failed creating {}", temporary.display()))?;
     file.write_all(contents)?;
     file.sync_all()?;
+    if let Some((uid, gid, mode)) = existing {
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
+        chown(&temporary, Some(uid), Some(gid))
+            .with_context(|| format!("failed preserving ownership for {}", path.display()))?;
+    }
     std::fs::rename(&temporary, path)
         .with_context(|| format!("failed replacing {}", path.display()))?;
     File::open(parent)?.sync_all()?;
@@ -126,6 +147,19 @@ mod tests {
         atomic_write(&path, b"first", 0o600).unwrap();
         atomic_write(&path, b"second", 0o600).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn atomic_write_preserves_existing_access_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        atomic_write(&path, b"first", 0o640).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        atomic_write(&path, b"second", 0o600).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
     }
 
     #[tokio::test]

@@ -45,47 +45,47 @@ ETA = RTT + 抖动 + 丢包惩罚
 
 ## 安装与首次运行
 
-运行节点需要：
-
-- Linux 主机、`/dev/net/tun`、`iproute2` 和 `iptables`；
-- 启用 systemd 服务时，需要 systemd、`systemd-sysusers` 或等价的系统用户管理工具；
-- 守护进程需要 `CAP_NET_ADMIN`；运行 `doctor`、初始化和服务管理命令通常使用 `sudo`。
-
-Debian 包安装：
+运行节点需要 Linux、`/dev/net/tun`、`iproute2`、`iptables` 和 `CAP_NET_ADMIN`。
+安装 Debian 包或从源码安装：
 
 ```bash
 sudo dpkg -i ./ironet_0.1.0_amd64.deb
-```
-
-从源码安装：
-
-```bash
+# 或
 nix develop -c cargo build --locked --release
 sudo scripts/install.sh
 ```
 
-首次节点使用交互式初始化。第一个节点不传入 `--network-id`，命令会生成并输出网络 ID；其余节点传入相同的值。
+第一台机器创建网络。节点名和覆盖地址默认根据主机自动生成；命令会生成身份、原子写入并密封配置，然后启动服务：
 
 ```bash
-sudo ironet init \
-  --config /etc/ironet/config.toml \
-  --state-dir /var/lib/ironet
-
-sudo ironet init \
-  --config /etc/ironet/config.toml \
-  --state-dir /var/lib/ironet \
-  --network-id "第一个节点输出的网络 ID"
+sudo ironet network create production
 ```
 
-初始化后，根据部署拓扑补充地址、前缀和引导 peer。每次手工修改配置后都必须重新生成完整性摘要：
+创建一个一小时有效的邀请：
 
 ```bash
-sudo ironet validate --config /etc/ironet/config.toml
-sudo ironet seal-config --config /etc/ironet/config.toml
-sudo systemctl enable --now ironet
+sudo ironet invite create --expires 1h
 ```
 
-两节点静态示例、配置字段说明和配置变更方式见 [快速开始](docs/快速开始.md) 与 [配置参考](docs/配置参考.md)。
+在另一台机器粘贴输出的 `ironet://join/v1/...` 地址：
+
+```bash
+sudo ironet join 'ironet://join/v1/...'
+```
+
+需要向网络发布本地 LAN 时再启用该能力：
+
+```bash
+sudo ironet subnet publish 192.168.50.0/24
+```
+
+需要让本机承担 overlay 中转时执行：
+
+```bash
+sudo ironet transit enable
+```
+
+无需手工复制 network ID、endpoint ID 或 DERP key，也无需编辑或密封 TOML。无人值守部署可用 `--output json`、`--invite-file` 和 `--no-start`。完整流程见 [快速开始](docs/快速开始.md)。
 
 ## 日常操作
 

@@ -18,6 +18,7 @@ pub mod mesh;
 pub mod observability;
 pub mod packet;
 pub mod path_selection;
+pub mod product;
 pub mod protocol;
 pub mod routes;
 pub mod runtime;

@@ -21,7 +21,7 @@ trap cleanup EXIT
 extract_value() {
   local name=$1
   local output=$2
-  sed -n "s/^${name} = //p" <<<"$output"
+  sed -n "s/^[[:space:]]*\"${name}\": \"\([^\"]*\)\",*$/\1/p" <<<"$output"
 }
 
 route_epoch() {
@@ -138,15 +138,21 @@ kill -0 "$PID_DERP_2"
 echo "==> creating node and DERP identities"
 declare -A IDS DERP_KEYS
 for node in node-a node-b; do
-  output=$(ironet init \
+  output=$(ironet network create netns-derp-two-node \
     --config "/state/$node/config.toml" \
     --state-dir "/state/$node" \
-    --network-id netns-derp-two-node \
+    --node-name "$node" \
+    --no-start \
+    --output json \
     --derp-server http://derp \
     --derp-server http://derp2)
   IDS[$node]=$(extract_value endpoint_id "$output")
-  DERP_KEYS[$node]=$(extract_value derp_public_key "$output")
+  DERP_KEYS[$node]=$(ironet inspect \
+    --config "/state/$node/config.toml" \
+    --state-dir "/state/$node" \
+    | sed -n 's/^derp_public_key: //p')
   test -n "${IDS[$node]}" && test -n "${DERP_KEYS[$node]}"
+  rm -f "/state/$node/network.toml" "/state/$node/network-authority.key"
 done
 write_config node-a 10.211.0.1 fd73:9db8:4211::1 \
   node-b "${IDS[node-b]}" "${DERP_KEYS[node-b]}" \

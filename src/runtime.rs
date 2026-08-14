@@ -2307,6 +2307,7 @@ impl Drop for DynamicPeerTasks {
 
 struct DynamicMeshManager {
     config: Config,
+    removed_nodes: HashSet<EndpointId>,
     local_id: EndpointId,
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
@@ -2347,6 +2348,7 @@ impl DynamicMeshManager {
         )?;
         Ok(Arc::new(Self {
             config: config.clone(),
+            removed_nodes: crate::product::removed_node_ids(&config.identity_file),
             local_id,
             endpoint,
             alpn,
@@ -2485,6 +2487,7 @@ impl DynamicMeshManager {
             .iter()
             .filter(|presence| !dynamic_ids.contains(&presence.body.owner))
             .filter(|presence| !pinned.contains(&presence.body.owner))
+            .filter(|presence| !self.removed_nodes.contains(&presence.body.owner))
             .filter(|presence| presence_path(presence).is_some())
             .cloned()
             .collect::<Vec<_>>();
@@ -2518,6 +2521,7 @@ impl DynamicMeshManager {
         let eligible = presences
             .iter()
             .filter(|presence| !unhealthy_ids.contains(&presence.body.owner))
+            .filter(|presence| !self.removed_nodes.contains(&presence.body.owner))
             // Only the lower EndpointId initiates the canonical connection.
             // The other side creates its bounded adjacency in accept_unknown.
             .filter(|presence| {
@@ -2552,6 +2556,10 @@ impl DynamicMeshManager {
 
     async fn accept_unknown(&self, connection: Connection) -> Result<()> {
         let endpoint_id = connection.remote_id();
+        ensure!(
+            !self.removed_nodes.contains(&endpoint_id),
+            "node membership has been removed"
+        );
         let session = negotiate_connection(
             &connection,
             &SessionPolicy {
@@ -2567,6 +2575,8 @@ impl DynamicMeshManager {
                     false,
                 ),
                 link: None,
+                local_invite_id: crate::product::local_invite_id(&self.config.identity_file),
+                authority_invites: crate::product::authority_invites(&self.config.identity_file),
             },
         )
         .await
@@ -2618,6 +2628,10 @@ impl DynamicMeshManager {
         negotiated: Option<NegotiatedSession>,
     ) -> Result<()> {
         let endpoint_id = presence.body.owner;
+        ensure!(
+            !self.removed_nodes.contains(&endpoint_id),
+            "node membership has been removed"
+        );
         if let Some(peer) = self.peers.read().await.get(&endpoint_id).cloned() {
             if let Some(connection) = connection {
                 peer.install_connection_with_session(connection, negotiated)
@@ -3008,6 +3022,8 @@ impl Peer {
                         secret,
                     }
                 }),
+                local_invite_id: crate::product::local_invite_id(&config.identity_file),
+                authority_invites: crate::product::authority_invites(&config.identity_file),
             },
             negotiated_session: StdRwLock::new(None),
             inbound_packets: services.inbound_packets,

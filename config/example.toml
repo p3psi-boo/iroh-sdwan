@@ -1,4 +1,4 @@
-# `ironet init` 输出的共享网络加入密钥。所有节点使用同一值，
+# ironet 内部维护的网络准入密钥。正常部署使用 `network create` 和邀请加入，
 # 不要将其提交到公开配置仓库。
 network_id = "REPLACE_WITH_RANDOM_NETWORK_ID"
 identity_file = "/var/lib/ironet/identity.key"
