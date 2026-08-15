@@ -1883,6 +1883,7 @@ mod tests {
                 description: None,
                 metadata: BTreeMap::from([("site".into(), "test".into())]),
             }),
+            path_selection: Default::default(),
             relay: RelayConfig::default(),
             peers: Vec::new(),
             links: Vec::new(),

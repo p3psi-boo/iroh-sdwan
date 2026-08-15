@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use ipnet::{IpNet, Ipv4Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
@@ -27,9 +27,22 @@ use crate::{
 pub const PRODUCT_STATE_VERSION: u8 = 1;
 pub const INVITE_VERSION: u8 = 1;
 pub const DEFAULT_ADDRESS_POOL: &str = "100.64.0.0/10";
+/// Compatibility pool used when reading product state or V1 invites created
+/// before Overlay IPv6 was represented explicitly.
+pub const DEFAULT_IPV6_ADDRESS_POOL: &str = "fd42:6972:6f68::/64";
 const PRODUCT_STATE_FILE: &str = "network.toml";
 const AUTHORITY_KEY_FILE: &str = "network-authority.key";
 const DEFAULT_INVITE_LIFETIME_SECS: u64 = 3_600;
+
+fn default_ipv6_address_pool() -> Ipv6Net {
+    DEFAULT_IPV6_ADDRESS_POOL
+        .parse()
+        .expect("default Overlay IPv6 pool is valid")
+}
+
+fn is_default_ipv6_address_pool(pool: &Ipv6Net) -> bool {
+    *pool == default_ipv6_address_pool()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +56,10 @@ pub struct ProductState {
     pub authority_key_file: Option<PathBuf>,
     pub address_pool: Ipv4Net,
     pub local_address: IpNet,
+    #[serde(default = "default_ipv6_address_pool")]
+    pub ipv6_address_pool: Ipv6Net,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_ipv6_address: Option<IpNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_invite_id: Option<String>,
     pub created_unix_secs: u64,
@@ -87,6 +104,11 @@ pub struct InvitePayload {
     pub network_secret: String,
     pub authority: EndpointId,
     pub address_pool: Ipv4Net,
+    #[serde(
+        default = "default_ipv6_address_pool",
+        skip_serializing_if = "is_default_ipv6_address_pool"
+    )]
+    pub ipv6_address_pool: Ipv6Net,
     pub issued_unix_secs: u64,
     pub expires_unix_secs: u64,
     pub capabilities: Vec<String>,
@@ -123,6 +145,7 @@ pub struct NetworkSummary {
     pub node: String,
     pub endpoint_id: String,
     pub address: String,
+    pub addresses: Vec<String>,
     pub config: String,
     pub state: String,
     pub created: bool,
@@ -155,6 +178,7 @@ pub struct CapabilityChange {
 pub struct CreateNetworkOptions {
     pub node_name: Option<String>,
     pub address_pool: Option<Ipv4Net>,
+    pub ipv6_address_pool: Option<Ipv6Net>,
     pub derp_servers: Vec<String>,
     pub bind_addresses: Vec<SocketAddr>,
     pub reuse_identity: bool,
@@ -211,6 +235,7 @@ pub async fn create_network(
     let CreateNetworkOptions {
         node_name,
         address_pool,
+        ipv6_address_pool,
         derp_servers,
         bind_addresses,
         reuse_identity,
@@ -240,6 +265,13 @@ pub async fn create_network(
                 existing.address_pool == address_pool,
                 "network already uses address pool {}",
                 existing.address_pool
+            );
+        }
+        if let Some(ipv6_address_pool) = ipv6_address_pool {
+            ensure!(
+                existing.ipv6_address_pool == ipv6_address_pool,
+                "network already uses IPv6 address pool {}",
+                existing.ipv6_address_pool
             );
         }
         return show_network(config_path, state_dir).await;
@@ -281,15 +313,24 @@ pub async fn create_network(
         }
         None => select_address_pool(authority_key.public())?,
     };
+    let ipv6_pool = match ipv6_address_pool {
+        Some(pool) => {
+            validate_ipv6_address_pool(pool)?;
+            ensure_local_ipv6_pool_available(pool)?;
+            pool
+        }
+        None => select_ipv6_address_pool(authority_key.public())?,
+    };
     let network_secret = hex::encode(SecretKey::generate().to_bytes());
     let network_uid = short_network_uid(authority_key.public());
     let address = allocate_address(pool, node_key.public());
+    let ipv6_address = allocate_ipv6_address(ipv6_pool, node_key.public());
     let now = now_unix()?;
     let config = base_config(
         network_secret,
         identity_file.clone(),
         node_name.clone(),
-        address,
+        vec![address, ipv6_address],
         derp_servers,
         bind_addresses,
         Vec::new(),
@@ -305,6 +346,8 @@ pub async fn create_network(
         authority_key_file: Some(authority_file.clone()),
         address_pool: pool,
         local_address: address,
+        ipv6_address_pool: ipv6_pool,
+        local_ipv6_address: Some(ipv6_address),
         join_invite_id: None,
         created_unix_secs: now,
         invites: Vec::new(),
@@ -328,6 +371,7 @@ pub async fn create_network(
         node: node_name,
         endpoint_id: node_key.public().to_string(),
         address: address.to_string(),
+        addresses: vec![address.to_string(), ipv6_address.to_string()],
         config: config_path.display().to_string(),
         state: product_file.display().to_string(),
         created: true,
@@ -379,6 +423,7 @@ pub fn create_invite(
         network_secret: config.network_id.clone(),
         authority: state.authority,
         address_pool: state.address_pool,
+        ipv6_address_pool: state.ipv6_address_pool,
         issued_unix_secs: now,
         expires_unix_secs: expires,
         capabilities: vec!["join".into()],
@@ -465,10 +510,17 @@ pub async fn join_network(
     let node_name = node_name.unwrap_or_else(default_node_name);
     validate_display_name(&node_name, "node name")?;
     validate_address_pool(payload.address_pool)?;
+    validate_ipv6_address_pool(payload.ipv6_address_pool)?;
     ensure_local_pool_available(payload.address_pool).with_context(|| {
         format!(
             "invite address pool {} conflicts with this machine; recreate the network with a different --address-pool",
             payload.address_pool
+        )
+    })?;
+    ensure_local_ipv6_pool_available(payload.ipv6_address_pool).with_context(|| {
+        format!(
+            "invite IPv6 address pool {} conflicts with this machine; recreate the network with a different --ipv6-address-pool",
+            payload.ipv6_address_pool
         )
     })?;
 
@@ -507,6 +559,7 @@ pub async fn join_network(
         node_key.public()
     );
     let address = allocate_address(payload.address_pool, node_key.public());
+    let ipv6_address = allocate_ipv6_address(payload.ipv6_address_pool, node_key.public());
     let peer = PeerConfig {
         name: payload.bootstrap.name.clone(),
         endpoint_id: payload.bootstrap.endpoint_id,
@@ -520,7 +573,7 @@ pub async fn join_network(
         payload.network_secret,
         identity_file,
         node_name.clone(),
-        address,
+        vec![address, ipv6_address],
         Vec::new(),
         Vec::new(),
         vec![peer],
@@ -536,6 +589,8 @@ pub async fn join_network(
         authority_key_file: None,
         address_pool: payload.address_pool,
         local_address: address,
+        ipv6_address_pool: payload.ipv6_address_pool,
+        local_ipv6_address: Some(ipv6_address),
         join_invite_id: Some(payload.id.clone()),
         created_unix_secs: now,
         invites: Vec::new(),
@@ -557,6 +612,7 @@ pub async fn join_network(
         node: node_name,
         endpoint_id: node_key.public().to_string(),
         address: address.to_string(),
+        addresses: vec![address.to_string(), ipv6_address.to_string()],
         config: config_path.display().to_string(),
         state: product_file.display().to_string(),
         created: false,
@@ -611,6 +667,11 @@ pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<Networ
         node: state.node_name,
         endpoint_id: key.public().to_string(),
         address: state.local_address.to_string(),
+        addresses: config
+            .node_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         config: config_path.display().to_string(),
         state: state_path(state_dir).display().to_string(),
         created: state.authority_key_file.is_some(),
@@ -893,11 +954,12 @@ fn base_config(
     network_secret: String,
     identity_file: PathBuf,
     node_name: String,
-    address: IpNet,
+    addresses: Vec<IpNet>,
     derp_servers: Vec<String>,
     bind_addresses: Vec<SocketAddr>,
     peers: Vec<PeerConfig>,
 ) -> Config {
+    let iroh_relay_enabled = peers.iter().any(|peer| !peer.relay_urls.is_empty());
     Config {
         network_id: network_secret,
         identity_file,
@@ -908,14 +970,16 @@ fn base_config(
         tun_mtu: u16::MAX,
         max_frame_size: 1400,
         node_interface: "ironet0".into(),
-        node_addresses: vec![address],
+        node_addresses: addresses,
         advertised_prefixes: Vec::new(),
         node_info: Some(NodeInfo {
             name: node_name,
             description: None,
             metadata: BTreeMap::new(),
         }),
+        path_selection: Default::default(),
         relay: RelayConfig {
+            iroh_relay_enabled,
             urls: Vec::new(),
             discovery_urls: Vec::new(),
             servers: derp_servers,
@@ -1066,6 +1130,23 @@ fn validate_address_pool(pool: Ipv4Net) -> Result<()> {
     Ok(())
 }
 
+fn validate_ipv6_address_pool(pool: Ipv6Net) -> Result<()> {
+    ensure!(
+        pool.prefix_len() <= 120,
+        "IPv6 address pool must provide at least 256 addresses"
+    );
+    ensure!(
+        pool.prefix_len() >= 48,
+        "IPv6 address pool is too broad; use a /48 to /120 ULA prefix"
+    );
+    let ula: Ipv6Net = "fc00::/7".parse().expect("valid ULA prefix");
+    ensure!(
+        ula.contains(&pool.network()),
+        "IPv6 address pool must use the ULA range fc00::/7"
+    );
+    Ok(())
+}
+
 fn select_address_pool(seed: EndpointId) -> Result<Ipv4Net> {
     let routes = local_ipv4_routes();
     let start = usize::from(blake3::hash(seed.as_bytes()).as_bytes()[0]);
@@ -1095,12 +1176,48 @@ fn select_address_pool(seed: EndpointId) -> Result<Ipv4Net> {
         .context("no collision-free automatic IPv4 address pool is available; pass --address-pool")
 }
 
+fn select_ipv6_address_pool(seed: EndpointId) -> Result<Ipv6Net> {
+    let routes = local_ipv6_routes();
+    (0_u16..=u16::MAX)
+        .map(|subnet| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"ironet-auto-ipv6-pool-v1\0");
+            hasher.update(seed.as_bytes());
+            hasher.update(&subnet.to_be_bytes());
+            let hash = hasher.finalize();
+            let bytes = hash.as_bytes();
+            let address = Ipv6Addr::from([
+                0xfd, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ]);
+            Ipv6Net::new(address, 64).expect("valid automatic IPv6 pool")
+        })
+        .find(|candidate| {
+            !routes
+                .iter()
+                .any(|route| ipv6_nets_overlap(*candidate, *route))
+        })
+        .context(
+            "no collision-free automatic IPv6 address pool is available; pass --ipv6-address-pool",
+        )
+}
+
 fn ensure_local_pool_available(pool: Ipv4Net) -> Result<()> {
     if let Some(route) = local_ipv4_routes()
         .into_iter()
         .find(|route| ipv4_nets_overlap(pool, *route))
     {
         bail!("address pool {pool} overlaps local route {route}");
+    }
+    Ok(())
+}
+
+fn ensure_local_ipv6_pool_available(pool: Ipv6Net) -> Result<()> {
+    if let Some(route) = local_ipv6_routes()
+        .into_iter()
+        .find(|route| ipv6_nets_overlap(pool, *route))
+    {
+        bail!("IPv6 address pool {pool} overlaps local route {route}");
     }
     Ok(())
 }
@@ -1130,7 +1247,40 @@ fn local_ipv4_routes() -> Vec<Ipv4Net> {
         .collect()
 }
 
+fn local_ipv6_routes() -> Vec<Ipv6Net> {
+    let Ok(output) = std::process::Command::new("ip")
+        .args(["-6", "route", "show", "table", "all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let ula: Ipv6Net = "fc00::/7".parse().expect("valid ULA prefix");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|value| *value != "default")
+        .filter_map(|value| {
+            value.parse::<Ipv6Net>().ok().or_else(|| {
+                value
+                    .parse::<Ipv6Addr>()
+                    .ok()
+                    .map(|address| Ipv6Net::new(address, 128).expect("valid IPv6 host route"))
+            })
+        })
+        // Ignore default and split-default routes installed by general VPNs.
+        // Only ULA-specific routes can conflict with an Overlay ULA pool.
+        .filter(|route| route.prefix_len() >= ula.prefix_len() && ula.contains(&route.network()))
+        .collect()
+}
+
 fn ipv4_nets_overlap(left: Ipv4Net, right: Ipv4Net) -> bool {
+    left.contains(&right.network()) || right.contains(&left.network())
+}
+
+fn ipv6_nets_overlap(left: Ipv6Net, right: Ipv6Net) -> bool {
     left.contains(&right.network()) || right.contains(&left.network())
 }
 
@@ -1151,6 +1301,21 @@ fn allocate_address(pool: Ipv4Net, endpoint: EndpointId) -> IpNet {
     let host = 1 + raw % usable;
     let network = u32::from(pool.network());
     IpNet::new(IpAddr::V4(Ipv4Addr::from(network | host)), 32).expect("valid IPv4 host")
+}
+
+fn allocate_ipv6_address(pool: Ipv6Net, endpoint: EndpointId) -> IpNet {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ironet-auto-ipv6-address-v1\0");
+    hasher.update(pool.to_string().as_bytes());
+    hasher.update(endpoint.as_bytes());
+    let hash = hasher.finalize();
+    let raw = u128::from_be_bytes(hash.as_bytes()[..16].try_into().expect("sixteen bytes"));
+    let host_bits = 128 - pool.prefix_len();
+    let host_mask = (1_u128 << host_bits) - 1;
+    let usable = host_mask.saturating_sub(1).max(1);
+    let host = 1 + raw % usable;
+    let network = u128::from(pool.network());
+    IpNet::new(IpAddr::V6(Ipv6Addr::from(network | host)), 128).expect("valid IPv6 host")
 }
 
 fn short_network_uid(authority: EndpointId) -> String {
@@ -1196,6 +1361,7 @@ mod tests {
             network_secret: "secret".into(),
             authority: authority.public(),
             address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
+            ipv6_address_pool: default_ipv6_address_pool(),
             issued_unix_secs: 1,
             expires_unix_secs: u64::MAX,
             capabilities: vec!["join".into()],
@@ -1223,6 +1389,67 @@ mod tests {
     }
 
     #[test]
+    fn invite_without_ipv6_pool_remains_valid_and_gets_compatibility_pool() {
+        #[derive(Serialize)]
+        struct LegacyInvitePayload {
+            version: u8,
+            id: String,
+            network_name: String,
+            network_uid: String,
+            network_secret: String,
+            authority: EndpointId,
+            address_pool: Ipv4Net,
+            issued_unix_secs: u64,
+            expires_unix_secs: u64,
+            capabilities: Vec<String>,
+            member_endpoint_id: EndpointId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            member_secret: Option<String>,
+            bootstrap: InviteBootstrap,
+        }
+
+        #[derive(Serialize)]
+        struct LegacySignedInvite {
+            payload: LegacyInvitePayload,
+            signature: Vec<u8>,
+        }
+
+        let authority = SecretKey::generate();
+        let payload = LegacyInvitePayload {
+            version: INVITE_VERSION,
+            id: "legacy".into(),
+            network_name: "production".into(),
+            network_uid: authority.public().to_string(),
+            network_secret: "secret".into(),
+            authority: authority.public(),
+            address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
+            issued_unix_secs: 1,
+            expires_unix_secs: u64::MAX,
+            capabilities: vec!["join".into()],
+            member_endpoint_id: SecretKey::generate().public(),
+            member_secret: None,
+            bootstrap: InviteBootstrap {
+                name: "edge-a".into(),
+                endpoint_id: SecretKey::generate().public(),
+                direct_addresses: Vec::new(),
+                relay_urls: Vec::new(),
+                derp_public_key: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope = LegacySignedInvite {
+            signature: authority.sign(&bytes).to_bytes().to_vec(),
+            payload,
+        };
+        let token = format!(
+            "ironet://join/v1/{}",
+            hex::encode(serde_json::to_vec(&envelope).unwrap())
+        );
+        let decoded = decode_invite(&token).unwrap();
+        assert_eq!(decoded.ipv6_address_pool, default_ipv6_address_pool());
+    }
+
+    #[test]
     fn deterministic_addresses_stay_inside_pool() {
         let pool: Ipv4Net = "100.64.0.0/10".parse().unwrap();
         let key = SecretKey::generate();
@@ -1234,6 +1461,37 @@ mod tests {
         };
         assert!(pool.contains(&address));
         assert_eq!(first.prefix_len(), 32);
+
+        let ipv6_pool: Ipv6Net = "fd42:6972:6f68::/64".parse().unwrap();
+        let first_ipv6 = allocate_ipv6_address(ipv6_pool, key.public());
+        let second_ipv6 = allocate_ipv6_address(ipv6_pool, key.public());
+        assert_eq!(first_ipv6, second_ipv6);
+        let IpAddr::V6(address) = first_ipv6.addr() else {
+            panic!("expected IPv6 address")
+        };
+        assert!(ipv6_pool.contains(&address));
+        assert_eq!(first_ipv6.prefix_len(), 128);
+    }
+
+    #[test]
+    fn legacy_product_state_loads_without_ipv6_fields() {
+        let authority = SecretKey::generate();
+        let state: ProductState = toml::from_str(&format!(
+            r#"
+version = 1
+network_name = "production"
+network_uid = "{authority}"
+node_name = "edge-a"
+authority = "{authority}"
+address_pool = "100.64.0.0/10"
+local_address = "100.64.0.1/32"
+created_unix_secs = 1
+"#,
+            authority = authority.public()
+        ))
+        .unwrap();
+        assert_eq!(state.ipv6_address_pool, default_ipv6_address_pool());
+        assert_eq!(state.local_ipv6_address, None);
     }
 
     #[test]
@@ -1285,6 +1543,37 @@ mod tests {
         assert!(!second.created);
         assert_eq!(first.network_id, second.network_id);
         assert_ne!(first.address, second.address);
+        assert_eq!(first.addresses.len(), 2);
+        assert_eq!(second.addresses.len(), 2);
+        assert!(
+            first
+                .addresses
+                .iter()
+                .any(|address| address.ends_with("/32"))
+        );
+        assert!(
+            first
+                .addresses
+                .iter()
+                .any(|address| address.ends_with("/128"))
+        );
+        let joiner_runtime = Config::load(&joiner_config).await.unwrap();
+        assert_eq!(
+            joiner_runtime
+                .node_addresses
+                .iter()
+                .filter(|address| address.addr().is_ipv4())
+                .count(),
+            1
+        );
+        assert_eq!(
+            joiner_runtime
+                .node_addresses
+                .iter()
+                .filter(|address| address.addr().is_ipv6())
+                .count(),
+            1
+        );
 
         publish_subnet(&creator_config, "192.168.50.0/24".parse().unwrap())
             .await
@@ -1344,6 +1633,7 @@ mod tests {
             network_secret: "secret".into(),
             authority: authority.public(),
             address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
+            ipv6_address_pool: default_ipv6_address_pool(),
             issued_unix_secs: 1,
             expires_unix_secs: u64::MAX,
             capabilities: vec!["join".into()],

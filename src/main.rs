@@ -283,10 +283,10 @@ enum NetworkCommand {
     /// Create a network and configure this machine as its first node.
     ///
     /// Writes the node identity, network state, daemon configuration, route file, and
-    /// configuration digest. The address pool and node name use defaults when omitted.
+    /// configuration digest. The IPv4/IPv6 address pools and node name use defaults when omitted.
     /// Starts the system service unless `--no-start` is set.
     #[command(
-        after_help = "Examples:\n  ironet network create office\n  ironet network create office --node-name gateway-a --listen 203.0.113.10:4000\n  ironet network create lab --address-pool 10.42.0.0/16 --no-start --output json"
+        after_help = "Examples:\n  ironet network create office\n  ironet network create office --node-name gateway-a --listen 203.0.113.10:4000\n  ironet network create lab --address-pool 10.42.0.0/16 --ipv6-address-pool fd42:6972:6f68::/64 --no-start --output json"
     )]
     Create {
         /// Name used to identify the network in local status and invites.
@@ -298,6 +298,9 @@ enum NetworkCommand {
         /// IPv4 CIDR used for overlay addresses; the default is selected automatically.
         #[arg(long, value_name = "CIDR")]
         address_pool: Option<ipnet::Ipv4Net>,
+        /// IPv6 ULA CIDR used for overlay addresses; the default is selected automatically.
+        #[arg(long, value_name = "CIDR")]
+        ipv6_address_pool: Option<ipnet::Ipv6Net>,
         /// Add a Tailscale DERP server URL; repeat the option for multiple servers.
         #[arg(long = "derp-server", value_name = "URL")]
         derp_servers: Vec<String>,
@@ -647,7 +650,7 @@ async fn overview(config: &Path, socket: &Path, state_dir: &Path) -> Result<()> 
     let summary = product::show_network(config, state_dir).await?;
     println!("Network: {}", summary.network);
     println!("Node:    {}", summary.node);
-    println!("Address: {}", summary.address);
+    println!("Addresses: {}", summary.addresses.join(", "));
     match control::snapshot(socket).await {
         Ok(status) => {
             println!(
@@ -704,6 +707,7 @@ async fn network_command(
             name,
             node_name,
             address_pool,
+            ipv6_address_pool,
             derp_servers,
             bind_addresses,
             reuse_identity,
@@ -717,6 +721,7 @@ async fn network_command(
                 product::CreateNetworkOptions {
                     node_name,
                     address_pool,
+                    ipv6_address_pool,
                     derp_servers,
                     bind_addresses,
                     reuse_identity,
@@ -1003,7 +1008,7 @@ fn print_network_summary(
             if started.is_none() {
                 println!("Network:  {}", summary.network);
                 println!("Node:     {}", summary.node);
-                println!("Address:  {}", summary.address);
+                println!("Addresses: {}", summary.addresses.join(", "));
                 println!("Endpoint: {}", summary.endpoint_id);
                 return Ok(());
             } else if summary.created {
@@ -1012,7 +1017,10 @@ fn print_network_summary(
                 println!("✓ Joined network \"{}\"", summary.network);
             }
             println!("✓ Added this machine as \"{}\"", summary.node);
-            println!("✓ Assigned overlay address {}", summary.address);
+            println!(
+                "✓ Assigned overlay addresses {}",
+                summary.addresses.join(", ")
+            );
             match started {
                 Some(true) => println!("✓ ironet is running"),
                 Some(false) => println!("State created; service start was skipped"),
@@ -1722,6 +1730,14 @@ async fn validate(config_path: &Path) -> Result<()> {
     println!("route_file = {}", config.route_registry_path().display());
     println!("transit_enabled = {}", config.routing.transit_enabled);
     println!("nat_enabled = {}", config.routing.nat_enabled);
+    println!(
+        "preferred_ip_family = {}",
+        match config.path_selection.prefer {
+            ironet::config::IpFamilyPreference::Ipv4 => "ipv4",
+            ironet::config::IpFamilyPreference::Ipv6 => "ipv6",
+        }
+    );
+    println!("iroh_relay_enabled = {}", config.relay.iroh_relay_enabled);
     Ok(())
 }
 

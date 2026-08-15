@@ -49,6 +49,10 @@ pub struct Config {
     pub advertised_prefixes: Vec<IpNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_info: Option<NodeInfo>,
+    /// Selection policy for concurrently available IPv4 and IPv6 underlay
+    /// paths. The preference is applied only while path quality is comparable.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub path_selection: PathSelectionConfig,
     #[serde(default, skip_serializing_if = "is_default")]
     pub relay: RelayConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,6 +85,23 @@ pub enum AttachmentMode {
     #[default]
     Tun,
     None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpFamilyPreference {
+    Ipv4,
+    #[default]
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathSelectionConfig {
+    /// Preferred direct-path address family when IPv4 and IPv6 have comparable
+    /// health, loss and latency.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub prefer: IpFamilyPreference,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,15 +172,17 @@ pub struct NodeInfo {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// Optional underlay relay transports.
-///
-/// DERP is enabled whenever `servers` is non-empty.  There is deliberately no
-/// mode switch: an empty list means that the transport is unavailable, while
-/// a populated list configures it.  `urls` retains support for explicitly
-/// configured iroh relays and may be used alongside DERP.
+/// Optional underlay relay transports. DERP is enabled whenever `servers` is
+/// non-empty. iroh relay is disabled by default and requires an explicit
+/// opt-in so deployments can restrict fallback to DERP, overlay transit and
+/// direct UDP.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
+    /// Permit iroh relay registration and dialing. Direct iroh UDP paths stay
+    /// available when this is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub iroh_relay_enabled: bool,
     /// Explicit iroh relay URLs inherited by peers without `relay_urls`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
@@ -184,6 +207,7 @@ impl RelayConfig {
             .iter()
             .chain(&self.discovery_urls)
             .map(String::as_str)
+            .filter(|_| self.iroh_relay_enabled)
     }
 }
 
@@ -918,6 +942,16 @@ impl Config {
     }
 
     fn validate_relay(&self) -> Result<()> {
+        if !self.relay.iroh_relay_enabled {
+            ensure!(
+                self.relay.urls.is_empty() && self.relay.discovery_urls.is_empty(),
+                "relay.urls and relay.discovery_urls require relay.iroh_relay_enabled = true"
+            );
+            ensure!(
+                self.peers.iter().all(|peer| peer.relay_urls.is_empty()),
+                "peer relay_urls require relay.iroh_relay_enabled = true"
+            );
+        }
         if !self.relay.urls.is_empty() {
             ensure!(
                 self.relay.urls.len() >= 2,
@@ -1285,6 +1319,7 @@ mod tests {
                 description: None,
                 metadata: BTreeMap::new(),
             }),
+            path_selection: PathSelectionConfig::default(),
             relay: RelayConfig::default(),
             peers: Vec::new(),
             links: Vec::new(),
@@ -1318,7 +1353,22 @@ mod tests {
         let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
         config.validate().unwrap();
         assert_eq!(config.relay, RelayConfig::default());
+        assert_eq!(config.path_selection.prefer, IpFamilyPreference::Ipv6);
         assert!(!config.routing.transit_enabled);
+    }
+
+    #[test]
+    fn underlay_address_family_preference_is_user_selectable() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            path_selection: PathSelectionConfig,
+        }
+
+        let defaults: Wrapper = toml::from_str("").unwrap();
+        assert_eq!(defaults.path_selection.prefer, IpFamilyPreference::Ipv6);
+        let ipv4: Wrapper = toml::from_str("[path_selection]\nprefer = \"ipv4\"").unwrap();
+        assert_eq!(ipv4.path_selection.prefer, IpFamilyPreference::Ipv4);
     }
 
     #[test]
@@ -1380,6 +1430,7 @@ mod tests {
         }
 
         let wrapper: Wrapper = toml::from_str("").unwrap();
+        assert!(!wrapper.relay.iroh_relay_enabled);
         assert!(wrapper.relay.urls.is_empty());
         assert!(wrapper.relay.discovery_urls.is_empty());
         assert!(wrapper.relay.servers.is_empty());
@@ -1388,6 +1439,7 @@ mod tests {
     #[test]
     fn qad_discovery_requires_two_unique_observation_urls() {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.relay.iroh_relay_enabled = true;
         config.relay.discovery_urls = vec!["https://qad-a.example.com".into()];
         assert!(
             config
@@ -1573,6 +1625,7 @@ mod tests {
     fn derp_servers_enable_transport_and_require_peer_keys() {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
         config.relay = RelayConfig {
+            iroh_relay_enabled: false,
             urls: Vec::new(),
             discovery_urls: Vec::new(),
             servers: vec![
@@ -1625,6 +1678,7 @@ mod tests {
             allowed_source_prefixes: vec!["10.201.0.2/32".parse().unwrap()],
         };
         config.relay = RelayConfig {
+            iroh_relay_enabled: true,
             urls: vec![
                 "https://relay-a.example.com".into(),
                 "https://relay-b.example.com".into(),
@@ -1640,6 +1694,22 @@ mod tests {
 
         config.validate().unwrap();
         assert_eq!(config.inherited_peer_relays().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn iroh_relay_requires_explicit_opt_in() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        config.relay.urls = vec![
+            "https://relay-a.example.com".into(),
+            "https://relay-b.example.com".into(),
+        ];
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("iroh_relay_enabled")
+        );
     }
 
     #[test]

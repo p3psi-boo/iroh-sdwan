@@ -38,6 +38,7 @@ advertised_prefixes = []
 name = "$node"
 
 [relay]
+iroh_relay_enabled = true
 urls = ["http://relay1:3340", "http://relay2:3340"]
 
 [routing]

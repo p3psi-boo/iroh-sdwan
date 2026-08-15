@@ -43,15 +43,20 @@ description = "Example branch router"
 [node_info.metadata]
 site = "example-site"
 
+# IPv4、IPv6 直连路径会同时建立并持续测量；一次只激活其中一条。
+# 偏好仅在健康度、丢包和 RTT 接近时生效，明显更好的另一地址族仍会被选择。
+[path_selection]
+prefer = "ipv6"
+
 [relay]
-# discovery_enabled = true 且未填写下列 iroh URL 时，使用 iroh N0 默认公共
-# QAD/relay 集合。QAD、UPnP/PCP/NAT-PMP 和 host/IPv6 候选都从同一 UDP
-# endpoint 产生；正式连接可先走 relay，再在原连接上打洞并透明升级为直连。
-# 自建观察点至少填写两个；discovery_urls 也可作为加密 fallback relay。
+# 默认禁止 iroh relay；直连 UDP、DERP 和已连接覆盖节点中转不受影响。
+iroh_relay_enabled = false
+# discovery_enabled = true 时继续发布 host、UPnP/PCP/NAT-PMP 和 peer 观察到的
+# NAT 候选；iroh relay 关闭不影响直连和连接内的候选交换。
 # discovery_urls = ["https://qad-1.example.net", "https://qad-2.example.net"]
 # DERP 服务器列表为空时不建立 DERP 自定义传输。
 # servers = ["https://derp-1.example.net/derp", "https://derp-2.example.net/derp"]
-# 可选的自建 iroh relay URL；至少两个，设置后取代 N0 默认集合并与 DERP 并行。
+# 显式开启后才能配置自建 iroh relay URL；至少两个，并可与 DERP 并行。
 # urls = ["https://relay-1.example.net", "https://relay-2.example.net"]
 
 [routing]

@@ -46,10 +46,14 @@ jq -e '
   .network.network == "production-demo" and
   .network.node == "edge-a" and
   (.network.endpoint_id | length > 0) and
-  (.network.address | endswith("/32"))
+  (.network.address | endswith("/32")) and
+  (.network.addresses | length == 2) and
+  (any(.network.addresses[]; endswith("/32"))) and
+  (any(.network.addresses[]; endswith("/128")))
 ' <<<"$CREATE_JSON" >/dev/null
 NETWORK_ID=$(jq -r '.network.network_id' <<<"$CREATE_JSON")
 ADDRESS_A=$(jq -r '.network.address | split("/")[0]' <<<"$CREATE_JSON")
+ADDRESS_A6=$(jq -r '.network.addresses[] | select(endswith("/128")) | split("/")[0]' <<<"$CREATE_JSON")
 
 echo "==> issuing and consuming a signed invite"
 INVITE_JSON=$(product_cli product-a node-a invite create \
@@ -71,10 +75,15 @@ jq -e --arg network_id "$NETWORK_ID" '
   .network.network == "production-demo" and
   .network.network_id == $network_id and
   .network.node == "edge-b" and
-  (.network.address | endswith("/32"))
+  (.network.address | endswith("/32")) and
+  (.network.addresses | length == 2) and
+  (any(.network.addresses[]; endswith("/32"))) and
+  (any(.network.addresses[]; endswith("/128")))
 ' <<<"$JOIN_JSON" >/dev/null
 ADDRESS_B=$(jq -r '.network.address | split("/")[0]' <<<"$JOIN_JSON")
+ADDRESS_B6=$(jq -r '.network.addresses[] | select(endswith("/128")) | split("/")[0]' <<<"$JOIN_JSON")
 test "$ADDRESS_A" != "$ADDRESS_B"
+test "$ADDRESS_A6" != "$ADDRESS_B6"
 
 echo "==> starting both daemons from generated state"
 start_daemon product-a node-a PID_A
@@ -84,6 +93,7 @@ wait_until "joiner readiness" ctl product-b node-b health
 wait_until "product overlay connectivity" \
   ip netns exec product-b ping -c 1 -W 3 -I "$ADDRESS_B" "$ADDRESS_A"
 ip netns exec product-a ping -c 3 -W 3 -I "$ADDRESS_A" "$ADDRESS_B"
+ip netns exec product-a ping -6 -c 3 -W 3 -I "$ADDRESS_A6" "$ADDRESS_B6"
 
 echo "==> verifying that product vocabulary exposes the live network"
 product_cli product-a node-a network show --output json \

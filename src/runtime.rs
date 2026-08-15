@@ -2117,20 +2117,7 @@ async fn build_endpoint(
     derp_transport: Option<Arc<DerpTransport>>,
 ) -> Result<Endpoint> {
     let configured_relays = config.inherited_peer_relays()?;
-    let relay_mode = if configured_relays.is_empty() {
-        if config.discovery_enabled {
-            // Net-report needs multiple independent QAD observers to detect
-            // endpoint-dependent mappings.  The N0 preset provides that
-            // public observation set and an immediately usable relay path, so
-            // hard-NAT peers can establish the formal connection before QNT
-            // starts coordinated hole punching.
-            RelayMode::Default
-        } else {
-            RelayMode::Disabled
-        }
-    } else {
-        RelayMode::custom(configured_relays)
-    };
+    let relay_mode = iroh_relay_mode(config, configured_relays);
     // Retain BBR3's conservative, MTU-scaled initial window.  A fixed 64 KiB
     // window can inject roughly half a second of data on a 1 Mbit/s path
     // before the first useful bandwidth/RTT sample exists.
@@ -2171,7 +2158,7 @@ async fn build_endpoint(
         .build();
     let path_exclusions = underlay_exclusion_prefixes(config);
     let hidden_prefixes = Arc::new(underlay_publish_exclusion_prefixes(config));
-    let path_selector = WanPathSelector::new(path_exclusions);
+    let path_selector = WanPathSelector::new(path_exclusions, config.path_selection.prefer);
     let address_filter = if config.discovery_enabled {
         AddrFilter::new(move |addresses| {
             Cow::Owned(
@@ -2211,6 +2198,23 @@ async fn build_endpoint(
         builder = builder.add_custom_transport(transport);
     }
     builder.bind().await.context("failed to bind iroh endpoint")
+}
+
+fn iroh_relay_mode(config: &Config, configured_relays: Vec<RelayUrl>) -> RelayMode {
+    if !config.relay.iroh_relay_enabled {
+        RelayMode::Disabled
+    } else if configured_relays.is_empty() {
+        if config.discovery_enabled {
+            // Net-report needs multiple independent QAD observers to detect
+            // endpoint-dependent mappings. The N0 preset also makes these
+            // observers usable as relay paths when explicitly enabled.
+            RelayMode::Default
+        } else {
+            RelayMode::Disabled
+        }
+    } else {
+        RelayMode::custom(configured_relays)
+    }
 }
 
 async fn monitor_network_discovery(
@@ -2488,7 +2492,9 @@ impl DynamicMeshManager {
             .filter(|presence| !dynamic_ids.contains(&presence.body.owner))
             .filter(|presence| !pinned.contains(&presence.body.owner))
             .filter(|presence| !self.removed_nodes.contains(&presence.body.owner))
-            .filter(|presence| presence_path(presence).is_some())
+            .filter(|presence| {
+                presence_path(presence, self.config.relay.iroh_relay_enabled).is_some()
+            })
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by_key(|presence| presence.body.owner);
@@ -2499,7 +2505,8 @@ impl DynamicMeshManager {
         // direct-only QUIC probe would prevent two hard-NAT peers from ever
         // reaching the coordinated punching phase.
         let candidate_observations = candidates.iter().filter_map(|presence| {
-            let (path, rtt, diversity_key) = presence_path(presence)?;
+            let (path, rtt, diversity_key) =
+                presence_path(presence, self.config.relay.iroh_relay_enabled)?;
             Some(ProbeObservation {
                 endpoint_id: presence.body.owner,
                 path,
@@ -2527,7 +2534,9 @@ impl DynamicMeshManager {
             .filter(|presence| {
                 self.local_id < presence.body.owner || dynamic_ids.contains(&presence.body.owner)
             })
-            .filter(|presence| presence_path(presence).is_some())
+            .filter(|presence| {
+                presence_path(presence, self.config.relay.iroh_relay_enabled).is_some()
+            })
             .map(|presence| presence.body.owner)
             .collect::<Vec<_>>();
         let decision = planner.evaluate(eligible, now);
@@ -2603,8 +2612,8 @@ impl DynamicMeshManager {
         let mut presence = presence;
         presence.body.direct_addresses = self.mesh.direct_candidates(&presence).await;
         ensure!(
-            presence_path(&presence).is_some(),
-            "dynamic endpoint has no usable direct or relay candidate"
+            presence_path(&presence, self.config.relay.iroh_relay_enabled).is_some(),
+            "dynamic endpoint has no usable direct, DERP or enabled iroh relay candidate"
         );
         let _admission = self.admission_lock.lock().await;
         ensure!(
@@ -2643,7 +2652,7 @@ impl DynamicMeshManager {
             self.peers.read().await.len() < self.config.mesh.max_peers,
             "bounded mesh peer limit reached"
         );
-        let peer_config = presence_peer_config(&presence);
+        let peer_config = presence_peer_config(&presence, self.config.relay.iroh_relay_enabled);
         let connection_mode = if connection.is_some() {
             ConnectionMode::Inbound
         } else {
@@ -2717,7 +2726,7 @@ impl DynamicMeshManager {
     }
 }
 
-fn presence_peer_config(presence: &SignedPresence) -> PeerConfig {
+fn presence_peer_config(presence: &SignedPresence, allow_iroh_relay: bool) -> PeerConfig {
     PeerConfig {
         name: presence
             .body
@@ -2728,17 +2737,26 @@ fn presence_peer_config(presence: &SignedPresence) -> PeerConfig {
         endpoint_id: presence.body.owner,
         transit_enabled: presence.body.transit_enabled,
         direct_addresses: presence.body.direct_addresses.clone(),
-        relay_urls: presence.body.relay_urls.clone(),
+        relay_urls: if allow_iroh_relay {
+            presence.body.relay_urls.clone()
+        } else {
+            Vec::new()
+        },
         derp_public_key: presence.body.derp_public_key,
         allowed_source_prefixes: presence.body.prefixes.clone(),
     }
 }
 
-fn presence_path(presence: &SignedPresence) -> Option<(PathKind, Duration, String)> {
+fn presence_path(
+    presence: &SignedPresence,
+    allow_iroh_relay: bool,
+) -> Option<(PathKind, Duration, String)> {
     if let Some(direct) = presence_direct_path(presence) {
         return Some(direct);
     }
-    (!presence.body.relay_urls.is_empty() || presence.body.derp_public_key.is_some()).then(|| {
+    ((allow_iroh_relay && !presence.body.relay_urls.is_empty())
+        || presence.body.derp_public_key.is_some())
+    .then(|| {
         (
             PathKind::Relay,
             Duration::from_millis(400),
@@ -2746,6 +2764,7 @@ fn presence_path(presence: &SignedPresence) -> Option<(PathKind, Duration, Strin
                 .body
                 .relay_urls
                 .first()
+                .filter(|_| allow_iroh_relay)
                 .cloned()
                 .unwrap_or_else(|| "derp".into()),
         )
@@ -4794,7 +4813,8 @@ mod tests {
     fn relay_only_presence_is_eligible_for_formal_connection() {
         let presence =
             presence_with_paths(61, Vec::new(), vec!["https://relay.example.com".into()]);
-        let (path, _, diversity) = presence_path(&presence).unwrap();
+        assert!(presence_path(&presence, false).is_none());
+        let (path, _, diversity) = presence_path(&presence, true).unwrap();
         assert_eq!(path, PathKind::Relay);
         assert_eq!(diversity, "https://relay.example.com");
     }
@@ -4806,7 +4826,10 @@ mod tests {
             vec!["203.0.113.62:10119".parse().unwrap()],
             vec!["https://relay.example.com".into()],
         );
-        assert_eq!(presence_path(&presence).unwrap().0, PathKind::DirectIpv4);
+        assert_eq!(
+            presence_path(&presence, false).unwrap().0,
+            PathKind::DirectIpv4
+        );
     }
 
     #[test]
@@ -5135,6 +5158,7 @@ mod tests {
     #[test]
     fn derp_uses_stream_tolerant_path_idle_timeout() {
         let derp = RelayConfig {
+            iroh_relay_enabled: false,
             urls: Vec::new(),
             discovery_urls: Vec::new(),
             servers: vec!["https://derp.example.com".into()],
@@ -5147,8 +5171,23 @@ mod tests {
     }
 
     #[test]
-    fn default_qad_observation_set_has_multiple_vantage_points() {
+    fn opt_in_qad_observation_set_has_multiple_vantage_points() {
         assert!(RelayMode::Default.relay_map().len() >= 2);
+    }
+
+    #[test]
+    fn iroh_relay_is_disabled_by_default() {
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        assert!(matches!(
+            iroh_relay_mode(&config, Vec::new()),
+            RelayMode::Disabled
+        ));
+
+        config.relay.iroh_relay_enabled = true;
+        assert!(matches!(
+            iroh_relay_mode(&config, Vec::new()),
+            RelayMode::Default
+        ));
     }
 
     #[test]
