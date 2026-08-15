@@ -38,6 +38,10 @@ pub struct Config {
         skip_serializing_if = "is_default_max_frame_size"
     )]
     pub max_frame_size: u16,
+    /// Use UDP segmentation offload for batched QUIC datagram transmission.
+    /// Keep disabled unless the host UDP stack and network interface support it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub udp_segmentation_offload: bool,
     #[serde(
         default = "default_node_interface",
         skip_serializing_if = "is_default_node_interface"
@@ -1311,6 +1315,7 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
+            udp_segmentation_offload: false,
             node_interface: "ironet0".into(),
             node_addresses: Vec::new(),
             advertised_prefixes: Vec::new(),

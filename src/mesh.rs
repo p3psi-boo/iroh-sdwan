@@ -1875,6 +1875,7 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
+            udp_segmentation_offload: false,
             node_interface: "ironet0".into(),
             node_addresses: vec!["10.200.0.1/32".parse().unwrap()],
             advertised_prefixes: Vec::new(),

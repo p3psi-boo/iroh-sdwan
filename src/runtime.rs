@@ -41,7 +41,7 @@ use crate::{
         CapacityProbeStart, ProbeReceiver, ProbeRequest, ProbeStatusSnapshot, append_probe_hop,
         encode_probe, forward_next_hop, reverse_next_hop,
     },
-    config::{AttachmentMode, Config, DialRole, PeerConfig, RelayConfig},
+    config::{AttachmentMode, Config, DialRole, IpFamilyPreference, PeerConfig, RelayConfig},
     delivery::{
         DELIVERY_ROUTE_TEMPLATE_TTL, DELIVERY_SESSION_TTL, DELIVERY_TAG_WIRE_BYTES,
         DeliveryMessage, DeliveryReceiver, DeliveryReport, DeliverySessionRegister, DeliverySource,
@@ -82,11 +82,11 @@ use crate::{
     },
 };
 
-// Keep noq's FIFO datagram buffer shallower than one interactive RTT.  The
-// application scheduler cannot preempt datagrams after they enter this
-// buffer, so a large value turns otherwise-prioritized traffic into hidden
-// head-of-line blocking under bulk load.
-const QUIC_SEND_BUFFER_BYTES: usize = 8 * 1024;
+// Hold one maximum-size TUN packet after fragmentation so noq can submit a
+// complete UDP GSO batch instead of blocking the peer task every few
+// datagrams. Keep the bound to one packet so priority traffic cannot build an
+// unbounded hidden FIFO behind bulk traffic.
+const QUIC_SEND_BUFFER_BYTES: usize = 64 * 1024;
 const QUIC_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const SMALL_PACKET_LIMIT: usize = 512;
 const OVERLAY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -2144,7 +2144,7 @@ async fn build_endpoint(
         // yet the loss burst can close the only direct path. Userspace batching
         // plus the large virtual TUN MTU keep
         // syscall cost low without that WAN-visible one-time outage.
-        .enable_segmentation_offload(false)
+        .enable_segmentation_offload(config.udp_segmentation_offload)
         .datagram_send_buffer_size(QUIC_SEND_BUFFER_BYTES)
         .datagram_receive_buffer_size(Some(QUIC_RECEIVE_BUFFER_BYTES))
         // Peer-observed socket addresses are endpoint-wide and can therefore
@@ -2814,12 +2814,36 @@ fn diversity_key(address: std::net::SocketAddr) -> String {
     }
 }
 
+fn prefer_initial_dial_addr(
+    endpoint_addr: EndpointAddr,
+    preference: IpFamilyPreference,
+) -> EndpointAddr {
+    let preferred_is_ipv4 = preference == IpFamilyPreference::Ipv4;
+    let has_preferred = endpoint_addr
+        .ip_addrs()
+        .any(|address| address.is_ipv4() == preferred_is_ipv4);
+    if !has_preferred {
+        return endpoint_addr;
+    }
+    EndpointAddr::from_parts(
+        endpoint_addr.id,
+        endpoint_addr
+            .addrs
+            .into_iter()
+            .filter(|address| match address {
+                TransportAddr::Ip(address) => address.is_ipv4() == preferred_is_ipv4,
+                _ => true,
+            }),
+    )
+}
+
 struct Peer {
     name: String,
     endpoint_id: EndpointId,
     route_id: RouteId,
     declared_transit_enabled: bool,
     endpoint_addr: EndpointAddr,
+    path_preference: IpFamilyPreference,
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
     session_policy: SessionPolicy,
@@ -3018,6 +3042,7 @@ impl Peer {
             route_id: route_id(peer.endpoint_id),
             declared_transit_enabled: peer.transit_enabled,
             endpoint_addr,
+            path_preference: config.path_selection.prefer,
             endpoint,
             alpn,
             session_policy: SessionPolicy {
@@ -3519,8 +3544,7 @@ impl Peer {
         let _dial_guard = self.dial_lock.lock().await;
         let endpoint_addr = self.dial_addr().await;
         let connection = self
-            .endpoint
-            .connect(endpoint_addr, self.alpn.as_slice())
+            .connect_preferred(endpoint_addr)
             .await
             .with_context(|| format!("failed refreshing peer {}", self.name))?;
         self.install_connection(connection).await
@@ -3630,6 +3654,25 @@ impl Peer {
         endpoint_addr
     }
 
+    async fn connect_preferred(&self, endpoint_addr: EndpointAddr) -> Result<Connection> {
+        let preferred = prefer_initial_dial_addr(endpoint_addr.clone(), self.path_preference);
+        match self
+            .endpoint
+            .connect(preferred.clone(), self.alpn.as_slice())
+            .await
+        {
+            Ok(connection) => Ok(connection),
+            Err(error) if preferred != endpoint_addr => {
+                debug!(peer = %self.name, %error, "preferred underlay address family failed; retrying all candidates");
+                self.endpoint
+                    .connect(endpoint_addr, self.alpn.as_slice())
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn local_address_candidates(&self) -> Vec<std::net::SocketAddr> {
         if !self.candidate_exchange_enabled {
             return Vec::new();
@@ -3713,8 +3756,7 @@ impl Peer {
         }
         let endpoint_addr = self.dial_addr().await;
         let connection = self
-            .endpoint
-            .connect(endpoint_addr, self.alpn.as_slice())
+            .connect_preferred(endpoint_addr)
             .await
             .with_context(|| format!("failed connecting to peer {}", self.name))?;
         self.install_connection(connection.clone()).await?;
@@ -4787,6 +4829,39 @@ mod tests {
 
     fn endpoint(byte: u8) -> EndpointId {
         SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn initial_dial_uses_preferred_family_and_keeps_relay_fallback() {
+        let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let address = EndpointAddr::new(endpoint(60))
+            .with_ip_addr("198.51.100.60:4000".parse().unwrap())
+            .with_ip_addr("[2001:db8::60]:4000".parse().unwrap())
+            .with_relay_url(relay.clone());
+
+        let preferred = prefer_initial_dial_addr(address, IpFamilyPreference::Ipv6);
+
+        assert_eq!(
+            preferred.ip_addrs().copied().collect::<Vec<_>>(),
+            vec!["[2001:db8::60]:4000".parse().unwrap()]
+        );
+        assert_eq!(
+            preferred.relay_urls().cloned().collect::<Vec<_>>(),
+            vec![relay]
+        );
+    }
+
+    #[test]
+    fn initial_dial_keeps_available_family_when_preferred_family_is_absent() {
+        let address =
+            EndpointAddr::new(endpoint(60)).with_ip_addr("198.51.100.60:4000".parse().unwrap());
+
+        let preferred = prefer_initial_dial_addr(address, IpFamilyPreference::Ipv6);
+
+        assert_eq!(
+            preferred.ip_addrs().copied().collect::<Vec<_>>(),
+            vec!["198.51.100.60:4000".parse().unwrap()]
+        );
     }
 
     fn presence_with_paths(

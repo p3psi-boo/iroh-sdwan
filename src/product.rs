@@ -969,6 +969,7 @@ fn base_config(
         attachment: AttachmentMode::Tun,
         tun_mtu: u16::MAX,
         max_frame_size: 1400,
+        udp_segmentation_offload: false,
         node_interface: "ironet0".into(),
         node_addresses: addresses,
         advertised_prefixes: Vec::new(),
