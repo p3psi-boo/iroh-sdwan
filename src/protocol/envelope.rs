@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub const MAGIC: &[u8; 4] = b"IRN1";
 pub const HEADER_LEN: usize = 12;
@@ -55,24 +55,7 @@ impl Envelope {
     }
 
     pub fn encode(&self) -> Result<Bytes> {
-        let header_len = HEADER_LEN + self.extension.len();
-        ensure!(
-            header_len <= MAX_HEADER_LEN,
-            "v1 envelope extension is too large"
-        );
-        ensure!(
-            header_len <= u16::MAX as usize,
-            "v1 envelope header is too large"
-        );
-        let mut out = Vec::with_capacity(header_len + self.payload.len());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(self.kind as u16).to_be_bytes());
-        out.extend_from_slice(&self.flags.to_be_bytes());
-        out.extend_from_slice(&(header_len as u16).to_be_bytes());
-        out.extend_from_slice(&0_u16.to_be_bytes());
-        out.extend_from_slice(&self.extension);
-        out.extend_from_slice(&self.payload);
-        Ok(Bytes::from(out))
+        encode_parts(self.kind, self.flags, &self.extension, &self.payload)
     }
 
     pub fn decode(bytes: Bytes) -> Result<Self> {
@@ -100,6 +83,51 @@ impl Envelope {
     }
 }
 
+/// Write a V1 envelope in one allocation. Callers that already have a
+/// contiguous payload must use this instead of building a payload `Vec`
+/// and copying it into a second envelope buffer.
+pub fn encode_parts(
+    kind: MessageType,
+    flags: u16,
+    extension: &[u8],
+    payload: &[u8],
+) -> Result<Bytes> {
+    let header_len = HEADER_LEN + extension.len();
+    ensure!(
+        header_len <= MAX_HEADER_LEN,
+        "v1 envelope extension is too large"
+    );
+    ensure!(
+        header_len <= u16::MAX as usize,
+        "v1 envelope header is too large"
+    );
+    let mut out = BytesMut::with_capacity(header_len + payload.len());
+    write_header(&mut out, kind, flags, header_len as u16);
+    out.extend_from_slice(extension);
+    out.extend_from_slice(payload);
+    Ok(out.freeze())
+}
+
+pub fn write_header(out: &mut BytesMut, kind: MessageType, flags: u16, header_len: u16) {
+    out.extend_from_slice(MAGIC);
+    out.put_u16(kind as u16);
+    out.put_u16(flags);
+    out.put_u16(header_len);
+    out.put_u16(0);
+}
+
+/// Patch a header into bytes that already contain the payload at
+/// `payload_start`. Used by the single-datagram in-place path.
+pub fn write_header_at(dest: &mut [u8], kind: MessageType, flags: u16) -> Result<()> {
+    ensure!(dest.len() >= HEADER_LEN, "envelope header destination is too small");
+    dest[..4].copy_from_slice(MAGIC);
+    dest[4..6].copy_from_slice(&(kind as u16).to_be_bytes());
+    dest[6..8].copy_from_slice(&flags.to_be_bytes());
+    dest[8..10].copy_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+    dest[10..12].copy_from_slice(&0_u16.to_be_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +147,15 @@ mod tests {
     }
 
     #[test]
+    fn encode_parts_matches_struct_encode() {
+        let payload = Bytes::from_static(b"payload");
+        let envelope = Envelope::new(MessageType::IpFragment, payload.clone());
+        assert_eq!(
+            encode_parts(MessageType::IpFragment, 0, &[], &payload).unwrap(),
+            envelope.encode().unwrap()
+        );
+    }
+
     fn unknown_messages_are_rejected_without_parsing_payload() {
         let mut bytes = Envelope::new(MessageType::Heartbeat, Bytes::new())
             .encode()

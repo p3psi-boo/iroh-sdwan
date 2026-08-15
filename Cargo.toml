@@ -8,16 +8,18 @@ name = "ironet"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Demand-aware Linux overlay network using iroh and a single FlowRouter TUN"
+description = "Demand-aware Linux overlay network using iroh and a sharded multi-queue FlowRouter TUN"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.2"
 blake3 = "1.8.6"
 bytes = "1.11.1"
 chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 crypto_box = { version = "0.9.1", features = ["rand_core", "std"] }
+crossbeam-channel = "0.5.16"
 hex = "0.4.3"
 futures-util = "0.3.33"
 ipnet = { version = "2.12.1", features = ["serde"] }
@@ -29,6 +31,7 @@ n0-watcher = "1.0.0"
 noq-udp = "1.1.1"
 reed-solomon-simd = "3.1.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+rustc-hash = "2.1.1"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"

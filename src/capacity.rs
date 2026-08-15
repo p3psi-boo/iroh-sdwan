@@ -384,6 +384,17 @@ impl RouteEstimateTable {
         self.entries.iter()
     }
 
+    pub fn snapshot_all(
+        &self,
+        now: Instant,
+        max_egress_bps: Option<u64>,
+    ) -> HashMap<RouteKey, CapacitySnapshot> {
+        self.entries
+            .iter()
+            .map(|(key, estimate)| (*key, estimate.snapshot(now, max_egress_bps)))
+            .collect()
+    }
+
     pub fn prune_expired(&mut self, now: Instant) {
         self.entries.retain(|_, estimate| {
             estimate.freshness_at(now) != Freshness::Unknown

@@ -1,15 +1,19 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Range,
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
+use crate::buffer::DataplaneBuf;
 use crate::capacity_probe::{CapacityProbeMessage, decode_probe};
 use crate::delivery::{DELIVERY_TAG_WIRE_BYTES, DeliveryMessage, DeliveryTag, decode_delivery};
-use crate::protocol::envelope::{Envelope, HEADER_LEN as ENVELOPE_HEADER_LEN, MessageType};
+use crate::protocol::envelope::{
+    self, Envelope, HEADER_LEN as ENVELOPE_HEADER_LEN, MessageType,
+};
 
 const HEADER_LEN: usize = 16;
 pub const MAX_PACKET_FRAME_HEADER_LEN: usize =
@@ -81,12 +85,18 @@ pub fn encode_address_candidates(addresses: &[SocketAddr]) -> Result<Bytes> {
         }
         bytes.extend_from_slice(&address.port().to_be_bytes());
     }
-    Envelope::new(MessageType::AddressCandidates, bytes).encode()
+    envelope::encode_parts(MessageType::AddressCandidates, 0, &[], &bytes)
 }
 
 #[cfg(test)]
 pub(crate) fn encode_packet(packet: &[u8], maximum: usize, packet_id: u64) -> Result<Vec<Bytes>> {
     encode_packet_tagged(packet, maximum, packet_id, None)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodeStats {
+    pub payload_copies: u64,
+    pub frames: u64,
 }
 
 pub fn encode_packet_tagged(
@@ -95,35 +105,117 @@ pub fn encode_packet_tagged(
     packet_id: u64,
     delivery_tag: Option<DeliveryTag>,
 ) -> Result<Vec<Bytes>> {
+    encode_packet_from_buf(
+        &DataplaneBuf::from_bytes(Bytes::copy_from_slice(packet)),
+        maximum,
+        packet_id,
+        delivery_tag,
+    )
+    .map(|(frames, _)| frames)
+}
+
+/// Encode an owned packet. A unique buffer with enough unused prefix is
+/// sealed in place for the single-datagram case (`payload_copies == 0`).
+/// Jumbo packets freeze the payload once and copy each fragment once.
+pub fn encode_packet_from_buf(
+    packet: &DataplaneBuf,
+    maximum: usize,
+    packet_id: u64,
+    delivery_tag: Option<DeliveryTag>,
+) -> Result<(Vec<Bytes>, EncodeStats)> {
     ensure!(!packet.is_empty(), "cannot frame an empty packet");
     ensure!(
         packet.len() <= MAX_PACKET_LEN,
         "packet exceeds wire protocol maximum"
     );
-    let header_len = HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES);
+    let fragment_header_len = HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES);
+    let sealed_header_len = ENVELOPE_HEADER_LEN + fragment_header_len;
     ensure!(
-        maximum > ENVELOPE_HEADER_LEN + header_len,
+        maximum > sealed_header_len,
         "QUIC datagram limit is too small"
     );
 
-    let chunk_size = maximum - ENVELOPE_HEADER_LEN - header_len;
-    let mut frames = Vec::with_capacity(packet.len().div_ceil(chunk_size));
-    for (index, chunk) in packet.chunks(chunk_size).enumerate() {
-        let offset = index * chunk_size;
-        let mut frame = Vec::with_capacity(ENVELOPE_HEADER_LEN + header_len + chunk.len());
-        frame.extend_from_slice(&packet_id.to_be_bytes());
-        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&(offset as u16).to_be_bytes());
-        frame.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&delivery_tag.map_or(0, |_| FLAG_DELIVERY_TAG).to_be_bytes());
-        if let Some(tag) = delivery_tag {
-            frame.extend_from_slice(&tag.session_id.to_be_bytes());
-            frame.extend_from_slice(&tag.sequence.to_be_bytes());
-        }
-        frame.extend_from_slice(chunk);
-        frames.push(Envelope::new(MessageType::IpFragment, frame).encode()?);
+    let chunk_size = maximum - sealed_header_len;
+    if packet.len() <= chunk_size {
+        let header = fragment_header(packet_id, packet.len(), 0, packet.len(), delivery_tag);
+        let (frame, copies) = seal_fragment(packet.clone(), &header)?;
+        return Ok((
+            vec![frame],
+            EncodeStats {
+                payload_copies: copies,
+                frames: 1,
+            },
+        ));
     }
-    Ok(frames)
+
+    let payload = packet.payload_bytes();
+    let mut frames = Vec::with_capacity(payload.len().div_ceil(chunk_size));
+    for (index, chunk) in payload.chunks(chunk_size).enumerate() {
+        let offset = index * chunk_size;
+        let header = fragment_header(packet_id, payload.len(), offset, chunk.len(), delivery_tag);
+        let mut out = BytesMut::with_capacity(sealed_header_len + chunk.len());
+        envelope::write_header(
+            &mut out,
+            MessageType::IpFragment,
+            0,
+            ENVELOPE_HEADER_LEN as u16,
+        );
+        out.extend_from_slice(&header);
+        out.extend_from_slice(chunk);
+        frames.push(out.freeze());
+    }
+    Ok((
+        frames,
+        EncodeStats {
+            payload_copies: frames.len() as u64,
+            frames: frames.len() as u64,
+        },
+    ))
+}
+
+fn fragment_header(
+    packet_id: u64,
+    total_len: usize,
+    offset: usize,
+    chunk_len: usize,
+    delivery_tag: Option<DeliveryTag>,
+) -> Vec<u8> {
+    let mut header = Vec::with_capacity(HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES));
+    header.extend_from_slice(&packet_id.to_be_bytes());
+    header.extend_from_slice(&(total_len as u16).to_be_bytes());
+    header.extend_from_slice(&(offset as u16).to_be_bytes());
+    header.extend_from_slice(&(chunk_len as u16).to_be_bytes());
+    header.extend_from_slice(&delivery_tag.map_or(0, |_| FLAG_DELIVERY_TAG).to_be_bytes());
+    if let Some(tag) = delivery_tag {
+        header.extend_from_slice(&tag.session_id.to_be_bytes());
+        header.extend_from_slice(&tag.sequence.to_be_bytes());
+    }
+    header
+}
+
+fn seal_fragment(packet: DataplaneBuf, fragment_header: &[u8]) -> Result<(Bytes, u64)> {
+    let needed = ENVELOPE_HEADER_LEN + fragment_header.len();
+    if packet.can_prepend(needed) {
+        let mut prefix = [0_u8; ENVELOPE_HEADER_LEN + HEADER_LEN + DELIVERY_TAG_WIRE_BYTES];
+        envelope::write_header_at(&mut prefix[..ENVELOPE_HEADER_LEN], MessageType::IpFragment, 0)?;
+        prefix[ENVELOPE_HEADER_LEN..needed].copy_from_slice(fragment_header);
+        match packet.try_prepend(&prefix[..needed]) {
+            Ok(frame) => return Ok((frame, 0)),
+            Err(packet) => {
+                return Ok((packet.copy_with_prefix(&prefix[..needed]), 1));
+            }
+        }
+    }
+    let mut out = BytesMut::with_capacity(needed + packet.len());
+    envelope::write_header(
+        &mut out,
+        MessageType::IpFragment,
+        0,
+        ENVELOPE_HEADER_LEN as u16,
+    );
+    out.extend_from_slice(fragment_header);
+    out.extend_from_slice(packet.as_slice());
+    Ok((out.freeze(), 1))
 }
 
 pub fn encode_batch(frames: &[Bytes], maximum: usize) -> Result<Bytes> {
@@ -141,14 +233,14 @@ pub fn encode_batch(frames: &[Bytes], maximum: usize) -> Result<Bytes> {
         length + ENVELOPE_HEADER_LEN <= maximum,
         "overlay batch exceeds path limit"
     );
-    let mut batch = Vec::with_capacity(length);
-    batch.extend_from_slice(&(frames.len() as u16).to_be_bytes());
+    let mut batch = BytesMut::with_capacity(length);
+    batch.put_u16(frames.len() as u16);
     for frame in frames {
         ensure!(frame.len() <= u16::MAX as usize, "batch frame is too large");
-        batch.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        batch.put_u16(frame.len() as u16);
         batch.extend_from_slice(frame);
     }
-    Envelope::new(MessageType::IpBatch, batch).encode()
+    envelope::encode_parts(MessageType::IpBatch, 0, &[], &batch)
 }
 
 pub fn encode_repair_request(request: &RepairRequest) -> Result<Bytes> {
@@ -166,7 +258,7 @@ pub fn encode_repair_request(request: &RepairRequest) -> Result<Bytes> {
     for offset in &request.missing_offsets {
         bytes.extend_from_slice(&offset.to_be_bytes());
     }
-    Envelope::new(MessageType::RepairRequest, bytes).encode()
+    envelope::encode_parts(MessageType::RepairRequest, 0, &[], &bytes)
 }
 
 pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
@@ -312,16 +404,28 @@ struct Assembly {
     last_repair: Option<Instant>,
     repair_attempts: u8,
     buffer: Vec<u8>,
-    received: Vec<bool>,
+    /// Sorted, disjoint byte ranges already present in `buffer`. Fragment
+    /// count is bounded by packet length / path MTU, so range merging avoids a
+    /// second allocation proportional to every packet byte and replaces the
+    /// previous byte-at-a-time hot loop with slice copies.
+    received_ranges: Vec<Range<usize>>,
     received_count: usize,
     delivery_tag: Option<DeliveryTag>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReassembledPacket {
-    pub data: Vec<u8>,
+    pub data: DataplaneBuf,
     pub delivery_tag: Option<DeliveryTag>,
 }
+
+impl PartialEq for ReassembledPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.as_slice() == other.data.as_slice() && self.delivery_tag == other.delivery_tag
+    }
+}
+
+impl Eq for ReassembledPacket {}
 
 #[derive(Debug)]
 pub struct Reassembler {
@@ -353,17 +457,19 @@ impl Reassembler {
     }
 
     pub fn push(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.push_tagged(frame)?.map(|packet| packet.data))
+        Ok(self
+            .push_tagged(Bytes::copy_from_slice(frame))?
+            .map(|packet| packet.data.as_slice().to_vec()))
     }
 
-    pub fn push_tagged(&mut self, frame: &[u8]) -> Result<Option<ReassembledPacket>> {
+    pub fn push_tagged(&mut self, frame: Bytes) -> Result<Option<ReassembledPacket>> {
         if frame.starts_with(crate::protocol::envelope::MAGIC) {
-            let envelope = Envelope::decode(Bytes::copy_from_slice(frame))?;
+            let envelope = Envelope::decode(frame)?;
             ensure!(
                 envelope.kind == MessageType::IpFragment,
                 "V1 envelope does not contain an IP fragment"
             );
-            return self.push_tagged(&envelope.payload);
+            return self.push_tagged(envelope.payload);
         }
         ensure!(frame.len() >= HEADER_LEN, "truncated overlay frame");
         let packet_id = u64::from_be_bytes(frame[0..8].try_into().unwrap());
@@ -402,7 +508,7 @@ impl Reassembler {
         self.expire(false);
         if offset == 0 && fragment_len == total_len {
             return Ok(Some(ReassembledPacket {
-                data: frame[header_len..].to_vec(),
+                data: DataplaneBuf::from_pooled(frame, header_len),
                 delivery_tag,
             }));
         }
@@ -431,7 +537,7 @@ impl Reassembler {
                 last_repair: None,
                 repair_attempts: 0,
                 buffer: vec![0; total_len],
-                received: vec![false; total_len],
+                received_ranges: Vec::with_capacity(8),
                 received_count: 0,
                 delivery_tag,
             });
@@ -444,26 +550,19 @@ impl Reassembler {
             "overlay packet delivery tag changed"
         );
 
-        for (relative, byte) in frame[header_len..].iter().copied().enumerate() {
-            let position = offset + relative;
-            if assembly.received[position] {
-                ensure!(
-                    assembly.buffer[position] == byte,
-                    "conflicting duplicate overlay fragment"
-                );
-                continue;
-            }
-            assembly.buffer[position] = byte;
-            assembly.received[position] = true;
-            assembly.received_count += 1;
-        }
+        record_fragment(assembly, offset, &frame[header_len..])?;
 
         if assembly.received_count == total_len {
             let complete = self.assemblies.remove(&packet_id);
             if let Some(complete) = complete {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(complete.buffer.len());
+                let mut gathered = BytesMut::zeroed(tun_rs::VIRTIO_NET_HDR_LEN + complete.buffer.len());
+                gathered[tun_rs::VIRTIO_NET_HDR_LEN..].copy_from_slice(&complete.buffer);
                 return Ok(Some(ReassembledPacket {
-                    data: complete.buffer,
+                    data: DataplaneBuf::from_pooled(
+                        gathered.freeze(),
+                        tun_rs::VIRTIO_NET_HDR_LEN,
+                    ),
                     delivery_tag: complete.delivery_tag,
                 }));
             }
@@ -510,13 +609,14 @@ impl Reassembler {
         if !force && now < self.next_expiry {
             return;
         }
-        self.assemblies
-            .retain(|_, assembly| assembly.created.elapsed() < ASSEMBLY_TTL);
-        self.buffered_bytes = self
-            .assemblies
-            .values()
-            .map(|assembly| assembly.buffer.len())
-            .sum();
+        self.assemblies.retain(|_, assembly| {
+            if assembly.created.elapsed() < ASSEMBLY_TTL {
+                true
+            } else {
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.buffer.len());
+                false
+            }
+        });
         self.next_expiry = now + EXPIRY_INTERVAL;
     }
 
@@ -542,18 +642,66 @@ impl Reassembler {
 }
 
 fn missing_offsets(assembly: &Assembly) -> Vec<u16> {
+    let mut missing = Vec::new();
+    let mut covered_until = 0_usize;
+    for range in &assembly.received_ranges {
+        if range.start > covered_until {
+            missing.push(covered_until as u16);
+        }
+        covered_until = covered_until.max(range.end);
+    }
+    if covered_until < assembly.buffer.len() {
+        missing.push(covered_until as u16);
+    }
+    missing
+}
+
+fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Result<()> {
+    let end = offset + data.len();
+    let mut already_received = 0_usize;
+    for range in &assembly.received_ranges {
+        let overlap_start = offset.max(range.start);
+        let overlap_end = end.min(range.end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let incoming_start = overlap_start - offset;
+        let incoming_end = overlap_end - offset;
+        ensure!(
+            assembly.buffer[overlap_start..overlap_end] == data[incoming_start..incoming_end],
+            "conflicting duplicate overlay fragment"
+        );
+        already_received += overlap_end - overlap_start;
+    }
+
+    if already_received == data.len() {
+        return Ok(());
+    }
+    assembly.buffer[offset..end].copy_from_slice(data);
+    assembly.received_count = assembly
+        .received_count
+        .saturating_add(data.len().saturating_sub(already_received));
+
+    let mut merged_start = offset;
+    let mut merged_end = end;
+    let mut first = 0_usize;
+    while first < assembly.received_ranges.len()
+        && assembly.received_ranges[first].end < merged_start
+    {
+        first += 1;
+    }
+    let mut last = first;
+    while last < assembly.received_ranges.len()
+        && assembly.received_ranges[last].start <= merged_end
+    {
+        merged_start = merged_start.min(assembly.received_ranges[last].start);
+        merged_end = merged_end.max(assembly.received_ranges[last].end);
+        last += 1;
+    }
     assembly
-        .received
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, received)| {
-            if !received && (offset == 0 || assembly.received[offset - 1]) {
-                Some(offset as u16)
-            } else {
-                None
-            }
-        })
-        .collect()
+        .received_ranges
+        .splice(first..last, std::iter::once(merged_start..merged_end));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -601,13 +749,9 @@ mod tests {
                 complete = Some(value);
             }
         }
-        assert_eq!(
-            complete.unwrap(),
-            ReassembledPacket {
-                data: packet,
-                delivery_tag: Some(tag),
-            }
-        );
+        let complete = complete.unwrap();
+        assert_eq!(complete.data.as_slice(), packet);
+        assert_eq!(complete.delivery_tag, Some(tag));
     }
 
     #[test]

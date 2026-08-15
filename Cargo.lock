@@ -1901,10 +1901,12 @@ name = "ironet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "blake3",
  "bytes",
  "chrono",
  "clap",
+ "crossbeam-channel",
  "crypto_box",
  "futures-util",
  "hex",

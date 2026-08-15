@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
-use crate::protocol::envelope::{Envelope as V1Envelope, HEADER_LEN as V1_HEADER_LEN, MessageType};
+use crate::protocol::envelope::{
+    self, Envelope as V1Envelope, HEADER_LEN as V1_HEADER_LEN, MessageType,
+};
 
 const HEADER_LEN: usize = 16;
 const LENGTH_PREFIX_LEN: usize = 2;
@@ -54,6 +56,7 @@ pub struct FecEncoder {
     block_timeout: Duration,
     next_block_id: u64,
     block: Option<EncodeBlock>,
+    codec: Option<ReedSolomonEncoder>,
 }
 
 impl FecEncoder {
@@ -70,6 +73,7 @@ impl FecEncoder {
             block_timeout,
             next_block_id: 1,
             block: None,
+            codec: None,
         })
     }
 
@@ -118,9 +122,9 @@ impl FecEncoder {
 
         let block = self.block.as_mut().expect("block was initialized");
         let index = block.originals.len();
-        let mut original = vec![0; shard_bytes];
-        original[..2].copy_from_slice(&(frame.len() as u16).to_be_bytes());
-        original[2..2 + frame.len()].copy_from_slice(&frame);
+        let mut original = Vec::with_capacity(shard_bytes);
+        original.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        original.extend_from_slice(&frame);
         batch.overhead_bytes += WIRE_OVERHEAD as u64;
         batch.datagrams.push(EncodedDatagram {
             bytes: encode_envelope(
@@ -130,16 +134,29 @@ impl FecEncoder {
                 self.data_shards,
                 self.recovery_shards,
                 shard_bytes,
-                &original[..2 + frame.len()],
+                &original,
             )?,
             recovery: false,
         });
+        original.resize(shard_bytes, 0);
         block.originals.push(original);
 
         if block.originals.len() == self.data_shards {
-            let mut encoder =
-                ReedSolomonEncoder::new(self.data_shards, self.recovery_shards, shard_bytes)
-                    .context("unsupported FEC encoder parameters")?;
+            let encoder = match self.codec.as_mut() {
+                Some(encoder) => {
+                    encoder
+                        .reset(self.data_shards, self.recovery_shards, shard_bytes)
+                        .context("unsupported FEC encoder parameters")?;
+                    encoder
+                }
+                None => {
+                    self.codec = Some(
+                        ReedSolomonEncoder::new(self.data_shards, self.recovery_shards, shard_bytes)
+                            .context("unsupported FEC encoder parameters")?,
+                    );
+                    self.codec.as_mut().expect("encoder was stored")
+                }
+            };
             for original in &block.originals {
                 encoder
                     .add_original_shard(original)
@@ -230,6 +247,7 @@ pub struct FecDecoder {
     buffered_bytes: usize,
     max_buffered_bytes: usize,
     next_expiry: Instant,
+    codec: Option<ReedSolomonDecoder>,
 }
 
 impl FecDecoder {
@@ -245,6 +263,7 @@ impl FecDecoder {
             buffered_bytes: 0,
             max_buffered_bytes: max_buffered_bytes.max(u16::MAX as usize),
             next_expiry: Instant::now() + EXPIRY_INTERVAL,
+            codec: None,
         })
     }
 
@@ -262,7 +281,7 @@ impl FecDecoder {
             return Ok(batch);
         }
 
-        let envelope = Envelope::parse(&v1.payload)?;
+        let envelope = Envelope::parse(v1.payload)?;
         if envelope.kind == KIND_RECOVERY {
             batch.recovery_shards = 1;
         }
@@ -337,7 +356,7 @@ impl FecDecoder {
                 }
                 if !block.delivered[envelope.index] {
                     block.delivered[envelope.index] = true;
-                    batch.frames.push(original_payload(envelope.payload)?);
+                    batch.frames.push(original_payload(envelope.payload.clone())?);
                 }
             }
             KIND_RECOVERY => {
@@ -359,12 +378,25 @@ impl FecDecoder {
         if original_count < block.data_shards
             && original_count + recovery_count >= block.data_shards
         {
-            let mut decoder = ReedSolomonDecoder::new(
-                block.data_shards,
-                block.recovery_shards,
-                block.shard_bytes,
-            )
-            .context("unsupported FEC decoder parameters")?;
+            let decoder = match self.codec.as_mut() {
+                Some(decoder) => {
+                    decoder
+                        .reset(block.data_shards, block.recovery_shards, block.shard_bytes)
+                        .context("unsupported FEC decoder parameters")?;
+                    decoder
+                }
+                None => {
+                    self.codec = Some(
+                        ReedSolomonDecoder::new(
+                            block.data_shards,
+                            block.recovery_shards,
+                            block.shard_bytes,
+                        )
+                        .context("unsupported FEC decoder parameters")?,
+                    );
+                    self.codec.as_mut().expect("decoder was stored")
+                }
+            };
             for (index, original) in block.originals.iter().enumerate() {
                 if let Some(original) = original {
                     decoder
@@ -422,13 +454,18 @@ impl FecDecoder {
         if !force && now < self.next_expiry {
             return 0;
         }
-        let before = self.blocks.len();
-        self.blocks
-            .retain(|_, block| block.created.elapsed() < self.block_ttl);
-        let expired = before - self.blocks.len();
-        self.buffered_bytes = self.blocks.values().map(DecodeBlock::buffered_bytes).sum();
+        let mut expired = 0_u64;
+        self.blocks.retain(|_, block| {
+            if block.created.elapsed() < self.block_ttl {
+                true
+            } else {
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(block.buffered_bytes());
+                expired += 1;
+                false
+            }
+        });
         self.next_expiry = now + EXPIRY_INTERVAL;
-        expired as u64
+        expired
     }
 
     fn evict_oldest(&mut self) -> Option<u64> {
@@ -443,18 +480,18 @@ impl FecDecoder {
     }
 }
 
-struct Envelope<'a> {
+struct Envelope {
     block_id: u64,
     kind: u8,
     index: usize,
     data_shards: usize,
     recovery_shards: usize,
     shard_bytes: usize,
-    payload: &'a [u8],
+    payload: Bytes,
 }
 
-impl<'a> Envelope<'a> {
-    fn parse(datagram: &'a [u8]) -> Result<Self> {
+impl Envelope {
+    fn parse(datagram: Bytes) -> Result<Self> {
         ensure!(datagram.len() >= HEADER_LEN, "truncated FEC envelope");
         let block_id = u64::from_be_bytes(datagram[0..8].try_into().unwrap());
         let kind = datagram[8];
@@ -471,7 +508,7 @@ impl<'a> Envelope<'a> {
             datagram.len() == HEADER_LEN + payload_bytes,
             "FEC envelope payload length mismatch"
         );
-        let payload = &datagram[HEADER_LEN..];
+        let payload = datagram.slice(HEADER_LEN..);
         match kind {
             KIND_ORIGINAL => {
                 ensure!(index < data_shards, "invalid FEC original shard index");
@@ -479,7 +516,7 @@ impl<'a> Envelope<'a> {
                     payload.len() <= shard_bytes,
                     "FEC original exceeds shard size"
                 );
-                original_payload(payload)?;
+                original_payload(payload.clone())?;
             }
             KIND_RECOVERY => {
                 ensure!(index < recovery_shards, "invalid FEC recovery shard index");
@@ -586,21 +623,21 @@ fn encode_envelope(
     frame.extend_from_slice(&(shard_bytes as u16).to_be_bytes());
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
-    V1Envelope::new(MessageType::FecShard, frame).encode()
+    envelope::encode_parts(MessageType::FecShard, 0, &[], &frame)
 }
 
 fn expand_original(payload: &[u8], shard_bytes: usize) -> Result<Vec<u8>> {
-    original_payload(payload)?;
     ensure!(
         payload.len() <= shard_bytes,
         "FEC original exceeds shard size"
     );
-    let mut original = vec![0; shard_bytes];
-    original[..payload.len()].copy_from_slice(payload);
+    let mut original = Vec::with_capacity(shard_bytes);
+    original.extend_from_slice(payload);
+    original.resize(shard_bytes, 0);
     Ok(original)
 }
 
-fn original_payload(payload: &[u8]) -> Result<Bytes> {
+fn original_payload(payload: Bytes) -> Result<Bytes> {
     ensure!(
         payload.len() >= LENGTH_PREFIX_LEN,
         "truncated FEC original shard"
@@ -611,7 +648,7 @@ fn original_payload(payload: &[u8]) -> Result<Bytes> {
         payload.len() == LENGTH_PREFIX_LEN + frame_len,
         "FEC original shard length mismatch"
     );
-    Ok(Bytes::copy_from_slice(&payload[2..]))
+    Ok(payload.slice(LENGTH_PREFIX_LEN..LENGTH_PREFIX_LEN + frame_len))
 }
 
 fn original_from_expanded(original: &[u8]) -> Result<Bytes> {

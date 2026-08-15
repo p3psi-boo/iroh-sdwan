@@ -3,9 +3,11 @@
 //! A flow carries only a decaying pressure estimate and a short route lease.
 
 use std::{
-    collections::HashMap,
+    collections::VecDeque,
     time::{Duration, Instant},
 };
+
+use rustc_hash::FxHashMap;
 
 use crate::packet::FlowKey;
 
@@ -136,7 +138,8 @@ impl Default for FlowRouterConfig {
 #[derive(Debug)]
 pub struct FlowRouter {
     config: FlowRouterConfig,
-    flows: HashMap<FlowKey, FlowSlot>,
+    flows: FxHashMap<FlowKey, FlowSlot>,
+    insertion_order: VecDeque<FlowKey>,
     next_prune_at: Option<Instant>,
 }
 
@@ -166,7 +169,8 @@ impl FlowRouter {
         );
         Self {
             config,
-            flows: HashMap::new(),
+            flows: FxHashMap::default(),
+            insertion_order: VecDeque::new(),
             next_prune_at: None,
         }
     }
@@ -210,6 +214,7 @@ impl FlowRouter {
         if !self.flows.contains_key(&key) {
             self.make_room(now);
             self.flows.insert(key, FlowSlot::new(now));
+            self.insertion_order.push_back(key);
         }
 
         let slot = self.flows.get_mut(&key).expect("flow was inserted");
@@ -299,13 +304,10 @@ impl FlowRouter {
         if self.flows.len() < self.config.max_flows {
             return;
         }
-        if let Some(oldest) = self
-            .flows
-            .iter()
-            .min_by_key(|(_, flow)| flow.updated_at)
-            .map(|(key, _)| *key)
-        {
-            self.flows.remove(&oldest);
+        while let Some(oldest) = self.insertion_order.pop_front() {
+            if self.flows.remove(&oldest).is_some() {
+                return;
+            }
         }
     }
 }

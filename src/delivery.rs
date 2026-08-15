@@ -314,6 +314,22 @@ impl DeliverySource {
         }
     }
 
+    /// Synchronize queue history sampled by the lock-free data-plane tagger
+    /// before applying a receiver report. Report handling is cold relative to
+    /// packet tagging, so the mutable source table stays off the hot path.
+    pub fn observe_queue_since(
+        &mut self,
+        session_id: u64,
+        nonempty_since: Option<Instant>,
+        now: Instant,
+    ) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.last_used = now;
+        session.queue_nonempty_since = nonempty_since;
+    }
+
     pub fn apply_report(
         &mut self,
         report: &DeliveryReport,
@@ -367,18 +383,14 @@ impl DeliverySource {
     }
 
     fn allocate_session_id(&mut self, origin: EndpointId) -> u64 {
+        let mut mix = 0_u64;
+        for chunk in origin.as_bytes().chunks_exact(8) {
+            mix ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        }
         loop {
             let sequence = self.next_session_id.max(1);
             self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"ironet-delivery-session-v1\0");
-            hasher.update(origin.as_bytes());
-            hasher.update(&sequence.to_be_bytes());
-            let id = u64::from_be_bytes(
-                hasher.finalize().as_bytes()[..8]
-                    .try_into()
-                    .expect("hash prefix has fixed length"),
-            );
+            let id = sequence ^ mix;
             if id != 0 && !self.sessions.contains_key(&id) {
                 return id;
             }

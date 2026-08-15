@@ -5,12 +5,13 @@ use std::{
     net::IpAddr,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use ipnet::IpNet;
@@ -29,11 +30,16 @@ use tokio::{
     task::JoinSet,
 };
 use tracing::{debug, info, warn};
+use tun_rs::{AsyncDevice, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::{
     address::{
         Nat64Prefix, discover_nat64_prefix, network_alpn, network_discovery_status,
         network_probe_alpn,
+    },
+    buffer::{
+        BufferBudget, DEFAULT_FEC_DECODE_BYTES, DEFAULT_QUEUE_BYTES, DEFAULT_REASSEMBLY_BYTES,
+        DEFAULT_REPAIR_BYTES, DataplaneBuf, PROCESS_PAYLOAD_BUDGET_BYTES,
     },
     capacity::{CapacitySnapshot, RouteEstimateTable, RouteKey},
     capacity_probe::{
@@ -41,7 +47,7 @@ use crate::{
         CapacityProbeStart, ProbeReceiver, ProbeRequest, ProbeStatusSnapshot, append_probe_hop,
         encode_probe, forward_next_hop, reverse_next_hop,
     },
-    config::{AttachmentMode, Config, DialRole, IpFamilyPreference, PeerConfig, RelayConfig},
+    config::{AttachmentMode, Config, DialRole, PeerConfig, RelayConfig},
     delivery::{
         DELIVERY_ROUTE_TEMPLATE_TTL, DELIVERY_SESSION_TTL, DELIVERY_TAG_WIRE_BYTES,
         DeliveryMessage, DeliveryReceiver, DeliveryReport, DeliverySessionRegister, DeliverySource,
@@ -71,22 +77,27 @@ use crate::{
     },
     trace::TraceResponder,
     transport::{
-        AdaptiveFrameSizer, OUTBOUND_QUEUE_BYTES, OutboundItem, OutboundPacket, OutboundQueue,
-        RepairCache, adaptive_queue_max_age, store_duration_micros,
+        AdaptiveFrameSizer, OUTBOUND_QUEUE_BYTES, OutboundConsumer, OutboundItem, OutboundPacket,
+        OutboundQueue, RepairCache, adaptive_queue_max_age, store_duration_micros,
     },
-    tunnel::OverlayTunnel,
+    tunnel::{
+        OverlayTunnel, OverlayTunnelQueueWriter, attach_virtio, data_plane_parallelism,
+        tun_read_pool,
+    },
     wire::{
         MAX_PACKET_FRAME_HEADER_LEN, Reassembler, WireDatagram, decode_datagram,
-        encode_address_candidates, encode_batch, encode_heartbeat, encode_packet_tagged,
+        encode_address_candidates, encode_batch, encode_heartbeat, encode_packet_from_buf,
         encode_repair_request,
     },
 };
 
-// Hold one maximum-size TUN packet after fragmentation so noq can submit a
-// complete UDP GSO batch instead of blocking the peer task every few
-// datagrams. Keep the bound to one packet so priority traffic cannot build an
-// unbounded hidden FIFO behind bulk traffic.
-const QUIC_SEND_BUFFER_BYTES: usize = 64 * 1024;
+// Keep noq's non-preemptible FIFO smaller than a short interactive burst.
+// Large TUN super-packets remain in the application scheduler between wire
+// datagrams, where control/latency work can preempt them, instead of hiding a
+// whole 64 KiB packet behind bulk traffic inside QUIC.
+const QUIC_SEND_BUFFER_BYTES: usize = 8 * 1024;
+// Keep 8 MiB receive so FEC/repair can absorb a BDP of loss. Shrinking it
+// without a measured loss/FEC regression would trade recoverability for RSS.
 const QUIC_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const SMALL_PACKET_LIMIT: usize = 512;
 const OVERLAY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -114,7 +125,14 @@ const UNKNOWN_ADMISSION_CONCURRENCY: usize = 16;
 // sight of the class-aware outbound queues.
 const FLOW_DISPATCH_QUEUE: usize = 64;
 const CAPACITY_EVENT_QUEUE: usize = 4_096;
+const ROUTE_SNAPSHOT_REFRESH: Duration = Duration::from_millis(100);
+const INBOUND_ROUTER_BATCH: usize = 128;
 const LATENCY_PRESSURE_LIMIT: u64 = 64 * 1024;
+// A merely connected owner must not suppress every transit path. Above these
+// thresholds the direct adjacency remains a candidate, but FlowRouter is also
+// given healthy transit alternatives so loss or queue collapse can move work.
+const DIRECT_OWNER_MAX_LOSS_PPM: u32 = 50_000;
+const DIRECT_OWNER_MIN_HEALTH_PER_MILLE: u16 = 700;
 // A low-pressure flow normally receives latency service, but one large TUN
 // super-packet must never monopolize that class while it is fragmented into
 // dozens of wire datagrams. Flow demand still controls route selection; this
@@ -131,17 +149,148 @@ fn latency_service(demand_bytes: u64, packet_len: usize) -> bool {
     demand_bytes < LATENCY_PRESSURE_LIMIT && packet_len <= PRIORITY_PACKET_LIMIT
 }
 
+fn delivery_tracking_required(
+    destination_owner: EndpointId,
+    selected_endpoint: EndpointId,
+    candidate_count: usize,
+    selected_path_transport: u64,
+) -> bool {
+    candidate_count > 1 || selected_endpoint != destination_owner || selected_path_transport != 1
+}
+
 struct InboundPacket {
     peer_id: EndpointId,
-    packet: Vec<u8>,
+    packet: DataplaneBuf,
+    packet_info: PacketInfo,
     delivery_tag: Option<DeliveryTag>,
 }
 
 struct RouteRequest {
-    packet: Vec<u8>,
+    packet: DataplaneBuf,
     packet_info: PacketInfo,
     previous_peer: Option<EndpointId>,
     delivery_tag: Option<DeliveryTag>,
+}
+
+#[derive(Clone)]
+struct InboundDispatcher {
+    senders: Arc<Vec<mpsc::Sender<InboundPacket>>>,
+}
+
+impl InboundDispatcher {
+    fn new(senders: Vec<mpsc::Sender<InboundPacket>>) -> Self {
+        assert!(!senders.is_empty(), "at least one inbound shard is required");
+        Self {
+            senders: Arc::new(senders),
+        }
+    }
+
+    fn shard_for(&self, packet: PacketInfo) -> usize {
+        flow_shard(packet, self.senders.len())
+    }
+
+    async fn send(&self, packet: InboundPacket) -> Result<()> {
+        let shard = self.shard_for(packet.packet_info);
+        self.senders[shard]
+            .send(packet)
+            .await
+            .context("inbound shard queue closed")
+    }
+}
+
+#[derive(Clone)]
+struct RouteDispatcher {
+    senders: Arc<Vec<mpsc::Sender<RouteRequest>>>,
+}
+
+impl RouteDispatcher {
+    fn new(senders: Vec<mpsc::Sender<RouteRequest>>) -> Self {
+        assert!(
+            !senders.is_empty(),
+            "at least one FlowRouter shard is required"
+        );
+        Self {
+            senders: Arc::new(senders),
+        }
+    }
+
+    fn shard_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    fn shard_for(&self, packet: PacketInfo) -> usize {
+        flow_shard(packet, self.senders.len())
+    }
+
+    async fn send_batch(&self, requests: &mut Vec<RouteRequest>) -> Result<()> {
+        let mut scratch = (0..self.senders.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        self.send_batch_with_scratch(requests, &mut scratch).await
+    }
+
+    async fn send_batch_with_scratch(
+        &self,
+        requests: &mut Vec<RouteRequest>,
+        by_shard: &mut [Vec<RouteRequest>],
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(by_shard.len(), self.senders.len());
+        for bucket in by_shard.iter_mut() {
+            bucket.clear();
+        }
+        for request in requests.drain(..) {
+            by_shard[self.shard_for(request.packet_info)].push(request);
+        }
+        for (sender, shard) in self.senders.iter().zip(by_shard.iter_mut()) {
+            while !shard.is_empty() {
+                let count = shard.len().min(FLOW_DISPATCH_QUEUE);
+                let permits = sender
+                    .reserve_many(count)
+                    .await
+                    .context("FlowRouter request queue closed")?;
+                for (permit, request) in permits.zip(shard.drain(..count)) {
+                    permit.send(request);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn flow_shard(packet: PacketInfo, shards: usize) -> usize {
+    debug_assert!(shards > 0);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix_u64 = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    let mut mix_bytes = |bytes: &[u8]| {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in chunks.by_ref() {
+            mix_u64(u64::from_ne_bytes(chunk.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut tail = [0_u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            mix_u64(u64::from_ne_bytes(tail));
+        }
+    };
+    match packet.source {
+        std::net::IpAddr::V4(address) => mix_bytes(&address.octets()),
+        std::net::IpAddr::V6(address) => mix_bytes(&address.octets()),
+    }
+    match packet.destination {
+        std::net::IpAddr::V4(address) => mix_bytes(&address.octets()),
+        std::net::IpAddr::V6(address) => mix_bytes(&address.octets()),
+    }
+    mix_bytes(&[packet.protocol]);
+    mix_bytes(&packet.source_port.unwrap_or_default().to_be_bytes());
+    mix_bytes(&packet.destination_port.unwrap_or_default().to_be_bytes());
+    (hash as usize) % shards
 }
 
 /// One encoded application transmission that may be suspended between wire
@@ -221,11 +370,221 @@ struct DeliveryCoordinator {
     forwarding: HashMap<u64, DeliveryBinding>,
 }
 
+#[derive(Debug)]
+struct FastDeliveryBinding {
+    registration: DeliverySessionRegister,
+    next_sequence: AtomicU32,
+    last_used_micros: AtomicU64,
+    queue_nonempty_since_micros: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FastSourceLiveness {
+    route: RouteKey,
+    session_id: u64,
+    queue_nonempty_since: Option<Instant>,
+}
+
+/// Read-mostly delivery-session index. Control-plane registration and report
+/// application remain serialized, while tagged data packets only perform an
+/// ArcSwap lookup plus relaxed atomics. This removes DeliveryCoordinator from
+/// the per-packet transit/multipath hot path.
+#[derive(Debug)]
+struct DeliveryFastPath {
+    started: Instant,
+    source_routes: arc_swap::ArcSwap<HashMap<RouteKey, Arc<FastDeliveryBinding>>>,
+    forwarding: arc_swap::ArcSwap<HashMap<u64, Arc<FastDeliveryBinding>>>,
+}
+
+impl Default for DeliveryFastPath {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            source_routes: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            forwarding: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
+}
+
+impl DeliveryFastPath {
+    fn duration_micros(duration: Duration) -> u64 {
+        duration.as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn now_micros(&self) -> u64 {
+        Self::duration_micros(self.started.elapsed()).max(1)
+    }
+
+    fn install_source(&self, registration: DeliverySessionRegister, next_sequence: u32) {
+        let route = RouteKey {
+            destination: registration.destination,
+            first_hop: registration.first_hop,
+        };
+        let binding = Arc::new(FastDeliveryBinding {
+            registration,
+            next_sequence: AtomicU32::new(next_sequence),
+            last_used_micros: AtomicU64::new(self.now_micros()),
+            queue_nonempty_since_micros: AtomicU64::new(0),
+        });
+        self.source_routes.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.insert(route, binding.clone());
+            Arc::new(updated)
+        });
+    }
+
+    fn install_forwarding(&self, registration: DeliverySessionRegister) {
+        let session_id = registration.session_id;
+        let binding = Arc::new(FastDeliveryBinding {
+            registration,
+            next_sequence: AtomicU32::new(0),
+            last_used_micros: AtomicU64::new(self.now_micros()),
+            queue_nonempty_since_micros: AtomicU64::new(0),
+        });
+        self.forwarding.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.insert(session_id, binding.clone());
+            Arc::new(updated)
+        });
+    }
+
+    fn next_source_tag(
+        &self,
+        route: RouteKey,
+        path_epoch: u64,
+        queue_nonempty: bool,
+    ) -> Option<DeliveryTag> {
+        let now = self.now_micros();
+        let routes = self.source_routes.load();
+        let binding = routes.get(&route)?;
+        if binding.registration.path_epoch != path_epoch
+            || now.saturating_sub(binding.last_used_micros.load(Ordering::Relaxed))
+                > Self::duration_micros(DELIVERY_SESSION_TTL)
+        {
+            return None;
+        }
+        binding.last_used_micros.store(now, Ordering::Relaxed);
+        if queue_nonempty {
+            let _ = binding.queue_nonempty_since_micros.compare_exchange(
+                0,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        } else {
+            binding
+                .queue_nonempty_since_micros
+                .store(0, Ordering::Relaxed);
+        }
+        Some(DeliveryTag {
+            session_id: binding.registration.session_id,
+            sequence: binding.next_sequence.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    fn remove_source_session(&self, session_id: u64) {
+        self.source_routes.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.retain(|_, binding| binding.registration.session_id != session_id);
+            Arc::new(updated)
+        });
+    }
+
+    fn source_queue_nonempty_since(&self, session_id: u64) -> Option<Instant> {
+        let routes = self.source_routes.load();
+        let binding = routes
+            .values()
+            .find(|binding| binding.registration.session_id == session_id)?;
+        let micros = binding.queue_nonempty_since_micros.load(Ordering::Relaxed);
+        (micros != 0).then(|| self.started + Duration::from_micros(micros))
+    }
+
+    fn source_liveness(&self) -> Vec<FastSourceLiveness> {
+        let now = self.now_micros();
+        let ttl = Self::duration_micros(DELIVERY_SESSION_TTL);
+        self.source_routes
+            .load()
+            .iter()
+            .filter(|(_, binding)| {
+                now.saturating_sub(binding.last_used_micros.load(Ordering::Relaxed)) <= ttl
+            })
+            .map(|(route, binding)| {
+                let queue_micros = binding.queue_nonempty_since_micros.load(Ordering::Relaxed);
+                FastSourceLiveness {
+                    route: *route,
+                    session_id: binding.registration.session_id,
+                    queue_nonempty_since: (queue_micros != 0)
+                        .then(|| self.started + Duration::from_micros(queue_micros)),
+                }
+            })
+            .collect()
+    }
+
+    fn touch_forwarding(&self, session_id: u64) -> bool {
+        let forwarding = self.forwarding.load();
+        let Some(binding) = forwarding.get(&session_id) else {
+            return false;
+        };
+        binding
+            .last_used_micros
+            .store(self.now_micros(), Ordering::Relaxed);
+        true
+    }
+
+    fn forwarding_registration(&self, session_id: u64) -> Option<DeliverySessionRegister> {
+        self.forwarding
+            .load()
+            .get(&session_id)
+            .map(|binding| binding.registration.clone())
+    }
+
+    /// Resolve report routing from the lock-free session generation. Sources
+    /// live in `source_routes`; transit and destination nodes live in
+    /// `forwarding`. Reports are cold, so the bounded source scan is preferable
+    /// to putting another shared mutable index on every tagged data packet.
+    fn session_registration(&self, session_id: u64) -> Option<DeliverySessionRegister> {
+        if let Some(binding) = self.forwarding.load().get(&session_id) {
+            binding
+                .last_used_micros
+                .store(self.now_micros(), Ordering::Relaxed);
+            return Some(binding.registration.clone());
+        }
+        let routes = self.source_routes.load();
+        let binding = routes
+            .values()
+            .find(|binding| binding.registration.session_id == session_id)?;
+        binding
+            .last_used_micros
+            .store(self.now_micros(), Ordering::Relaxed);
+        Some(binding.registration.clone())
+    }
+
+    fn prune(&self) {
+        let now = self.now_micros();
+        let ttl = Self::duration_micros(DELIVERY_SESSION_TTL);
+        self.source_routes.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.retain(|_, binding| {
+                now.saturating_sub(binding.last_used_micros.load(Ordering::Relaxed)) <= ttl
+            });
+            Arc::new(updated)
+        });
+        self.forwarding.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.retain(|_, binding| {
+                now.saturating_sub(binding.last_used_micros.load(Ordering::Relaxed)) <= ttl
+            });
+            Arc::new(updated)
+        });
+    }
+}
+
 #[derive(Clone)]
 struct CapacityManagerState {
     estimates: Arc<StdRwLock<RouteEstimateTable>>,
     probe_status: Arc<StdRwLock<ProbeStatusSnapshot>>,
     delivery: Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: Arc<DeliveryFastPath>,
 }
 
 impl DeliveryCoordinator {
@@ -301,6 +660,12 @@ impl DeliveryCoordinator {
         }
     }
 
+    fn source_registration(&self, route: RouteKey) -> Option<DeliverySessionRegister> {
+        self.source_routes
+            .get(&route)
+            .map(|binding| binding.registration.clone())
+    }
+
     fn install_forwarding(
         &mut self,
         registration: crate::delivery::DeliverySessionRegister,
@@ -341,6 +706,22 @@ impl DeliveryCoordinator {
         self.source.invalidate_route(route);
     }
 
+    fn synchronize_source_liveness(&mut self, liveness: FastSourceLiveness, now: Instant) {
+        let Some(binding) = self.source_routes.get_mut(&liveness.route) else {
+            return;
+        };
+        if binding.registration.session_id != liveness.session_id {
+            return;
+        }
+        binding.last_used = now;
+        if let Some(forwarding) = self.forwarding.get_mut(&liveness.session_id) {
+            forwarding.last_used = now;
+        }
+        self.source
+            .observe_queue_since(liveness.session_id, liveness.queue_nonempty_since, now);
+    }
+
+    #[cfg(test)]
     fn observe_delivery(
         &mut self,
         tag: DeliveryTag,
@@ -353,12 +734,14 @@ impl DeliveryCoordinator {
         self.receiver.observe(tag, bytes, now)
     }
 
+    #[cfg(test)]
     fn touch_forwarding(&mut self, session_id: u64, now: Instant) {
         if let Some(binding) = self.forwarding.get_mut(&session_id) {
             binding.last_used = now;
         }
     }
 
+    #[cfg(test)]
     fn forwarding_hops(
         &mut self,
         origin: EndpointId,
@@ -378,18 +761,49 @@ impl DeliveryCoordinator {
         report: &DeliveryReport,
         now: Instant,
     ) -> Option<crate::delivery::PassiveObservation> {
-        let forwarding = self.forwarding.get(&report.session_id)?;
+        let Some(forwarding) = self.forwarding.get(&report.session_id) else {
+            debug!(
+                session_id = report.session_id,
+                "delivery report source session has no mutable forwarding binding"
+            );
+            return None;
+        };
         let route = RouteKey {
             destination: forwarding.registration.destination,
             first_hop: forwarding.registration.first_hop,
         };
-        let binding = self.source_routes.get_mut(&route)?;
+        let Some(binding) = self.source_routes.get_mut(&route) else {
+            debug!(
+                session_id = report.session_id,
+                destination = %route.destination,
+                first_hop = %route.first_hop,
+                "delivery report source session has no route template"
+            );
+            return None;
+        };
         if binding.registration.session_id != report.session_id {
+            debug!(
+                report_session_id = report.session_id,
+                active_session_id = binding.registration.session_id,
+                destination = %route.destination,
+                first_hop = %route.first_hop,
+                "delivery report belongs to a superseded source session"
+            );
             return None;
         }
         binding.last_used = now;
         let epoch = binding.registration.path_epoch;
-        self.source.apply_report(report, route, epoch, now)
+        let observation = self.source.apply_report(report, route, epoch, now);
+        if observation.is_none() {
+            debug!(
+                session_id = report.session_id,
+                path_epoch = report.path_epoch,
+                destination = %route.destination,
+                first_hop = %route.first_hop,
+                "delivery source rejected cumulative report state"
+            );
+        }
+        observation
     }
 
     fn prune(&mut self, now: Instant) {
@@ -446,6 +860,164 @@ struct RouteChoice {
     adjacency_index: usize,
     candidate: RouteCandidate,
     capacity: CapacitySnapshot,
+}
+
+/// Immutable prefix-membership index used by the packet-policy hot path.
+/// Lookup cost depends on the number of distinct prefix lengths, not on the
+/// number of advertised routes, and every FlowRouter shard shares one Arc
+/// generation without taking a mesh/control-plane lock.
+#[derive(Debug, Default)]
+struct IpPrefixSet {
+    v4: HashSet<(u8, u32)>,
+    v6: HashSet<(u8, u128)>,
+    v4_lengths: Vec<u8>,
+    v6_lengths: Vec<u8>,
+}
+
+impl IpPrefixSet {
+    fn from_prefixes(prefixes: impl IntoIterator<Item = IpNet>) -> Self {
+        let mut set = Self::default();
+        for prefix in prefixes {
+            match prefix {
+                IpNet::V4(prefix) => {
+                    let length = prefix.prefix_len();
+                    set.v4
+                        .insert((length, mask_v4(u32::from(prefix.network()), length)));
+                }
+                IpNet::V6(prefix) => {
+                    let length = prefix.prefix_len();
+                    set.v6
+                        .insert((length, mask_v6(u128::from(prefix.network()), length)));
+                }
+            }
+        }
+        set.v4_lengths = set.v4.iter().map(|(length, _)| *length).collect();
+        set.v4_lengths
+            .sort_unstable_by(|left, right| right.cmp(left));
+        set.v4_lengths.dedup();
+        set.v6_lengths = set.v6.iter().map(|(length, _)| *length).collect();
+        set.v6_lengths
+            .sort_unstable_by(|left, right| right.cmp(left));
+        set.v6_lengths.dedup();
+        set
+    }
+
+    fn contains(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => {
+                let address = u32::from(address);
+                self.v4_lengths
+                    .iter()
+                    .any(|length| self.v4.contains(&(*length, mask_v4(address, *length))))
+            }
+            IpAddr::V6(address) => {
+                let address = u128::from(address);
+                self.v6_lengths
+                    .iter()
+                    .any(|length| self.v6.contains(&(*length, mask_v6(address, *length))))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PrefixOwnerTable {
+    v4: HashMap<(u8, u32), EndpointId>,
+    v6: HashMap<(u8, u128), EndpointId>,
+    v4_lengths: Vec<u8>,
+    v6_lengths: Vec<u8>,
+}
+
+impl PrefixOwnerTable {
+    fn from_origins(origins: impl IntoIterator<Item = (EndpointId, IpNet)>) -> Self {
+        let mut table = Self::default();
+        for (owner, prefix) in origins {
+            match prefix {
+                IpNet::V4(prefix) => {
+                    let length = prefix.prefix_len();
+                    table.v4.insert(
+                        (length, mask_v4(u32::from(prefix.network()), length)),
+                        owner,
+                    );
+                    table.v4_lengths.push(length);
+                }
+                IpNet::V6(prefix) => {
+                    let length = prefix.prefix_len();
+                    table.v6.insert(
+                        (length, mask_v6(u128::from(prefix.network()), length)),
+                        owner,
+                    );
+                    table.v6_lengths.push(length);
+                }
+            }
+        }
+        table
+            .v4_lengths
+            .sort_unstable_by(|left, right| right.cmp(left));
+        table.v4_lengths.dedup();
+        table
+            .v6_lengths
+            .sort_unstable_by(|left, right| right.cmp(left));
+        table.v6_lengths.dedup();
+        table
+    }
+
+    fn owner(&self, address: std::net::IpAddr) -> Option<EndpointId> {
+        match address {
+            std::net::IpAddr::V4(address) => {
+                let address = u32::from(address);
+                self.v4_lengths
+                    .iter()
+                    .find_map(|length| self.v4.get(&(*length, mask_v4(address, *length))).copied())
+            }
+            std::net::IpAddr::V6(address) => {
+                let address = u128::from(address);
+                self.v6_lengths
+                    .iter()
+                    .find_map(|length| self.v6.get(&(*length, mask_v6(address, *length))).copied())
+            }
+        }
+    }
+}
+
+fn mask_v4(address: u32, prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        address
+            & u32::MAX
+                .checked_shl(u32::from(32 - prefix_len))
+                .unwrap_or(0)
+    }
+}
+
+fn mask_v6(address: u128, prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        address
+            & u128::MAX
+                .checked_shl(u32::from(128 - prefix_len))
+                .unwrap_or(0)
+    }
+}
+
+struct RouteAdjacencySnapshot {
+    input: AdjacencyRouteInput,
+    direct_capacity: CapacitySnapshot,
+    peer: Arc<Peer>,
+}
+
+struct DataPlaneRouteSnapshot {
+    owners: PrefixOwnerTable,
+    mesh_owners: PrefixOwnerTable,
+    overlay_prefixes: IpPrefixSet,
+    local_prefixes: IpPrefixSet,
+    remote_prefixes: IpPrefixSet,
+    adjacencies: Vec<RouteAdjacencySnapshot>,
+    adjacency_by_owner: HashMap<EndpointId, usize>,
+    capacities: HashMap<RouteKey, CapacitySnapshot>,
+    max_egress_bps: Option<u64>,
 }
 
 pub async fn run(config: Config, secret_key: SecretKey) -> Result<()> {
@@ -583,12 +1155,30 @@ async fn run_data_plane(
 
     let inherited_relays = config.inherited_peer_relays()?;
     let nat64_prefix = Arc::new(StdRwLock::new(None::<Nat64Prefix>));
-    let (inbound_tx, inbound_rx) = mpsc::channel(FLOW_DISPATCH_QUEUE);
-    let (route_tx, route_rx) = mpsc::channel(FLOW_DISPATCH_QUEUE);
+    let router_shards = tunnel
+        .as_ref()
+        .map_or_else(data_plane_parallelism, |tunnel| tunnel.queue_count());
+    let mut inbound_senders = Vec::with_capacity(router_shards);
+    let mut inbound_receivers = Vec::with_capacity(router_shards);
+    for _ in 0..router_shards {
+        let (sender, receiver) = mpsc::channel(FLOW_DISPATCH_QUEUE);
+        inbound_senders.push(sender);
+        inbound_receivers.push(receiver);
+    }
+    let inbound_dispatcher = InboundDispatcher::new(inbound_senders);
+    let mut route_senders = Vec::with_capacity(router_shards);
+    let mut route_receivers = Vec::with_capacity(router_shards);
+    for _ in 0..router_shards {
+        let (sender, receiver) = mpsc::channel(FLOW_DISPATCH_QUEUE);
+        route_senders.push(sender);
+        route_receivers.push(receiver);
+    }
+    let route_dispatcher = RouteDispatcher::new(route_senders);
     let (capacity_tx, capacity_rx) = mpsc::channel(CAPACITY_EVENT_QUEUE);
     let route_estimates = Arc::new(StdRwLock::new(RouteEstimateTable::default()));
     let probe_status = Arc::new(StdRwLock::new(ProbeStatusSnapshot::default()));
     let delivery = Arc::new(StdMutex::new(DeliveryCoordinator::default()));
+    let delivery_fast = Arc::new(DeliveryFastPath::default());
     let flow_router_counters = Arc::new(FlowRouterCounters::default());
     let mut peers = HashMap::new();
     for peer_config in &config.peers {
@@ -604,7 +1194,7 @@ async fn run_data_plane(
                 derp_transport: derp_transport.as_ref(),
                 mesh_runtime: mesh_runtime.clone(),
                 nat64_prefix: nat64_prefix.clone(),
-                inbound_packets: inbound_tx.clone(),
+                inbound_packets: inbound_dispatcher.clone(),
                 capacity_events: capacity_tx.clone(),
             },
         )?;
@@ -637,11 +1227,16 @@ async fn run_data_plane(
             mesh,
             peers.clone(),
             peer_counters.clone(),
-            inbound_tx.clone(),
+            inbound_dispatcher.clone(),
             capacity_tx.clone(),
         )?),
         None => None,
     };
+    let initial_route_snapshot = Arc::new(
+        build_route_snapshot(config, &peers, mesh_runtime.as_deref(), &route_estimates).await,
+    );
+    let (route_snapshot_tx, route_snapshot_rx) =
+        tokio::sync::watch::channel(initial_route_snapshot);
     let runtime_state = Arc::new(RuntimeState::new(
         local_id,
         routing_table(config),
@@ -664,6 +1259,15 @@ async fn run_data_plane(
     }
 
     let mut tasks = JoinSet::new();
+    {
+        let config = config.clone();
+        let peers = peers.clone();
+        let mesh = mesh_runtime.clone();
+        let route_estimates = route_estimates.clone();
+        tasks.spawn(async move {
+            maintain_route_snapshots(config, peers, mesh, route_estimates, route_snapshot_tx).await
+        });
+    }
     for peer in &initial_peers {
         let sender = peer.clone();
         tasks.spawn(async move { sender.queue_to_network().await });
@@ -671,34 +1275,49 @@ async fn run_data_plane(
         tasks.spawn(async move { connector.maintain_connection().await });
     }
     if let Some(tunnel) = tunnel.clone() {
-        let tunnel = tunnel.clone();
-        let route_tx = route_tx.clone();
-        tasks.spawn(async move { tunnel_to_router(tunnel, route_tx).await });
+        for (shard, device) in tunnel.devices.iter().cloned().enumerate() {
+            let name = tunnel.name.clone();
+            let mtu = tunnel.mtu;
+            let dispatcher = route_dispatcher.clone();
+            tasks
+                .spawn(async move { tunnel_to_router(name, device, mtu, shard, dispatcher).await });
+        }
     }
-    {
+    for (shard, inbound_rx) in inbound_receivers.into_iter().enumerate() {
         let config = config.clone();
-        let tunnel = tunnel.clone();
-        let route_tx = route_tx.clone();
+        let tunnel_writer = tunnel.as_ref().map(|tunnel| tunnel.queue_writer(shard));
+        let route_dispatcher = route_dispatcher.clone();
         let capacity_tx = capacity_tx.clone();
-        let delivery = delivery.clone();
+        let delivery_fast = delivery_fast.clone();
+        let route_snapshot_rx = route_snapshot_rx.clone();
         tasks.spawn(async move {
-            inbound_to_router(config, tunnel, inbound_rx, route_tx, capacity_tx, delivery).await
+            inbound_to_router_shard(
+                config,
+                shard,
+                tunnel_writer,
+                inbound_rx,
+                route_dispatcher,
+                capacity_tx,
+                delivery_fast,
+                route_snapshot_rx,
+            )
+            .await
         });
     }
-    {
-        let config = config.clone();
-        let peers = peers.clone();
-        let mesh = mesh_runtime.clone();
+    for route_rx in route_receivers {
+        let max_egress_bps = config.routing.max_egress_bps();
+        let route_snapshot_rx = route_snapshot_rx.clone();
         let route_estimates = route_estimates.clone();
         let delivery = delivery.clone();
+        let delivery_fast = delivery_fast.clone();
         let flow_router_counters = flow_router_counters.clone();
         tasks.spawn(async move {
             run_flow_router(
-                config,
-                peers,
-                mesh,
+                max_egress_bps,
+                route_snapshot_rx,
                 route_estimates,
                 delivery,
+                delivery_fast,
                 flow_router_counters,
                 route_rx,
             )
@@ -712,6 +1331,7 @@ async fn run_data_plane(
         let route_estimates = route_estimates.clone();
         let probe_status = probe_status.clone();
         let delivery = delivery.clone();
+        let delivery_fast = delivery_fast.clone();
         tasks.spawn(async move {
             run_capacity_manager(
                 config,
@@ -722,6 +1342,7 @@ async fn run_data_plane(
                     estimates: route_estimates,
                     probe_status,
                     delivery,
+                    delivery_fast,
                 },
                 capacity_rx,
             )
@@ -811,328 +1432,606 @@ async fn run_data_plane(
 }
 
 async fn tunnel_to_router(
-    tunnel: Arc<OverlayTunnel>,
-    route_tx: mpsc::Sender<RouteRequest>,
+    name: String,
+    device: Arc<AsyncDevice>,
+    _mtu: u16,
+    read_shard: usize,
+    dispatcher: RouteDispatcher,
 ) -> Result<()> {
-    let mut packet = vec![0_u8; 65_535];
+    let mut original = vec![0_u8; tun_rs::VIRTIO_NET_HDR_LEN + usize::from(u16::MAX)];
+    let mut pool = tun_read_pool();
+    let mut slot_refs = Vec::with_capacity(pool.slot_count());
+    let mut sizes = vec![0_usize; pool.slot_count()];
+    let mut route_batch = Vec::with_capacity(pool.slot_count());
+    let mut dispatch_scratch = (0..dispatcher.shard_count())
+        .map(|_| Vec::new())
+        .collect::<Vec<_>>();
     loop {
-        let len = tunnel
-            .device
-            .recv(&mut packet)
+        pool.fill_batch(&mut slot_refs);
+        let count = device
+            .recv_multiple(&mut original, &mut slot_refs, &mut sizes, pool.headroom())
             .await
-            .with_context(|| format!("failed reading {}", tunnel.name))?;
-        let packet_info = match inspect_ip_packet(&packet[..len]) {
-            Ok(info) => info,
-            Err(error) => {
-                debug!(%error, "dropping invalid packet read from FlowRouter TUN");
-                continue;
-            }
-        };
-        route_tx
-            .send(RouteRequest {
-                packet: packet[..len].to_vec(),
+            .with_context(|| format!("failed reading {name} queue {read_shard}"))?;
+        slot_refs.clear();
+        for index in 0..count {
+            let packet = pool.take(index, sizes[index]);
+            let packet_info = match inspect_ip_packet(packet.as_slice()) {
+                Ok(info) => info,
+                Err(error) => {
+                    debug!(%error, read_shard, "dropping invalid packet read from FlowRouter TUN");
+                    continue;
+                }
+            };
+            route_batch.push(RouteRequest {
+                packet,
                 packet_info,
                 previous_peer: None,
                 delivery_tag: None,
-            })
-            .await
-            .context("FlowRouter request queue closed")?;
+            });
+        }
+        dispatcher
+            .send_batch_with_scratch(&mut route_batch, &mut dispatch_scratch)
+            .await?;
     }
 }
 
-async fn inbound_to_router(
+async fn inbound_to_router_shard(
     config: Config,
-    tunnel: Option<Arc<OverlayTunnel>>,
+    shard: usize,
+    mut tunnel_writer: Option<OverlayTunnelQueueWriter>,
     mut inbound_rx: mpsc::Receiver<InboundPacket>,
-    route_tx: mpsc::Sender<RouteRequest>,
+    route_dispatcher: RouteDispatcher,
     capacity_tx: mpsc::Sender<CapacityEvent>,
-    delivery: Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: Arc<DeliveryFastPath>,
+    mut route_snapshots: tokio::sync::watch::Receiver<Arc<DataPlaneRouteSnapshot>>,
 ) -> Result<()> {
-    while let Some(mut inbound) = inbound_rx.recv().await {
-        let info = match inspect_ip_packet(&inbound.packet) {
-            Ok(info) => info,
-            Err(error) => {
-                debug!(peer = %inbound.peer_id, %error, "dropping invalid inbound packet");
-                continue;
-            }
-        };
-        let local_destination = config
-            .all_advertised_prefixes()
-            .any(|prefix| prefix.contains(&info.destination));
-        if local_destination {
-            let Some(tunnel) = &tunnel else {
-                debug!(destination = %info.destination, "dropping local packet without an attachment");
+    let mut inbound_batch = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    let mut local = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    let mut tun_buffers = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    let mut transit = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    let mut dispatch_scratch = (0..route_dispatcher.shard_count())
+        .map(|_| Vec::new())
+        .collect::<Vec<_>>();
+    let mut active_snapshot = route_snapshots.borrow_and_update().clone();
+    let mut delivery_receiver = DeliveryReceiver::default();
+    let mut registered_delivery_sessions = HashSet::new();
+    loop {
+        inbound_batch.clear();
+        if inbound_rx
+            .recv_many(&mut inbound_batch, INBOUND_ROUTER_BATCH)
+            .await
+            == 0
+        {
+            break;
+        }
+        if route_snapshots.has_changed().unwrap_or(false) {
+            active_snapshot = route_snapshots.borrow_and_update().clone();
+        }
+        let batch_now = Instant::now();
+        for mut inbound in inbound_batch.drain(..) {
+            let info = inbound.packet_info;
+            let snapshot = active_snapshot.as_ref();
+            let Some(adjacency_index) = snapshot.adjacency_by_owner.get(&inbound.peer_id) else {
+                debug!(peer = %inbound.peer_id, "dropping packet from expired adjacency generation");
                 continue;
             };
-            tunnel
-                .device
-                .send(&inbound.packet)
-                .await
-                .context("failed injecting inbound packet into FlowRouter TUN")?;
-            if let Some(tag) = inbound.delivery_tag {
-                // Aggregate at the receiver before entering the bounded
-                // capacity-event queue. Enqueuing one event per data packet
-                // would shed a biased subset under high throughput and turn
-                // receiver-confirmed capacity into a severe underestimate.
-                let report = delivery
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .observe_delivery(tag, inbound.packet.len(), Instant::now());
-                if let Some(report) = report {
-                    let _ = capacity_tx.try_send(CapacityEvent::Delivered { report });
+            let Some(adjacency) = snapshot.adjacencies.get(*adjacency_index) else {
+                continue;
+            };
+            let peer = &adjacency.peer;
+            if !peer.packet_allowed(
+                snapshot,
+                adjacency.input.transit_enabled,
+                info.source,
+                info.destination,
+                true,
+            ) {
+                if should_log(&peer.counters.policy_drops) {
+                    warn!(
+                        peer = %peer.name,
+                        source = %info.source,
+                        destination = %info.destination,
+                        policy_drops = peer.counters.policy_drops.load(Ordering::Relaxed),
+                        "dropping inbound packet rejected by immutable overlay policy"
+                    );
                 }
+                continue;
             }
-            continue;
-        }
-        if !config.routing.transit_enabled {
-            continue;
-        }
-        if let Err(error) = decrement_hop_limit_validated(&mut inbound.packet) {
-            debug!(peer = %inbound.peer_id, %error, "dropping packet at overlay hop limit");
-            continue;
-        }
-        route_tx
-            .send(RouteRequest {
+            peer.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+            peer.counters
+                .rx_bytes
+                .fetch_add(inbound.packet.len() as u64, Ordering::Relaxed);
+            if snapshot.local_prefixes.contains(info.destination) {
+                if tunnel_writer.is_none() {
+                    debug!(destination = %info.destination, "dropping local packet without an attachment");
+                    continue;
+                }
+                local.push(inbound);
+                continue;
+            }
+            if !config.routing.transit_enabled {
+                continue;
+            }
+            if let Err(error) = inbound
+                .packet
+                .try_map_payload(decrement_hop_limit_validated)
+            {
+                debug!(peer = %inbound.peer_id, %error, "dropping packet at overlay hop limit");
+                continue;
+            }
+            transit.push(RouteRequest {
                 packet: inbound.packet,
                 packet_info: info,
                 previous_peer: Some(inbound.peer_id),
                 delivery_tag: inbound.delivery_tag,
-            })
-            .await
-            .context("FlowRouter request queue closed")?;
+            });
+        }
+
+        if let Some(writer) = tunnel_writer.as_mut()
+            && !local.is_empty()
+        {
+            tun_buffers.clear();
+            for inbound in &local {
+                tun_buffers.push(attach_virtio(inbound.packet.clone()));
+            }
+            writer
+                .send_owned(&mut tun_buffers)
+                .await
+                .context("failed injecting inbound packet batch into FlowRouter TUN")?;
+            for inbound in local.drain(..) {
+                let Some(tag) = inbound.delivery_tag else {
+                    continue;
+                };
+                if !registered_delivery_sessions.contains(&tag.session_id) {
+                    let Some(registration) =
+                        delivery_fast.forwarding_registration(tag.session_id)
+                    else {
+                        continue;
+                    };
+                    if delivery_receiver.register(registration, batch_now).is_err() {
+                        continue;
+                    }
+                    if registered_delivery_sessions.len() >= MAX_DELIVERY_SESSIONS {
+                        registered_delivery_sessions.clear();
+                    }
+                    registered_delivery_sessions.insert(tag.session_id);
+                }
+                delivery_fast.touch_forwarding(tag.session_id);
+                let report = delivery_receiver.observe(tag, inbound.packet.len(), batch_now);
+                if let Some(report) = report {
+                    let _ = capacity_tx.try_send(CapacityEvent::Delivered { report });
+                }
+            }
+        }
+        route_dispatcher
+            .send_batch_with_scratch(&mut transit, &mut dispatch_scratch)
+            .await?;
+        let _ = shard;
     }
     bail!("inbound packet queue closed")
 }
 
-async fn run_flow_router(
+async fn build_route_snapshot(
+    config: &Config,
+    peers: &RwLock<HashMap<EndpointId, Arc<Peer>>>,
+    mesh: Option<&MeshRuntime>,
+    route_estimates: &StdRwLock<RouteEstimateTable>,
+) -> DataPlaneRouteSnapshot {
+    let (mesh_origins, transit_by_owner) = mesh
+        .map(MeshRuntime::routing_policy_snapshot)
+        .unwrap_or_default();
+    let mesh_owners = PrefixOwnerTable::from_origins(mesh_origins.iter().copied());
+    let mut origins = mesh_origins.clone();
+    // Pinned configuration is authoritative for an identical prefix. Insert
+    // it after Presence-derived policy so exact duplicates replace the dynamic
+    // entry while longest-prefix matching still governs overlaps.
+    origins.extend(config.route_origins.iter().flat_map(|origin| {
+        origin
+            .prefixes
+            .iter()
+            .copied()
+            .map(|prefix| (origin.endpoint_id, prefix))
+    }));
+    let owners = PrefixOwnerTable::from_origins(origins.iter().copied());
+    let overlay_prefixes = IpPrefixSet::from_prefixes(
+        config
+            .all_overlay_prefixes()
+            .chain(mesh_origins.iter().map(|(_, prefix)| *prefix)),
+    );
+    let local_prefixes = IpPrefixSet::from_prefixes(config.all_advertised_prefixes());
+    let remote_prefixes = IpPrefixSet::from_prefixes(
+        config
+            .all_remote_prefixes()
+            .chain(mesh_origins.iter().map(|(_, prefix)| *prefix)),
+    );
+    let peers = peers.read().await.values().cloned().collect::<Vec<_>>();
+    let now = Instant::now();
+    let estimates = route_estimates
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut adjacencies = Vec::with_capacity(peers.len());
+    let mut adjacency_by_owner = HashMap::with_capacity(peers.len());
+    for peer in peers {
+        let metrics = peer
+            .link_estimator
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        let index = adjacencies.len();
+        adjacency_by_owner.insert(peer.endpoint_id, index);
+        adjacencies.push(RouteAdjacencySnapshot {
+            input: AdjacencyRouteInput {
+                endpoint_id: peer.endpoint_id,
+                route_id: peer.route_id,
+                connected: peer.counters.connected.load(Ordering::Relaxed),
+                transit_enabled: transit_by_owner
+                    .get(&peer.endpoint_id)
+                    .copied()
+                    .unwrap_or(peer.declared_transit_enabled),
+                metrics,
+                queued_bytes: peer.outbound.queued_bytes(),
+            },
+            direct_capacity: estimates.snapshot_or_bootstrap(
+                &RouteKey {
+                    destination: peer.endpoint_id,
+                    first_hop: peer.endpoint_id,
+                },
+                now,
+                config.routing.max_egress_bps(),
+            ),
+            peer,
+        });
+    }
+    DataPlaneRouteSnapshot {
+        owners,
+        mesh_owners,
+        overlay_prefixes,
+        local_prefixes,
+        remote_prefixes,
+        adjacencies,
+        adjacency_by_owner,
+        capacities: estimates.snapshot_all(now, config.routing.max_egress_bps()),
+        max_egress_bps: config.routing.max_egress_bps(),
+    }
+}
+
+async fn maintain_route_snapshots(
     config: Config,
     peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
     mesh: Option<Arc<MeshRuntime>>,
     route_estimates: Arc<StdRwLock<RouteEstimateTable>>,
+    snapshots: tokio::sync::watch::Sender<Arc<DataPlaneRouteSnapshot>>,
+) -> Result<()> {
+    let mut refresh = tokio::time::interval(ROUTE_SNAPSHOT_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await;
+    loop {
+        refresh.tick().await;
+        snapshots.send_replace(Arc::new(
+            build_route_snapshot(&config, &peers, mesh.as_deref(), &route_estimates).await,
+        ));
+    }
+}
+
+fn direct_route_choice(
+    snapshot: &DataPlaneRouteSnapshot,
+    owner: EndpointId,
+    previous_peer: Option<EndpointId>,
+) -> Option<RouteChoice> {
+    if previous_peer == Some(owner) {
+        return None;
+    }
+    let adjacency_index = *snapshot.adjacency_by_owner.get(&owner)?;
+    let adjacency = snapshot.adjacencies.get(adjacency_index)?;
+    // Connected/queue state changes faster than the immutable topology
+    // generation. Refresh those two atomics on the fast path while keeping
+    // policy, prefix ownership and link metrics snapshot-owned.
+    if !adjacency.peer.counters.connected.load(Ordering::Relaxed) {
+        return None;
+    }
+    let capacity = adjacency.direct_capacity;
+    if adjacency.input.metrics.loss_ppm >= DIRECT_OWNER_MAX_LOSS_PPM
+        || capacity.health_per_mille < DIRECT_OWNER_MIN_HEALTH_PER_MILLE
+    {
+        return None;
+    }
+    Some(RouteChoice {
+        endpoint_id: owner,
+        adjacency_index,
+        candidate: RouteCandidate {
+            id: adjacency.input.route_id,
+            startup_latency: capacity
+                .rtt_ewma
+                .unwrap_or_else(|| adjacency.input.metrics.startup_latency()),
+            capacity_bps: capacity.effective_capacity_bps,
+            queued_bytes: adjacency.peer.outbound.queued_bytes(),
+            loss_penalty: adjacency.input.metrics.loss_penalty(),
+        },
+        capacity,
+    })
+}
+
+async fn run_flow_router(
+    max_egress_bps: Option<u64>,
+    mut route_snapshots: tokio::sync::watch::Receiver<Arc<DataPlaneRouteSnapshot>>,
+    route_estimates: Arc<StdRwLock<RouteEstimateTable>>,
     delivery: Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: Arc<DeliveryFastPath>,
     counters: Arc<FlowRouterCounters>,
     mut requests: mpsc::Receiver<RouteRequest>,
 ) -> Result<()> {
     let mut router = FlowRouter::default();
+    let mut published_active_flows = 0_usize;
+    let mut active_snapshot = route_snapshots.borrow_and_update().clone();
     let route_switch_log_events = AtomicU64::new(0);
-    let mut peer_inventory = Vec::new();
     let mut inputs = Vec::new();
     let mut choices = Vec::new();
-    while let Some(request) = requests.recv().await {
-        let packet_info = request.packet_info;
-        let owner = configured_destination_owner(&config, packet_info.destination).or_else(|| {
-            mesh.as_ref()
-                .and_then(|mesh| mesh.destination_owner(packet_info.destination))
-        });
-        peer_inventory.clear();
+    let mut request_batch = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    loop {
+        request_batch.clear();
+        if requests
+            .recv_many(&mut request_batch, INBOUND_ROUTER_BATCH)
+            .await
+            == 0
         {
-            let peers = peers.read().await;
-            peer_inventory.extend(peers.values().cloned());
+            break;
         }
-        inputs.clear();
-        inputs.reserve(peer_inventory.len().saturating_sub(inputs.capacity()));
-        for peer in &peer_inventory {
-            let transit_enabled = mesh
-                .as_ref()
-                .and_then(|mesh| mesh.transit_enabled_for(peer.endpoint_id))
-                .unwrap_or(peer.declared_transit_enabled);
-            let metrics = peer
-                .link_estimator
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .snapshot();
-            inputs.push(AdjacencyRouteInput {
-                endpoint_id: peer.endpoint_id,
-                route_id: peer.route_id,
-                connected: peer.counters.connected.load(Ordering::Relaxed),
-                transit_enabled,
-                metrics,
-                queued_bytes: peer.counters.queue_bytes.load(Ordering::Relaxed),
-            });
+        if route_snapshots.has_changed().unwrap_or(false) {
+            active_snapshot = route_snapshots.borrow_and_update().clone();
         }
-        {
-            let estimates = route_estimates
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            fill_route_candidates(
-                &mut choices,
-                owner,
-                request.previous_peer,
-                &inputs,
-                &estimates,
-                config.routing.max_egress_bps(),
-                Instant::now(),
+        let batch_now = Instant::now();
+        for request in request_batch.drain(..) {
+            let packet_info = request.packet_info;
+            let snapshot = active_snapshot.as_ref();
+            let owner = snapshot.owners.owner(packet_info.destination);
+            choices.clear();
+            if let Some(owner) = owner
+                && let Some(direct) = direct_route_choice(snapshot, owner, request.previous_peer)
+            {
+                choices.push(direct);
+            } else {
+                inputs.clear();
+                inputs.reserve(snapshot.adjacencies.len().saturating_sub(inputs.capacity()));
+                inputs.extend(
+                    snapshot
+                        .adjacencies
+                        .iter()
+                        .map(|adjacency| AdjacencyRouteInput {
+                            connected: adjacency.peer.counters.connected.load(Ordering::Relaxed),
+                            queued_bytes: adjacency.peer.outbound.queued_bytes(),
+                            ..adjacency.input
+                        }),
+                );
+                fill_route_candidates_from_snapshot(
+                    &mut choices,
+                    owner,
+                    request.previous_peer,
+                    &inputs,
+                    snapshot,
+                    batch_now,
+                );
+            }
+            let flow_key = FlowKey::from(packet_info);
+            let Some(decision) = router.select_projected(
+                flow_key,
+                packet_info.length,
+                0,
+                &choices,
+                |choice| &choice.candidate,
+                batch_now,
+            ) else {
+                publish_shard_flow_count(&counters, &mut published_active_flows, router.len());
+                counters.no_route_drops.fetch_add(1, Ordering::Relaxed);
+                debug!(destination = %packet_info.destination, "no usable FlowRouter route");
+                continue;
+            };
+            publish_shard_flow_count(&counters, &mut published_active_flows, router.len());
+            counters.decisions.fetch_add(1, Ordering::Relaxed);
+            let Some(selected_choice) = choices
+                .iter()
+                .find(|choice| choice.candidate.id == decision.route_id)
+            else {
+                continue;
+            };
+            let selected_endpoint = selected_choice.endpoint_id;
+            if decision.switched() {
+                counters.route_switches.fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                let route = RouteKey {
+                    destination: owner.expect("a route decision requires a destination owner"),
+                    first_hop: selected_endpoint,
+                };
+                route_estimates
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(route, now)
+                    .observe_route_switch(now);
+                if should_log(&route_switch_log_events) {
+                    let old_first_hop = decision
+                        .previous_route_id
+                        .and_then(|old| {
+                            choices
+                                .iter()
+                                .find(|choice| choice.candidate.id == old)
+                                .map(|choice| choice.endpoint_id.to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            decision.previous_route_id.map_or_else(
+                                || "none".into(),
+                                |old| format!("unavailable-route-{}", old.0),
+                            )
+                        });
+                    info!(
+                        ?flow_key,
+                        destination = %route.destination,
+                        old_first_hop = %old_first_hop,
+                        new_first_hop = %selected_endpoint,
+                        demand_bytes = decision.demand_bytes,
+                        rtt_micros = selected_choice
+                            .candidate
+                            .startup_latency
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                        capacity_bps = selected_choice.capacity.capacity_bps,
+                        effective_capacity_bps = selected_choice.capacity.effective_capacity_bps,
+                        health_per_mille = selected_choice.capacity.health_per_mille,
+                        queue_bytes = selected_choice.candidate.queued_bytes,
+                        loss_penalty_micros = selected_choice
+                            .candidate
+                            .loss_penalty
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                        switch_penalty_micros = decision
+                            .switch_penalty
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                        estimated_completion_micros = decision
+                            .estimated_completion
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                        "FlowRouter switched route"
+                    );
+                }
+            }
+            let Some(adjacency) = snapshot.adjacencies.get(selected_choice.adjacency_index) else {
+                continue;
+            };
+            let peer = adjacency.peer.as_ref();
+            if !peer.packet_allowed(
+                snapshot,
+                adjacency.input.transit_enabled,
+                packet_info.source,
+                packet_info.destination,
+                false,
+            ) {
+                if should_log(&peer.counters.policy_drops) {
+                    warn!(
+                        peer = %peer.name,
+                        source = %packet_info.source,
+                        destination = %packet_info.destination,
+                        "dropping FlowRouter packet outside overlay policy"
+                    );
+                }
+                continue;
+            }
+            let latency_sensitive = latency_service(decision.demand_bytes, packet_info.length);
+            if latency_sensitive {
+                peer.counters
+                    .flow_latency_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                peer.counters
+                    .flow_bulk_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            peer.counters
+                .flow_selected_bytes
+                .fetch_add(packet_info.length as u64, Ordering::Relaxed);
+            let mut delivery_state = if let Some(tag) = request.delivery_tag {
+                delivery_fast.touch_forwarding(tag.session_id);
+                DeliveryTagState {
+                    tag: Some(tag),
+                    registration: None,
+                }
+            } else if let Some(owner) = owner
+                && delivery_tracking_required(
+                    owner,
+                    selected_endpoint,
+                    choices.len(),
+                    peer.counters
+                        .selected_path_transport
+                        .load(Ordering::Relaxed),
+                )
+            {
+                // Receiver-confirmed capacity exists to discriminate between
+                // competing routes and to learn a transit route before an
+                // alternate reconnects. Only the common healthy direct-owner
+                // path can omit the 12-byte header; all tracked paths use the
+                // lock-free session index in steady state.
+                let route = RouteKey {
+                    destination: owner,
+                    first_hop: selected_endpoint,
+                };
+                let path_epoch = peer.path_epoch.load(Ordering::Relaxed);
+                let queue_nonempty =
+                    !latency_sensitive || peer.outbound.queued_bytes() > 0;
+                if let Some(tag) = delivery_fast.next_source_tag(route, path_epoch, queue_nonempty)
+                {
+                    DeliveryTagState {
+                        tag: Some(tag),
+                        registration: None,
+                    }
+                } else {
+                    // Expiry/registration is a once-per-session cold path.
+                    {
+                        let mut coordinator = delivery
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let state =
+                            coordinator.next_tag(route, path_epoch, queue_nonempty, batch_now);
+                        if let (Some(tag), Some(registration)) =
+                            (state.tag, coordinator.source_registration(route))
+                        {
+                            // Publish the mutable and read-mostly generations
+                            // under one cold-path serialization point. Without
+                            // this, two Router shards (or a probe renewal) can
+                            // publish an older session after a newer session.
+                            delivery_fast
+                                .install_source(registration, tag.sequence.wrapping_add(1));
+                        }
+                        state
+                    }
+                }
+            } else {
+                DeliveryTagState::default()
+            };
+            if let Some(registration) = delivery_state.registration.take() {
+                // Control is queued before the first tagged application packet. If
+                // the bounded control queue is full, leave this packet untagged and
+                // retry session renewal on later data.
+                let session_id = registration.session_id;
+                let registered =
+                    queue_delivery_message(&peer, DeliveryMessage::Register(registration)).await;
+                if !registered {
+                    delivery_state.tag = None;
+                    delivery_fast.remove_source_session(session_id);
+                    delivery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .registration_failed(session_id, Instant::now());
+                }
+            }
+            if delivery_state.tag.is_some() {
+                peer.counters
+                    .delivery_tagged_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                peer.counters
+                    .delivery_header_bytes
+                    .fetch_add(DELIVERY_TAG_WIRE_BYTES as u64, Ordering::Relaxed);
+            }
+            peer.outbound.push(
+                OutboundPacket::new(request.packet, latency_sensitive)
+                    .with_delivery_tag(delivery_state.tag),
             );
         }
-        let flow_key = FlowKey::from(packet_info);
-        let Some(decision) = router.select_projected(
-            flow_key,
-            packet_info.length,
-            0,
-            &choices,
-            |choice| &choice.candidate,
-            Instant::now(),
-        ) else {
-            counters
-                .active_flows
-                .store(router.len() as u64, Ordering::Relaxed);
-            counters.no_route_drops.fetch_add(1, Ordering::Relaxed);
-            debug!(destination = %packet_info.destination, "no usable FlowRouter route");
-            continue;
-        };
+    }
+    counters
+        .active_flows
+        .fetch_sub(published_active_flows as u64, Ordering::Relaxed);
+    bail!("FlowRouter request queue closed")
+}
+
+fn publish_shard_flow_count(counters: &FlowRouterCounters, published: &mut usize, current: usize) {
+    if current > *published {
         counters
             .active_flows
-            .store(router.len() as u64, Ordering::Relaxed);
-        counters.decisions.fetch_add(1, Ordering::Relaxed);
-        let Some(selected_choice) = choices
-            .iter()
-            .find(|choice| choice.candidate.id == decision.route_id)
-        else {
-            continue;
-        };
-        let selected_endpoint = selected_choice.endpoint_id;
-        if decision.switched() {
-            counters.route_switches.fetch_add(1, Ordering::Relaxed);
-            let now = Instant::now();
-            let route = RouteKey {
-                destination: owner.expect("a route decision requires a destination owner"),
-                first_hop: selected_endpoint,
-            };
-            route_estimates
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_or_insert(route, now)
-                .observe_route_switch(now);
-            if should_log(&route_switch_log_events) {
-                let old_first_hop = decision
-                    .previous_route_id
-                    .and_then(|old| {
-                        choices
-                            .iter()
-                            .find(|choice| choice.candidate.id == old)
-                            .map(|choice| choice.endpoint_id.to_string())
-                    })
-                    .unwrap_or_else(|| {
-                        decision.previous_route_id.map_or_else(
-                            || "none".into(),
-                            |old| format!("unavailable-route-{}", old.0),
-                        )
-                    });
-                info!(
-                    ?flow_key,
-                    destination = %route.destination,
-                    old_first_hop = %old_first_hop,
-                    new_first_hop = %selected_endpoint,
-                    demand_bytes = decision.demand_bytes,
-                    rtt_micros = selected_choice
-                        .candidate
-                        .startup_latency
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                    capacity_bps = selected_choice.capacity.capacity_bps,
-                    effective_capacity_bps = selected_choice.capacity.effective_capacity_bps,
-                    health_per_mille = selected_choice.capacity.health_per_mille,
-                    queue_bytes = selected_choice.candidate.queued_bytes,
-                    loss_penalty_micros = selected_choice
-                        .candidate
-                        .loss_penalty
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                    switch_penalty_micros = decision
-                        .switch_penalty
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                    estimated_completion_micros = decision
-                        .estimated_completion
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                    "FlowRouter switched route"
-                );
-            }
-        }
-        let Some(peer) = peer_inventory.get(selected_choice.adjacency_index).cloned() else {
-            continue;
-        };
-        if !peer.packet_allowed(packet_info.source, packet_info.destination, false) {
-            if should_log(&peer.counters.policy_drops) {
-                warn!(
-                    peer = %peer.name,
-                    source = %packet_info.source,
-                    destination = %packet_info.destination,
-                    "dropping FlowRouter packet outside overlay policy"
-                );
-            }
-            continue;
-        }
-        let latency_sensitive = latency_service(decision.demand_bytes, packet_info.length);
-        if latency_sensitive {
-            peer.counters
-                .flow_latency_packets
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            peer.counters
-                .flow_bulk_packets
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        peer.counters
-            .flow_selected_bytes
-            .fetch_add(packet_info.length as u64, Ordering::Relaxed);
-        let mut delivery_state = if let Some(tag) = request.delivery_tag {
-            delivery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .touch_forwarding(tag.session_id, Instant::now());
-            DeliveryTagState {
-                tag: Some(tag),
-                registration: None,
-            }
-        } else if let Some(owner) = owner {
-            delivery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next_tag(
-                    RouteKey {
-                        destination: owner,
-                        first_hop: selected_endpoint,
-                    },
-                    peer.path_epoch.load(Ordering::Relaxed),
-                    !latency_sensitive || peer.counters.queue_bytes.load(Ordering::Relaxed) > 0,
-                    Instant::now(),
-                )
-        } else {
-            DeliveryTagState::default()
-        };
-        if let Some(registration) = delivery_state.registration.take() {
-            // Control is queued before the first tagged application packet. If
-            // the bounded control queue is full, leave this packet untagged and
-            // retry session renewal on later data.
-            let session_id = registration.session_id;
-            let registered =
-                queue_delivery_message(&peer, DeliveryMessage::Register(registration)).await;
-            if !registered {
-                delivery_state.tag = None;
-                delivery
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .registration_failed(session_id, Instant::now());
-            }
-        }
-        if delivery_state.tag.is_some() {
-            peer.counters
-                .delivery_tagged_packets
-                .fetch_add(1, Ordering::Relaxed);
-            peer.counters
-                .delivery_header_bytes
-                .fetch_add(DELIVERY_TAG_WIRE_BYTES as u64, Ordering::Relaxed);
-        }
-        peer.outbound
-            .push(
-                OutboundPacket::new(Bytes::from(request.packet), latency_sensitive)
-                    .with_delivery_tag(delivery_state.tag),
-            )
-            .await;
+            .fetch_add((current - *published) as u64, Ordering::Relaxed);
+    } else if current < *published {
+        counters
+            .active_flows
+            .fetch_sub((*published - current) as u64, Ordering::Relaxed);
     }
-    bail!("FlowRouter request queue closed")
+    *published = current;
 }
 
 async fn run_capacity_manager(
@@ -1147,6 +2046,7 @@ async fn run_capacity_manager(
         estimates,
         probe_status,
         delivery,
+        delivery_fast,
     } = state;
     let mut scheduler = ActiveProbeScheduler::default();
     let mut pending = HashMap::<u64, PendingOriginProbe>::new();
@@ -1172,6 +2072,7 @@ async fn run_capacity_manager(
                             mesh.as_ref(),
                             &estimates,
                             &delivery,
+                            &delivery_fast,
                             &mut scheduler,
                             &mut pending,
                             &mut receiving,
@@ -1185,11 +2086,12 @@ async fn run_capacity_manager(
                             &peers,
                             &estimates,
                             &delivery,
+                            &delivery_fast,
                             &mut scheduler,
                         ).await.map_err(|error| (from, error))
                     }
                     CapacityEvent::Delivered { report } => {
-                        handle_delivery_report(local_id, report, &peers, &delivery)
+                        handle_delivery_report(local_id, report, &peers, &delivery_fast)
                             .await
                             .map_err(|error| (local_id, error))
                     }
@@ -1221,10 +2123,21 @@ async fn run_capacity_manager(
                     ).await;
                     last_health_refresh = Some(now);
                 }
-                delivery
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .prune(now);
+                let source_liveness = delivery_fast.source_liveness();
+                {
+                    let mut coordinator = delivery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // The packet path owns session liveness in atomics. Fold
+                    // it into the mutable report accumulator at control-tick
+                    // cadence so low-rate tagged traffic cannot keep the fast
+                    // session alive while its report state expires.
+                    for liveness in source_liveness {
+                        coordinator.synchronize_source_liveness(liveness, now);
+                    }
+                    coordinator.prune(now);
+                }
+                delivery_fast.prune();
 
                 let expired = pending
                     .iter()
@@ -1358,6 +2271,7 @@ async fn handle_capacity_message(
     mesh: Option<&Arc<MeshRuntime>>,
     estimates: &Arc<StdRwLock<RouteEstimateTable>>,
     delivery: &Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: &Arc<DeliveryFastPath>,
     scheduler: &mut ActiveProbeScheduler,
     pending: &mut HashMap<u64, PendingOriginProbe>,
     receiving: &mut HashMap<(EndpointId, u64), ReceivingProbe>,
@@ -1441,25 +2355,37 @@ async fn handle_capacity_message(
                 "probe first-hop path changed"
             );
             state.route_rtt = Some(Instant::now().saturating_duration_since(state.started_at));
-            let registration = delivery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .install_source_route(
+            let registration = {
+                let mut coordinator = delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let registration = coordinator.install_source_route(
                     local_id,
                     state.request.route,
                     state.path_epoch,
                     ready.traversed_hops.clone(),
                     Instant::now(),
                 )?;
-            ensure!(
-                send_delivery_message(
-                    peers,
-                    state.request.route.first_hop,
-                    DeliveryMessage::Register(registration),
-                )
-                .await,
-                "delivery registration first hop is unavailable"
-            );
+                // Use the same serialization boundary as FlowRouter renewal so
+                // the fast map cannot be rolled back to a stale session.
+                delivery_fast.install_source(registration.clone(), 0);
+                registration
+            };
+            let session_id = registration.session_id;
+            if !send_delivery_message(
+                peers,
+                state.request.route.first_hop,
+                DeliveryMessage::Register(registration),
+            )
+            .await
+            {
+                delivery_fast.remove_source_session(session_id);
+                delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .registration_failed(session_id, Instant::now());
+                bail!("delivery registration first hop is unavailable");
+            }
             let active_samples = scheduler
                 .bookkeeping(&state.request.route)
                 .map_or(0, |bookkeeping| bookkeeping.active_samples)
@@ -1504,7 +2430,7 @@ async fn handle_capacity_message(
                     let Ok(datagram) = encode_probe(&message) else {
                         break;
                     };
-                    if !peer.outbound.push_probe(datagram).await {
+                    if !peer.outbound.push_probe(datagram) {
                         break;
                     }
                     tokio::time::sleep_until(
@@ -1787,12 +2713,13 @@ async fn send_capacity_message(
         return false;
     }
     if probe_priority {
-        peer.outbound.push_probe(datagram).await
+        peer.outbound.push_probe(datagram)
     } else {
-        peer.outbound.push_control(datagram).await
+        peer.outbound.push_control(datagram)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_delivery_message(
     local_id: EndpointId,
     from: EndpointId,
@@ -1800,6 +2727,7 @@ async fn handle_delivery_message(
     peers: &Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
     estimates: &Arc<StdRwLock<RouteEstimateTable>>,
     delivery: &Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: &Arc<DeliveryFastPath>,
     scheduler: &mut ActiveProbeScheduler,
 ) -> Result<()> {
     let now = Instant::now();
@@ -1813,6 +2741,7 @@ async fn handle_delivery_message(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .install_forwarding(registration.clone(), local_id, now)?;
+            delivery_fast.install_forwarding(registration.clone());
             if registration.destination != local_id {
                 let next = forward_next_hop(&registration.forward_hops, local_id)
                     .context("delivery registration has no forward hop")?;
@@ -1824,21 +2753,34 @@ async fn handle_delivery_message(
             }
         }
         DeliveryMessage::Report(report) => {
-            let hops = delivery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .forwarding_hops(report.origin, report.session_id, now)
+            let registration = delivery_fast
+                .session_registration(report.session_id)
                 .context("unknown delivery report session")?;
+            ensure!(
+                registration.origin == report.origin,
+                "delivery report origin does not match its session"
+            );
+            let hops = registration.forward_hops;
             ensure!(
                 forward_next_hop(&hops, local_id) == Some(from),
                 "delivery report arrived outside its fixed reverse route"
             );
             if report.origin == local_id {
-                let observation = delivery
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .apply_report(&report, now)
-                    .context("delivery report does not match the active source route")?;
+                let queue_nonempty_since =
+                    delivery_fast.source_queue_nonempty_since(report.session_id);
+                let observation = {
+                    let mut coordinator = delivery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    coordinator.source.observe_queue_since(
+                        report.session_id,
+                        queue_nonempty_since,
+                        now,
+                    );
+                    coordinator
+                        .apply_report(&report, now)
+                        .context("delivery report does not match the active source route")?
+                };
                 let accepted = estimates
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1869,14 +2811,16 @@ async fn handle_delivery_report(
     local_id: EndpointId,
     report: DeliveryReport,
     peers: &Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
-    delivery: &Arc<StdMutex<DeliveryCoordinator>>,
+    delivery_fast: &Arc<DeliveryFastPath>,
 ) -> Result<()> {
-    let now = Instant::now();
-    let hops = delivery
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .forwarding_hops(report.origin, report.session_id, now)
+    let registration = delivery_fast
+        .session_registration(report.session_id)
         .context("delivered packet has no registered route")?;
+    ensure!(
+        registration.origin == report.origin,
+        "delivered packet origin does not match its session"
+    );
+    let hops = registration.forward_hops;
     ensure!(
         hops.last() == Some(&local_id),
         "delivery session does not terminate locally"
@@ -1911,7 +2855,7 @@ async fn queue_delivery_message(peer: &Peer, message: DeliveryMessage) -> bool {
         return false;
     };
     let bytes = datagram.len() as u64;
-    if !peer.outbound.push_control(datagram).await {
+    if !peer.outbound.push_control(datagram) {
         return false;
     }
     if register {
@@ -1931,7 +2875,9 @@ async fn queue_delivery_message(peer: &Peer, message: DeliveryMessage) -> bool {
 }
 
 /// Reduce topology inventory to usable single-next-hop routes. A direct
-/// owner suppresses transit alternatives only while that adjacency is live.
+/// owner suppresses transit alternatives only while that adjacency is live
+/// and healthy. A degraded direct route remains eligible but no longer hides
+/// transit alternatives.
 /// Capacity is directional and comes only from the locally measured complete
 /// route `(destination owner, first hop)`.
 #[cfg(test)]
@@ -1956,6 +2902,79 @@ fn route_candidates(
     choices
 }
 
+fn snapshot_route_capacity(
+    snapshot: &DataPlaneRouteSnapshot,
+    key: RouteKey,
+    now: Instant,
+) -> CapacitySnapshot {
+    snapshot.capacities.get(&key).copied().unwrap_or_else(|| {
+        crate::capacity::RouteEstimate::new(now).snapshot(now, snapshot.max_egress_bps)
+    })
+}
+
+fn fill_route_candidates_from_snapshot(
+    choices: &mut Vec<RouteChoice>,
+    owner: Option<EndpointId>,
+    previous_peer: Option<EndpointId>,
+    adjacencies: &[AdjacencyRouteInput],
+    snapshot: &DataPlaneRouteSnapshot,
+    now: Instant,
+) {
+    choices.clear();
+    let Some(owner) = owner else {
+        return;
+    };
+    let direct_owner_active = previous_peer != Some(owner)
+        && adjacencies.iter().any(|link| {
+            if link.endpoint_id != owner || !link.connected {
+                return false;
+            }
+            let capacity = snapshot_route_capacity(
+                snapshot,
+                RouteKey {
+                    destination: owner,
+                    first_hop: owner,
+                },
+                now,
+            );
+            link.metrics.loss_ppm < DIRECT_OWNER_MAX_LOSS_PPM
+                && capacity.health_per_mille >= DIRECT_OWNER_MIN_HEALTH_PER_MILLE
+        });
+
+    choices.reserve(adjacencies.len().saturating_sub(choices.capacity()));
+    for (adjacency_index, link) in adjacencies.iter().enumerate() {
+        if !link.connected || previous_peer == Some(link.endpoint_id) {
+            continue;
+        }
+        let direct_owner = owner == link.endpoint_id;
+        if !direct_owner && (direct_owner_active || !link.transit_enabled) {
+            continue;
+        }
+        let capacity = snapshot_route_capacity(
+            snapshot,
+            RouteKey {
+                destination: owner,
+                first_hop: link.endpoint_id,
+            },
+            now,
+        );
+        choices.push(RouteChoice {
+            endpoint_id: link.endpoint_id,
+            adjacency_index,
+            candidate: RouteCandidate {
+                id: link.route_id,
+                startup_latency: capacity
+                    .rtt_ewma
+                    .unwrap_or_else(|| link.metrics.startup_latency()),
+                capacity_bps: capacity.effective_capacity_bps,
+                queued_bytes: link.queued_bytes,
+                loss_penalty: link.metrics.loss_penalty(),
+            },
+            capacity,
+        });
+    }
+}
+
 fn fill_route_candidates(
     choices: &mut Vec<RouteChoice>,
     owner: Option<EndpointId>,
@@ -1970,9 +2989,21 @@ fn fill_route_candidates(
         return;
     };
     let direct_owner_active = previous_peer != Some(owner)
-        && adjacencies
-            .iter()
-            .any(|link| link.endpoint_id == owner && link.connected);
+        && adjacencies.iter().any(|link| {
+            if link.endpoint_id != owner || !link.connected {
+                return false;
+            }
+            let capacity = estimates.snapshot_or_bootstrap(
+                &RouteKey {
+                    destination: owner,
+                    first_hop: owner,
+                },
+                now,
+                max_egress_bps,
+            );
+            link.metrics.loss_ppm < DIRECT_OWNER_MAX_LOSS_PPM
+                && capacity.health_per_mille >= DIRECT_OWNER_MIN_HEALTH_PER_MILLE
+        });
 
     choices.reserve(adjacencies.len().saturating_sub(choices.capacity()));
     for (adjacency_index, link) in adjacencies.iter().enumerate() {
@@ -1980,8 +3011,7 @@ fn fill_route_candidates(
             continue;
         }
         let direct_owner = owner == link.endpoint_id;
-        if (direct_owner_active && !direct_owner) || (!direct_owner_active && !link.transit_enabled)
-        {
+        if !direct_owner && (direct_owner_active || !link.transit_enabled) {
             continue;
         }
         let snapshot = estimates.snapshot_or_bootstrap(
@@ -2026,19 +3056,6 @@ async fn maintain_presence_routes(config: Config, mesh: Arc<MeshRuntime>) -> Res
         }
         previous = current;
     }
-}
-
-fn configured_destination_owner(
-    config: &Config,
-    destination: std::net::IpAddr,
-) -> Option<EndpointId> {
-    config.route_origins.iter().find_map(|origin| {
-        origin
-            .prefixes
-            .iter()
-            .any(|prefix| prefix.contains(&destination))
-            .then_some(origin.endpoint_id)
-    })
 }
 
 fn route_id(endpoint_id: EndpointId) -> RouteId {
@@ -2118,9 +3135,9 @@ async fn build_endpoint(
 ) -> Result<Endpoint> {
     let configured_relays = config.inherited_peer_relays()?;
     let relay_mode = iroh_relay_mode(config, configured_relays);
-    // Retain BBR3's conservative, MTU-scaled initial window.  A fixed 64 KiB
-    // window can inject roughly half a second of data on a 1 Mbit/s path
-    // before the first useful bandwidth/RTT sample exists.
+    // Keep BBR3's MTU-scaled initial window until a path has a measured BDP.
+    // A fixed 512 KiB startup burst represents more than four seconds of data
+    // on a 1 Mbit/s WAN and makes loss recovery dominate initial convergence.
     let bbr3 = Bbr3Config::default();
     let path_idle_timeout = quic_path_idle_timeout(&config.relay);
     let transport = QuicTransportConfig::builder()
@@ -2322,7 +3339,7 @@ struct DynamicMeshManager {
     mesh: Arc<MeshRuntime>,
     peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
     peer_counters: Arc<StdRwLock<HashMap<EndpointId, Arc<PeerCounters>>>>,
-    inbound_packets: mpsc::Sender<InboundPacket>,
+    inbound_packets: InboundDispatcher,
     capacity_events: mpsc::Sender<CapacityEvent>,
     planner: Mutex<MeshPlanner>,
     admission_lock: Mutex<()>,
@@ -2343,7 +3360,7 @@ impl DynamicMeshManager {
         mesh: Arc<MeshRuntime>,
         peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
         peer_counters: Arc<StdRwLock<HashMap<EndpointId, Arc<PeerCounters>>>>,
-        inbound_packets: mpsc::Sender<InboundPacket>,
+        inbound_packets: InboundDispatcher,
         capacity_events: mpsc::Sender<CapacityEvent>,
     ) -> Result<Arc<Self>> {
         let planner = MeshPlanner::new(
@@ -2814,45 +3831,24 @@ fn diversity_key(address: std::net::SocketAddr) -> String {
     }
 }
 
-fn prefer_initial_dial_addr(
-    endpoint_addr: EndpointAddr,
-    preference: IpFamilyPreference,
-) -> EndpointAddr {
-    let preferred_is_ipv4 = preference == IpFamilyPreference::Ipv4;
-    let has_preferred = endpoint_addr
-        .ip_addrs()
-        .any(|address| address.is_ipv4() == preferred_is_ipv4);
-    if !has_preferred {
-        return endpoint_addr;
-    }
-    EndpointAddr::from_parts(
-        endpoint_addr.id,
-        endpoint_addr
-            .addrs
-            .into_iter()
-            .filter(|address| match address {
-                TransportAddr::Ip(address) => address.is_ipv4() == preferred_is_ipv4,
-                _ => true,
-            }),
-    )
-}
-
 struct Peer {
     name: String,
     endpoint_id: EndpointId,
     route_id: RouteId,
     declared_transit_enabled: bool,
     endpoint_addr: EndpointAddr,
-    path_preference: IpFamilyPreference,
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
     session_policy: SessionPolicy,
     negotiated_session: StdRwLock<Option<NegotiatedSession>>,
-    inbound_packets: mpsc::Sender<InboundPacket>,
+    inbound_packets: InboundDispatcher,
     capacity_events: mpsc::Sender<CapacityEvent>,
-    connection: Mutex<Option<Connection>>,
+    connection: ArcSwapOption<Connection>,
+    connection_updates: tokio::sync::watch::Sender<u64>,
+    /// Serializes rare install/clear transitions. Packet transmission reads
+    /// the active Arc through ArcSwap without a mutex or watch-channel guard.
+    connection_update: StdMutex<()>,
     dial_lock: Mutex<()>,
-    connection_ready: Notify,
     reconnect_needed: Notify,
     shutdown_ready: Notify,
     shutting_down: AtomicBool,
@@ -2866,18 +3862,14 @@ struct Peer {
     trace_responder: Option<Arc<TraceResponder>>,
     enforce_overlay_prefixes: bool,
     transit_enabled: bool,
-    overlay_prefixes: Arc<Vec<IpNet>>,
-    local_prefixes: Arc<Vec<IpNet>>,
-    remote_prefixes: Arc<Vec<IpNet>>,
-    allowed_source_prefixes: Arc<Vec<IpNet>>,
+    allowed_source_prefixes: Arc<IpPrefixSet>,
     forbidden_underlay_prefixes: Arc<Vec<IpNet>>,
     allowed_local_underlay_prefixes: Arc<Vec<IpNet>>,
     allowed_remote_underlay_prefixes: Arc<Vec<IpNet>>,
     private_remote_addresses: Arc<Vec<std::net::SocketAddr>>,
     private_link_exclusive: bool,
     next_packet_id: AtomicU64,
-    reassembler: Mutex<Reassembler>,
-    repair_cache: Mutex<RepairCache>,
+    repair_cache: StdMutex<RepairCache>,
     reassembly_buffer_limit: usize,
     repair_buffer_limit: usize,
     outbound: Arc<OutboundQueue>,
@@ -2887,8 +3879,11 @@ struct Peer {
     selected_path_fingerprint: StdRwLock<String>,
     frame_size_ceiling: usize,
     effective_frame_size: AtomicU64,
-    fec_encoder: Option<Mutex<FecEncoder>>,
-    fec_decoder: Mutex<FecDecoder>,
+    /// Taken once by `queue_to_network`; encoder mutation is single-writer.
+    fec_encoder: StdMutex<Option<FecEncoder>>,
+    fec_reset_epoch: AtomicU64,
+    fec_decoder_ttl: Duration,
+    fec_buffer_limit: usize,
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
     nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
@@ -2911,13 +3906,19 @@ struct PeerServices<'a> {
     derp_transport: Option<&'a Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
     nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
-    inbound_packets: mpsc::Sender<InboundPacket>,
+    inbound_packets: InboundDispatcher,
     capacity_events: mpsc::Sender<CapacityEvent>,
 }
 
 impl Peer {
     fn can_dial(&self) -> bool {
         self.connection_mode != ConnectionMode::Inbound
+    }
+
+    fn current_connection(&self) -> Option<Connection> {
+        self.connection
+            .load_full()
+            .map(|connection| connection.as_ref().clone())
     }
 
     fn create(
@@ -3008,7 +4009,6 @@ impl Peer {
                     usize::from(config.fec.recovery_shards),
                     Duration::from_millis(config.fec.block_timeout_millis),
                 )
-                .map(Mutex::new)
             })
             .transpose()?;
         counters
@@ -3020,29 +4020,36 @@ impl Peer {
         let mesh_pool_per_peer = config
             .mesh
             .enabled
-            .then(|| MESH_BUFFER_POOL_BUDGET_BYTES / config.mesh.max_peers.max(1));
+            .then(|| PROCESS_PAYLOAD_BUDGET_BYTES / config.mesh.max_peers.max(1));
+        // One process-wide payload budget is shared by queue/reassembly/repair/FEC.
+        // Mesh-off peers keep the 8 MiB BDP queue default instead of stacking
+        // independent 32/16/32 MiB tables.
+        let budget = Some(BufferBudget::process_wide());
         let outbound = Arc::new(if let Some(per_peer) = mesh_pool_per_peer {
-            // Reserve the global queue budget against the configured worst
-            // case. Pinned and automatic adjacencies count against the same
-            // ceiling, so growing the mesh cannot grow queue memory beyond
-            // the process-wide bound.
-            OutboundQueue::with_max_bytes(counters.clone(), OUTBOUND_QUEUE_BYTES.min(per_peer))
+            OutboundQueue::with_max_bytes_and_budget(
+                counters.clone(),
+                DEFAULT_QUEUE_BYTES.min(per_peer).min(OUTBOUND_QUEUE_BYTES),
+                budget,
+            )
         } else {
-            OutboundQueue::new(counters.clone())
+            OutboundQueue::with_max_bytes_and_budget(
+                counters.clone(),
+                DEFAULT_QUEUE_BYTES,
+                budget,
+            )
         });
-        let reassembly_buffer_limit =
-            mesh_pool_per_peer.map_or(32 * 1024 * 1024, |limit| limit.min(32 * 1024 * 1024));
+        let reassembly_buffer_limit = mesh_pool_per_peer
+            .map_or(DEFAULT_REASSEMBLY_BYTES, |limit| limit.min(DEFAULT_REASSEMBLY_BYTES));
         let repair_buffer_limit =
-            mesh_pool_per_peer.map_or(16 * 1024 * 1024, |limit| limit.min(16 * 1024 * 1024));
-        let fec_buffer_limit =
-            mesh_pool_per_peer.map_or(32 * 1024 * 1024, |limit| limit.min(32 * 1024 * 1024));
+            mesh_pool_per_peer.map_or(DEFAULT_REPAIR_BYTES, |limit| limit.min(DEFAULT_REPAIR_BYTES));
+        let fec_buffer_limit = mesh_pool_per_peer
+            .map_or(DEFAULT_FEC_DECODE_BYTES, |limit| limit.min(DEFAULT_FEC_DECODE_BYTES));
         Ok(Self {
             name: peer.name.clone(),
             endpoint_id: peer.endpoint_id,
             route_id: route_id(peer.endpoint_id),
             declared_transit_enabled: peer.transit_enabled,
             endpoint_addr,
-            path_preference: config.path_selection.prefer,
             endpoint,
             alpn,
             session_policy: SessionPolicy {
@@ -3072,9 +4079,10 @@ impl Peer {
             negotiated_session: StdRwLock::new(None),
             inbound_packets: services.inbound_packets,
             capacity_events: services.capacity_events,
-            connection: Mutex::new(None),
+            connection: ArcSwapOption::from(None),
+            connection_updates: tokio::sync::watch::channel(0).0,
+            connection_update: StdMutex::new(()),
             dial_lock: Mutex::new(()),
-            connection_ready: Notify::new(),
             reconnect_needed: Notify::new(),
             shutdown_ready: Notify::new(),
             shutting_down: AtomicBool::new(false),
@@ -3090,10 +4098,9 @@ impl Peer {
             trace_responder: services.trace_responder,
             enforce_overlay_prefixes: config.packet_policy.enforce_overlay_prefixes,
             transit_enabled: config.routing.transit_enabled,
-            overlay_prefixes: Arc::new(config.all_overlay_prefixes().collect()),
-            local_prefixes: Arc::new(config.all_advertised_prefixes().collect()),
-            remote_prefixes: Arc::new(config.all_remote_prefixes().collect()),
-            allowed_source_prefixes: Arc::new(peer.allowed_source_prefixes.clone()),
+            allowed_source_prefixes: Arc::new(IpPrefixSet::from_prefixes(
+                peer.allowed_source_prefixes.iter().copied(),
+            )),
             forbidden_underlay_prefixes: Arc::new(underlay_exclusion_prefixes(config)),
             allowed_local_underlay_prefixes: Arc::new(
                 link.map_or_else(Vec::new, |link| link.allowed_local_prefixes.clone()),
@@ -3106,10 +4113,7 @@ impl Peer {
             ),
             private_link_exclusive: link.is_some(),
             next_packet_id: AtomicU64::new(1),
-            reassembler: Mutex::new(Reassembler::with_max_buffered_bytes(
-                reassembly_buffer_limit,
-            )),
-            repair_cache: Mutex::new(RepairCache::with_max_bytes(repair_buffer_limit)),
+            repair_cache: StdMutex::new(RepairCache::with_max_bytes(repair_buffer_limit)),
             reassembly_buffer_limit,
             repair_buffer_limit,
             outbound,
@@ -3119,11 +4123,10 @@ impl Peer {
             selected_path_fingerprint: StdRwLock::new(String::new()),
             frame_size_ceiling,
             effective_frame_size: AtomicU64::new(effective_frame_size as u64),
-            fec_encoder,
-            fec_decoder: Mutex::new(FecDecoder::with_max_buffered_bytes(
-                Duration::from_millis(config.fec.decoder_ttl_millis),
-                fec_buffer_limit,
-            )?),
+            fec_encoder: StdMutex::new(fec_encoder),
+            fec_reset_epoch: AtomicU64::new(0),
+            fec_decoder_ttl: Duration::from_millis(config.fec.decoder_ttl_millis),
+            fec_buffer_limit,
             derp_transport: services.derp_transport.cloned(),
             mesh_runtime: services.mesh_runtime,
             nat64_prefix: services.nat64_prefix,
@@ -3131,10 +4134,32 @@ impl Peer {
     }
 
     async fn queue_to_network(self: Arc<Self>) -> Result<()> {
+        let mut outbound = self
+            .outbound
+            .take_consumer()
+            .context("peer outbound consumer was already started")?;
+        let mut fec_encoder = self
+            .fec_encoder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut observed_fec_reset = self.fec_reset_epoch.load(Ordering::Acquire);
         let mut suspended_bulk = None::<TransmissionJob>;
         let mut next_item = None::<OutboundItem>;
+        let mut cached_connection = None::<Connection>;
+        let mut cached_epoch = 0_u64;
 
         loop {
+            let reset_epoch = self.fec_reset_epoch.load(Ordering::Acquire);
+            if reset_epoch != observed_fec_reset {
+                if let Some(encoder) = fec_encoder.as_mut() {
+                    let unprotected = encoder.reset();
+                    self.counters
+                        .fec_unprotected_shards
+                        .fetch_add(unprotected, Ordering::Relaxed);
+                }
+                observed_fec_reset = reset_epoch;
+            }
             let rtt = Duration::from_micros(self.counters.path_rtt_micros.load(Ordering::Relaxed));
             let queue_max_age = adaptive_queue_max_age(rtt);
             self.counters.queue_max_age_micros.store(
@@ -3148,56 +4173,46 @@ impl Peer {
             let work = if let Some(item) = next_item.take() {
                 TransmissionWork::Item(item)
             } else if let Some(job) = suspended_bulk.take() {
-                if let Some(urgent) = self.outbound.try_pop_urgent(queue_max_age).await {
+                if let Some(urgent) = outbound.try_pop_urgent(queue_max_age) {
                     suspended_bulk = Some(job);
                     TransmissionWork::Item(urgent)
                 } else {
                     TransmissionWork::Job(job)
                 }
             } else {
-                TransmissionWork::Item(self.outbound.pop_for_network(queue_max_age).await)
+                TransmissionWork::Item(outbound.pop_for_network(queue_max_age).await)
             };
 
-            let connection = match self.connection().await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    if should_log(&self.counters.connection_errors) {
-                        warn!(
-                            peer = %self.name,
-                            connection_errors = self.counters.connection_errors.load(Ordering::Relaxed),
-                            %error,
-                            "cannot connect; retrying queued transmission"
-                        );
+            self.outbound.publish_depth();
+            let epoch = *self.connection_updates.borrow();
+            if cached_connection.is_none() || epoch != cached_epoch {
+                cached_connection = None;
+                cached_epoch = epoch;
+            }
+            let connection = match cached_connection.clone() {
+                Some(connection) => connection,
+                None => match self.connection().await {
+                    Ok(connection) => {
+                        cached_epoch = *self.connection_updates.borrow();
+                        cached_connection = Some(connection.clone());
+                        connection
                     }
-                    self.requeue_work(work).await;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
+                    Err(error) => {
+                        cached_connection = None;
+                        if should_log(&self.counters.connection_errors) {
+                            warn!(
+                                peer = %self.name,
+                                connection_errors = self.counters.connection_errors.load(Ordering::Relaxed),
+                                %error,
+                                "cannot connect; retrying queued transmission"
+                            );
+                        }
+                        self.requeue_work(work).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
             };
-            if self.private_link_exclusive
-                && let Some(reason) = private_link_path_violation(
-                    &connection,
-                    &self.allowed_local_underlay_prefixes,
-                    &self.allowed_remote_underlay_prefixes,
-                    &self.private_remote_addresses,
-                )
-            {
-                warn!(peer = %self.name, %reason, "closing connection after private link path migration");
-                connection.close(8_u8.into(), b"private link path migration");
-                self.requeue_work(work).await;
-                self.clear_connection(connection.stable_id()).await;
-                continue;
-            }
-            if let Some((address, prefix)) =
-                forbidden_selected_path(&connection, &self.forbidden_underlay_prefixes)
-            {
-                warn!(peer = %self.name, %address, %prefix, "closing connection on forbidden underlay path");
-                connection.close(2_u8.into(), b"forbidden underlay path");
-                self.requeue_work(work).await;
-                self.clear_connection(connection.stable_id()).await;
-                continue;
-            }
-
             let mut job = match work {
                 TransmissionWork::Job(job) => job,
                 TransmissionWork::Item(item) => {
@@ -3213,7 +4228,7 @@ impl Peer {
                                     .await
                                     .is_err()
                             {
-                                self.outbound.push_control(datagram).await;
+                                self.outbound.push_control(datagram);
                             }
                             continue;
                         }
@@ -3227,14 +4242,14 @@ impl Peer {
                                     .await
                                     .is_err()
                             {
-                                self.outbound.push_probe(datagram).await;
+                                self.outbound.push_probe(datagram);
                             }
                             continue;
                         }
                     };
                     let Some(path_maximum) = connection.max_datagram_size() else {
                         warn!(peer = %self.name, "peer does not support QUIC datagrams");
-                        self.outbound.push(first).await;
+                        self.outbound.push(first);
                         self.clear_connection(connection.stable_id()).await;
                         continue;
                     };
@@ -3243,7 +4258,14 @@ impl Peer {
                         .min(self.frame_size_ceiling)
                         .min(automatic.max(256));
                     let Some(job) = self
-                        .encode_transmission(first, &connection, maximum, queue_max_age)
+                        .encode_transmission(
+                            first,
+                            &connection,
+                            maximum,
+                            queue_max_age,
+                            &mut outbound,
+                            &mut fec_encoder,
+                        )
                         .await?
                     else {
                         continue;
@@ -3252,7 +4274,7 @@ impl Peer {
                 }
             };
             match self
-                .send_transmission(&connection, &mut job, queue_max_age)
+                .send_transmission(&connection, &mut job, queue_max_age, &mut outbound)
                 .await
             {
                 TransmissionOutcome::Complete => self.complete_transmission(job),
@@ -3264,8 +4286,8 @@ impl Peer {
                     next_item = Some(urgent);
                 }
                 TransmissionOutcome::Reframe => {
-                    if let Some(encoder) = &self.fec_encoder {
-                        let unprotected = encoder.lock().await.reset();
+                    if let Some(encoder) = fec_encoder.as_mut() {
+                        let unprotected = encoder.reset();
                         self.counters
                             .fec_unprotected_shards
                             .fetch_add(unprotected, Ordering::Relaxed);
@@ -3287,22 +4309,21 @@ impl Peer {
         connection: &Connection,
         maximum: usize,
         queue_max_age: Duration,
+        outbound: &mut OutboundConsumer,
+        fec_encoder: &mut Option<FecEncoder>,
     ) -> Result<Option<TransmissionJob>> {
         // DERP already carries every QUIC packet over an ordered, reliable
         // TCP/TLS byte stream. Adding recovery shards there cannot repair
         // underlay loss; it only consumes the QUIC congestion window and can
         // head-of-line-block newer systematic datagrams.
-        let selected_is_derp = connection
-            .paths()
-            .iter()
-            .find(|path| path.is_selected())
-            .map(|path| is_derp_transport(path.remote_addr()));
-        let fec_active = self.fec_encoder.is_some()
-            && selected_is_derp
-                .map(|is_derp| !is_derp)
-                .unwrap_or(self.derp_transport.is_none());
-        if !fec_active && let Some(encoder) = &self.fec_encoder {
-            let unprotected = encoder.lock().await.reset();
+        // 4 = DERP custom transport, published by the telemetry task.
+        let selected_is_derp = self.counters.selected_path_transport.load(Ordering::Relaxed) == 4;
+        let fec_active = fec_encoder.is_some()
+            && !selected_is_derp
+            && (self.counters.selected_path_transport.load(Ordering::Relaxed) != 0
+                || self.derp_transport.is_none());
+        if !fec_active && let Some(encoder) = fec_encoder.as_mut() {
+            let unprotected = encoder.reset();
             self.counters
                 .fec_unprotected_shards
                 .fetch_add(unprotected, Ordering::Relaxed);
@@ -3312,7 +4333,7 @@ impl Peer {
                 Ok(value) => value,
                 Err(error) => {
                     warn!(peer = %self.name, maximum, %error, "FEC leaves no overlay frame capacity");
-                    self.outbound.push(first).await;
+                    self.outbound.push(first);
                     return Ok(None);
                 }
             }
@@ -3321,7 +4342,7 @@ impl Peer {
         };
 
         let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
-        let frames = match encode_packet_tagged(
+        let (frames, _stats) = match encode_packet_from_buf(
             &first.data,
             inner_maximum,
             packet_id,
@@ -3335,8 +4356,11 @@ impl Peer {
         };
         if frames.len() > 1 {
             debug!(peer = %self.name, len = first.data.len(), fragments = frames.len(), maximum, "fragmenting overlay packet");
+            self.repair_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(packet_id, &frames);
         }
-        self.repair_cache.lock().await.insert(packet_id, &frames);
 
         let latency_sensitive = first.latency_sensitive;
         let mut packets = vec![first];
@@ -3344,38 +4368,25 @@ impl Peer {
         let mut packet_bytes = packets[0].data.len() as u64;
         let mut wire_frames = frames;
         if wire_frames.len() == 1 && packets[0].data.len() <= SMALL_PACKET_LIMIT {
-            let aggregation_delay = self.outbound.aggregation_delay().await;
-            self.counters.aggregation_delay_micros.store(
-                aggregation_delay.as_micros().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
+            self.counters.aggregation_delay_micros.store(0, Ordering::Relaxed);
+            let wire_budget = inner_maximum.saturating_sub(16 + wire_frames[0].len());
+            let additional = outbound.try_pop_small_batch_class(
+                latency_sensitive,
+                SMALL_PACKET_LIMIT,
+                wire_budget,
+                2 + MAX_PACKET_FRAME_HEADER_LEN,
+                64,
+                queue_max_age,
             );
-            if !aggregation_delay.is_zero() {
-                tokio::time::sleep(aggregation_delay).await;
-            }
-            let mut batch_len = 16 + wire_frames[0].len();
-            while let Some(remaining) =
-                inner_maximum.checked_sub(batch_len + 2 + MAX_PACKET_FRAME_HEADER_LEN)
-            {
-                let Some(packet) = self
-                    .outbound
-                    .try_pop_small_class(
-                        latency_sensitive,
-                        remaining.min(SMALL_PACKET_LIMIT),
-                        queue_max_age,
-                    )
-                    .await
-                else {
-                    break;
-                };
+            for packet in additional {
                 let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
-                let frame = encode_packet_tagged(
+                let (frame, _) = encode_packet_from_buf(
                     &packet.data,
                     inner_maximum,
                     packet_id,
                     packet.delivery_tag,
                 )?;
                 debug_assert_eq!(frame.len(), 1);
-                batch_len += 2 + frame[0].len();
                 packet_count += 1;
                 packet_bytes = packet_bytes.saturating_add(packet.data.len() as u64);
                 packets.push(packet);
@@ -3391,11 +4402,7 @@ impl Peer {
         };
         let mut encoded_datagrams = VecDeque::new();
         if fec_active {
-            let encoder = self
-                .fec_encoder
-                .as_ref()
-                .expect("active FEC has an encoder");
-            let mut encoder = encoder.lock().await;
+            let encoder = fec_encoder.as_mut().expect("active FEC has an encoder");
             for datagram in datagrams {
                 let batch = encoder.push(datagram, maximum)?;
                 self.counters
@@ -3430,6 +4437,7 @@ impl Peer {
         connection: &Connection,
         job: &mut TransmissionJob,
         queue_max_age: Duration,
+        outbound: &mut OutboundConsumer,
     ) -> TransmissionOutcome {
         while let Some(datagram) = job.datagrams.pop_front() {
             let frame = datagram.bytes;
@@ -3465,7 +4473,7 @@ impl Peer {
             }
             if !job.latency_sensitive
                 && !job.datagrams.is_empty()
-                && let Some(urgent) = self.outbound.try_pop_urgent(queue_max_age).await
+                && let Some(urgent) = outbound.try_pop_urgent(queue_max_age)
             {
                 return TransmissionOutcome::Preempted(urgent);
             }
@@ -3503,13 +4511,13 @@ impl Peer {
             .active_tx_bytes
             .fetch_sub(job.packet_bytes, Ordering::Relaxed);
         for packet in job.packets {
-            self.outbound.push(packet).await;
+            self.outbound.push(packet);
         }
     }
 
     async fn requeue_work(&self, work: TransmissionWork) {
         match work {
-            TransmissionWork::Item(item) => self.outbound.requeue(item).await,
+            TransmissionWork::Item(item) => self.outbound.requeue(item),
             TransmissionWork::Job(job) => self.requeue_transmission(job).await,
         }
     }
@@ -3520,7 +4528,7 @@ impl Peer {
             return Ok(());
         }
         loop {
-            if self.connection.lock().await.is_none()
+            if self.current_connection().is_none()
                 && let Err(error) = self.connection().await
             {
                 if should_log(&self.counters.connection_errors) {
@@ -3544,7 +4552,7 @@ impl Peer {
         let _dial_guard = self.dial_lock.lock().await;
         let endpoint_addr = self.dial_addr().await;
         let connection = self
-            .connect_preferred(endpoint_addr)
+            .connect_best_available(endpoint_addr)
             .await
             .with_context(|| format!("failed refreshing peer {}", self.name))?;
         self.install_connection(connection).await
@@ -3563,10 +4571,7 @@ impl Peer {
                 return;
             }
             let already_open = self
-                .connection
-                .lock()
-                .await
-                .as_ref()
+                .current_connection()
                 .is_some_and(|connection| connection.paths().iter().any(|path| path.is_relay()));
             if already_open {
                 return;
@@ -3654,23 +4659,16 @@ impl Peer {
         endpoint_addr
     }
 
-    async fn connect_preferred(&self, endpoint_addr: EndpointAddr) -> Result<Connection> {
-        let preferred = prefer_initial_dial_addr(endpoint_addr.clone(), self.path_preference);
-        match self
-            .endpoint
-            .connect(preferred.clone(), self.alpn.as_slice())
+    async fn connect_best_available(&self, endpoint_addr: EndpointAddr) -> Result<Connection> {
+        // Keep every IPv4, IPv6 and relay candidate in the first connection
+        // attempt. iroh can probe them within one QUIC session and the WAN path
+        // selector applies family preference after observing path quality. A
+        // preferred-only first attempt serialized fallback behind the complete
+        // connection timeout when an advertised IPv6 route was black-holed.
+        self.endpoint
+            .connect(endpoint_addr, self.alpn.as_slice())
             .await
-        {
-            Ok(connection) => Ok(connection),
-            Err(error) if preferred != endpoint_addr => {
-                debug!(peer = %self.name, %error, "preferred underlay address family failed; retrying all candidates");
-                self.endpoint
-                    .connect(endpoint_addr, self.alpn.as_slice())
-                    .await
-                    .map_err(Into::into)
-            }
-            Err(error) => Err(error.into()),
-        }
+            .map_err(Into::into)
     }
 
     fn local_address_candidates(&self) -> Vec<std::net::SocketAddr> {
@@ -3714,21 +4712,9 @@ impl Peer {
     }
 
     async fn connection(self: &Arc<Self>) -> Result<Connection> {
+        let mut updates = self.connection_updates.subscribe();
         loop {
-            // Register the waiter before checking the slot so an inbound
-            // install cannot race between the check and the await.
-            let notified = self.connection_ready.notified();
-            if let Some(connection) = self.connection.lock().await.as_ref().cloned() {
-                if let Some((address, prefix)) =
-                    forbidden_selected_path(&connection, &self.forbidden_underlay_prefixes)
-                {
-                    connection.close(2_u8.into(), b"forbidden underlay path");
-                    self.clear_connection(connection.stable_id()).await;
-                    bail!(
-                        "peer {} selected forbidden underlay address {address} in {prefix}",
-                        self.name
-                    );
-                }
+            if let Some(connection) = self.current_connection() {
                 return Ok(connection);
             }
             if self.can_dial()
@@ -3737,7 +4723,7 @@ impl Peer {
                 break;
             }
             if self.connection_mode == ConnectionMode::Canonical {
-                if tokio::time::timeout(BOOTSTRAP_FALLBACK_DELAY, notified)
+                if tokio::time::timeout(BOOTSTRAP_FALLBACK_DELAY, updates.changed())
                     .await
                     .is_err()
                 {
@@ -3745,18 +4731,20 @@ impl Peer {
                     break;
                 }
             } else {
-                tokio::time::timeout(Duration::from_secs(15), notified)
+                tokio::time::timeout(Duration::from_secs(15), updates.changed())
                     .await
-                    .with_context(|| format!("timed out waiting for inbound peer {}", self.name))?;
+                    .with_context(|| {
+                        format!("timed out waiting for inbound peer {}", self.name)
+                    })??;
             }
         }
         let _dial_guard = self.dial_lock.lock().await;
-        if let Some(connection) = self.connection.lock().await.as_ref().cloned() {
+        if let Some(connection) = self.current_connection() {
             return Ok(connection);
         }
         let endpoint_addr = self.dial_addr().await;
         let connection = self
-            .connect_preferred(endpoint_addr)
+            .connect_best_available(endpoint_addr)
             .await
             .with_context(|| format!("failed connecting to peer {}", self.name))?;
         self.install_connection(connection.clone()).await?;
@@ -3831,18 +4819,26 @@ impl Peer {
                 }
             },
         };
-        let mut slot = self.connection.lock().await;
+        let transition = self
+            .connection_update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.current_connection();
         if self.connection_mode == ConnectionMode::Canonical
             && connection.side() != canonical_side
-            && slot
+            && current
                 .as_ref()
                 .is_some_and(|current| current.side() == canonical_side)
         {
             connection.close(0_u8.into(), b"canonical connection already active");
             return Ok(());
         }
-        let old = slot.replace(connection.clone());
-        drop(slot);
+        let old = self
+            .connection
+            .swap(Some(Arc::new(connection.clone())))
+            .map(|connection| connection.as_ref().clone());
+        self.connection_updates.send_modify(|epoch| *epoch += 1);
+        drop(transition);
         *self
             .negotiated_session
             .write()
@@ -3859,16 +4855,12 @@ impl Peer {
         self.counters
             .private_link
             .store(negotiated.link_id.is_some(), Ordering::Relaxed);
-        if let Some(encoder) = &self.fec_encoder {
-            let unprotected = encoder.lock().await.reset();
-            self.counters
-                .fec_unprotected_shards
-                .fetch_add(unprotected, Ordering::Relaxed);
-        }
-        self.fec_decoder.lock().await.reset();
-        *self.reassembler.lock().await =
-            Reassembler::with_max_buffered_bytes(self.reassembly_buffer_limit);
-        *self.repair_cache.lock().await = RepairCache::with_max_bytes(self.repair_buffer_limit);
+        self.fec_reset_epoch.fetch_add(1, Ordering::Release);
+        *self
+            .repair_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            RepairCache::with_max_bytes(self.repair_buffer_limit);
         if let Some(old) = old
             && old.stable_id() != connection.stable_id()
         {
@@ -3886,7 +4878,6 @@ impl Peer {
         self.counters
             .connection_events
             .fetch_add(1, Ordering::Relaxed);
-        self.connection_ready.notify_waiters();
         if let Some(mesh_runtime) = self.mesh_runtime.clone() {
             let control_connection = connection.clone();
             let endpoint_id = self.endpoint_id;
@@ -3902,14 +4893,20 @@ impl Peer {
         if !self.relay_bootstrap_started.swap(true, Ordering::Relaxed) {
             tokio::spawn(self.clone().bootstrap_relay_path());
         }
-        let last_overlay_receive = Arc::new(Mutex::new(Instant::now()));
+        let receive_started = Instant::now();
+        let last_overlay_receive_millis = Arc::new(AtomicU64::new(0));
         let overlay_receive_confirmed = Arc::new(AtomicBool::new(false));
         let peer = self.clone();
         let receive_connection = connection.clone();
-        let receive_activity = last_overlay_receive.clone();
+        let receive_activity = last_overlay_receive_millis.clone();
         let receive_confirmed = overlay_receive_confirmed.clone();
         tokio::spawn(async move {
             let stable_id = receive_connection.stable_id();
+            let mut fec_decoder =
+                FecDecoder::with_max_buffered_bytes(peer.fec_decoder_ttl, peer.fec_buffer_limit)
+                    .expect("validated FEC decoder configuration");
+            let mut reassembler =
+                Reassembler::with_max_buffered_bytes(peer.reassembly_buffer_limit);
             let mut repair_tick = tokio::time::interval(Duration::from_millis(10));
             repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut repair_budget = 64_usize;
@@ -3918,27 +4915,7 @@ impl Peer {
                 tokio::select! {
                     result = receive_connection.read_datagram() => match result {
                     Ok(datagram) => {
-                        if peer.private_link_exclusive
-                            && let Some(reason) = private_link_path_violation(
-                                &receive_connection,
-                                &peer.allowed_local_underlay_prefixes,
-                                &peer.allowed_remote_underlay_prefixes,
-                                &peer.private_remote_addresses,
-                            )
-                        {
-                            warn!(peer = %peer.name, %reason, "closing connection after private link path migration");
-                            receive_connection.close(8_u8.into(), b"private link path migration");
-                            break;
-                        }
-                        if let Some((address, prefix)) = forbidden_selected_path(
-                            &receive_connection,
-                            &peer.forbidden_underlay_prefixes,
-                        ) {
-                            warn!(peer = %peer.name, %address, %prefix, "closing connection on forbidden underlay path");
-                            receive_connection.close(2_u8.into(), b"forbidden underlay path");
-                            break;
-                        }
-                        let decoded = match peer.fec_decoder.lock().await.push(datagram) {
+                        let decoded = match fec_decoder.push(datagram) {
                             Ok(decoded) => decoded,
                             Err(error) => {
                                 if should_log(&peer.counters.frame_drops) {
@@ -3960,7 +4937,13 @@ impl Peer {
                                     continue;
                                 }
                             };
-                            *receive_activity.lock().await = Instant::now();
+                            receive_activity.store(
+                                receive_started
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX)) as u64,
+                                Ordering::Relaxed,
+                            );
                             receive_confirmed.store(true, Ordering::Relaxed);
                             match wire {
                             WireDatagram::Frames(frames) => {
@@ -3968,12 +4951,8 @@ impl Peer {
                                     .rx_fragments
                                     .fetch_add(frames.len() as u64, Ordering::Relaxed);
                                 for frame in frames {
-                                    let (result, evictions) = {
-                                        let mut reassembler = peer.reassembler.lock().await;
-                                        let result = reassembler.push_tagged(&frame);
-                                        let evictions = reassembler.take_evictions();
-                                        (result, evictions)
-                                    };
+                                    let result = reassembler.push_tagged(frame);
+                                    let evictions = reassembler.take_evictions();
                                     peer.counters
                                         .reassembly_evictions
                                         .fetch_add(evictions, Ordering::Relaxed);
@@ -4001,7 +4980,11 @@ impl Peer {
                                 peer.counters
                                     .repair_requests_received
                                     .fetch_add(1, Ordering::Relaxed);
-                                let frames = peer.repair_cache.lock().await.get(&request);
+                                let frames = peer
+                                    .repair_cache
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get(&request);
                                 if let Some(frames) = frames {
                                     for frame in frames {
                                         if let Err(error) = receive_connection.send_datagram_wait(frame).await {
@@ -4065,11 +5048,7 @@ impl Peer {
                         let delay = Duration::from_micros(rtt_micros)
                             .mul_f32(1.25)
                             .clamp(Duration::from_millis(15), Duration::from_millis(200));
-                        let requests = peer
-                            .reassembler
-                            .lock()
-                            .await
-                            .repair_requests(delay, repair_budget);
+                        let requests = reassembler.repair_requests(delay, repair_budget);
                         repair_budget = repair_budget.saturating_sub(requests.len());
                         for request in requests {
                             let packet_id = request.packet_id;
@@ -4105,10 +5084,7 @@ impl Peer {
                 while address_updates.next().await.is_some() {
                     let is_current = !peer.shutting_down.load(Ordering::Acquire)
                         && peer
-                            .connection
-                            .lock()
-                            .await
-                            .as_ref()
+                            .current_connection()
                             .is_some_and(|current| current.stable_id() == stable_id);
                     if !is_current {
                         break;
@@ -4151,10 +5127,7 @@ impl Peer {
                 heartbeat.tick().await;
                 let is_current = !peer.shutting_down.load(Ordering::Acquire)
                     && peer
-                        .connection
-                        .lock()
-                        .await
-                        .as_ref()
+                        .current_connection()
                         .is_some_and(|current| current.stable_id() == stable_id);
                 if !is_current {
                     break;
@@ -4164,7 +5137,14 @@ impl Peer {
                     last_udp_rx = udp_rx;
                     last_transport_receive = Instant::now();
                 }
-                let overlay_silence = last_overlay_receive.lock().await.elapsed();
+                let elapsed_millis = receive_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let overlay_silence = Duration::from_millis(
+                    elapsed_millis
+                        .saturating_sub(last_overlay_receive_millis.load(Ordering::Relaxed)),
+                );
                 let transport_silence = last_transport_receive.elapsed();
                 let liveness_timeout = if overlay_receive_confirmed.load(Ordering::Relaxed)
                     || peer.counters.connection_events.load(Ordering::Relaxed) > 1
@@ -4173,17 +5153,13 @@ impl Peer {
                 } else {
                     INITIAL_OVERLAY_LIVENESS_TIMEOUT
                 };
-                // QUIC DATAGRAM is intentionally unreliable. Do not replace a
-                // healthy connection just because several application
-                // heartbeats were discarded while ACKs and path probes were
-                // still arriving. A genuine one-way NAT black hole stops both
-                // application frames and all UDP/QUIC transport activity.
+                // QUIC DATAGRAM is intentionally unreliable, so short overlay
+                // silence still requires transport silence. A hard overlay
+                // deadline is nevertheless necessary: ACKs or path probes can
+                // keep a broken application path transport-alive forever.
                 if liveness_expired(overlay_silence, transport_silence, liveness_timeout) {
                     let is_current = peer
-                        .connection
-                        .lock()
-                        .await
-                        .as_ref()
+                        .current_connection()
                         .is_some_and(|current| current.stable_id() == stable_id);
                     if !is_current {
                         break;
@@ -4295,6 +5271,19 @@ impl Peer {
                             peer.clear_connection(stable_id).await;
                             break;
                         }
+                        if peer.private_link_exclusive
+                            && let Some(reason) = private_link_path_violation(
+                                &connection,
+                                &peer.allowed_local_underlay_prefixes,
+                                &peer.allowed_remote_underlay_prefixes,
+                                &peer.private_remote_addresses,
+                            )
+                        {
+                            warn!(peer = %peer.name, %reason, "closing connection after private link path migration");
+                            connection.close(8_u8.into(), b"private link path migration");
+                            peer.clear_connection(stable_id).await;
+                            break;
+                        }
                     }
                     _ = telemetry.tick() => {
                         let snapshot = connection.paths();
@@ -4349,10 +5338,10 @@ impl Peer {
 
     async fn deliver_packet(
         &self,
-        packet: Vec<u8>,
+        packet: DataplaneBuf,
         delivery_tag: Option<DeliveryTag>,
     ) -> Result<()> {
-        let packet_info = match inspect_ip_packet(&packet) {
+        let packet_info = match inspect_ip_packet(packet.as_slice()) {
             Ok(info) => info,
             Err(error) => {
                 if should_log(&self.counters.invalid_packets) {
@@ -4366,20 +5355,8 @@ impl Peer {
                 return Ok(());
             }
         };
-        if !self.packet_allowed(packet_info.source, packet_info.destination, true) {
-            if should_log(&self.counters.policy_drops) {
-                warn!(
-                    peer = %self.name,
-                    source = %packet_info.source,
-                    destination = %packet_info.destination,
-                    policy_drops = self.counters.policy_drops.load(Ordering::Relaxed),
-                    "dropping inbound packet rejected by overlay or adjacency source policy"
-                );
-            }
-            return Ok(());
-        }
         if let Some(responder) = &self.trace_responder {
-            match responder.handle_packet(&packet).await {
+            match responder.handle_packet(packet.as_slice()).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(error) => {
@@ -4395,14 +5372,11 @@ impl Peer {
                 }
             }
         }
-        self.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .rx_bytes
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
         self.inbound_packets
             .send(InboundPacket {
                 peer_id: self.endpoint_id,
                 packet,
+                packet_info,
                 delivery_tag,
             })
             .await
@@ -4411,17 +5385,23 @@ impl Peer {
     }
 
     async fn clear_connection(&self, stable_id: usize) {
-        let mut connection = self.connection.lock().await;
-        if connection
+        let transition = self
+            .connection_update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .current_connection()
             .as_ref()
             .is_some_and(|current| current.stable_id() == stable_id)
         {
-            connection.take();
+            self.connection.store(None);
+            self.connection_updates.send_modify(|epoch| *epoch += 1);
             self.mark_disconnected();
             if !self.shutting_down.load(Ordering::Acquire) {
                 self.reconnect_needed.notify_one();
             }
         }
+        drop(transition);
     }
 
     fn mark_disconnected(&self) {
@@ -4451,6 +5431,8 @@ impl Peer {
 
     fn packet_allowed(
         &self,
+        snapshot: &DataPlaneRouteSnapshot,
+        peer_transit_enabled: bool,
         source: std::net::IpAddr,
         destination: std::net::IpAddr,
         inbound: bool,
@@ -4459,11 +5441,12 @@ impl Peer {
             PacketPolicy {
                 enforce_overlay_prefixes: self.enforce_overlay_prefixes,
                 transit_enabled: self.transit_enabled,
-                overlay_prefixes: &self.overlay_prefixes,
-                local_prefixes: &self.local_prefixes,
-                remote_prefixes: &self.remote_prefixes,
+                peer_transit_enabled,
+                overlay_prefixes: &snapshot.overlay_prefixes,
+                local_prefixes: &snapshot.local_prefixes,
+                remote_prefixes: &snapshot.remote_prefixes,
                 allowed_source_prefixes: &self.allowed_source_prefixes,
-                mesh_runtime: self.mesh_runtime.as_deref(),
+                mesh_owners: &snapshot.mesh_owners,
                 peer_id: self.endpoint_id,
             },
             source,
@@ -4474,11 +5457,19 @@ impl Peer {
 
     async fn close(&self) {
         self.shutting_down.store(true, Ordering::Release);
-        if let Some(connection) = self.connection.lock().await.take() {
+        let connection = {
+            let _transition = self
+                .connection_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let connection = self.connection.swap(None);
+            self.connection_updates.send_modify(|epoch| *epoch += 1);
+            connection
+        };
+        if let Some(connection) = connection {
             connection.close(0_u8.into(), b"shutdown");
         }
         self.mark_disconnected();
-        self.connection_ready.notify_waiters();
         self.reconnect_needed.notify_waiters();
         self.shutdown_ready.notify_waiters();
     }
@@ -4561,18 +5552,20 @@ fn liveness_expired(
     transport_silence: Duration,
     timeout: Duration,
 ) -> bool {
-    overlay_silence >= timeout && transport_silence >= timeout
+    (overlay_silence >= timeout && transport_silence >= timeout)
+        || overlay_silence >= timeout.saturating_mul(3)
 }
 
 #[derive(Clone, Copy)]
 struct PacketPolicy<'a> {
     enforce_overlay_prefixes: bool,
     transit_enabled: bool,
-    overlay_prefixes: &'a [IpNet],
-    local_prefixes: &'a [IpNet],
-    remote_prefixes: &'a [IpNet],
-    allowed_source_prefixes: &'a [IpNet],
-    mesh_runtime: Option<&'a MeshRuntime>,
+    peer_transit_enabled: bool,
+    overlay_prefixes: &'a IpPrefixSet,
+    local_prefixes: &'a IpPrefixSet,
+    remote_prefixes: &'a IpPrefixSet,
+    allowed_source_prefixes: &'a IpPrefixSet,
+    mesh_owners: &'a PrefixOwnerTable,
     peer_id: EndpointId,
 }
 
@@ -4582,19 +5575,10 @@ fn packet_allowed(
     destination: std::net::IpAddr,
     inbound: bool,
 ) -> bool {
-    let remote_destination = policy
-        .remote_prefixes
-        .iter()
-        .any(|prefix| prefix.contains(&destination))
-        || policy
-            .mesh_runtime
-            .is_some_and(|mesh| mesh.remote_overlay_address_known(destination));
+    let remote_destination = policy.remote_prefixes.contains(destination);
     if inbound
         && !policy.transit_enabled
-        && !policy
-            .local_prefixes
-            .iter()
-            .any(|prefix| prefix.contains(&destination))
+        && !policy.local_prefixes.contains(destination)
         && remote_destination
     {
         return false;
@@ -4602,25 +5586,15 @@ fn packet_allowed(
     if !policy.enforce_overlay_prefixes {
         return true;
     }
-    let contains = |address| {
-        policy
-            .overlay_prefixes
-            .iter()
-            .any(|prefix| prefix.contains(&address))
-            || policy
-                .mesh_runtime
-                .is_some_and(|mesh| mesh.overlay_address_known(address))
-    };
+    let contains = |address| policy.overlay_prefixes.contains(address);
     contains(source)
         && contains(destination)
         && (!inbound
+            || policy.allowed_source_prefixes.contains(source)
             || policy
-                .allowed_source_prefixes
-                .iter()
-                .any(|prefix| prefix.contains(&source))
-            || policy
-                .mesh_runtime
-                .is_some_and(|mesh| mesh.source_allowed_from(policy.peer_id, source)))
+                .mesh_owners
+                .owner(source)
+                .is_some_and(|owner| policy.peer_transit_enabled || owner == policy.peer_id))
 }
 
 async fn accept_loop(
@@ -4832,35 +5806,23 @@ mod tests {
     }
 
     #[test]
-    fn initial_dial_uses_preferred_family_and_keeps_relay_fallback() {
+    fn initial_dial_keeps_all_families_and_relay_in_one_attempt() {
         let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
         let address = EndpointAddr::new(endpoint(60))
             .with_ip_addr("198.51.100.60:4000".parse().unwrap())
             .with_ip_addr("[2001:db8::60]:4000".parse().unwrap())
             .with_relay_url(relay.clone());
 
-        let preferred = prefer_initial_dial_addr(address, IpFamilyPreference::Ipv6);
-
         assert_eq!(
-            preferred.ip_addrs().copied().collect::<Vec<_>>(),
-            vec!["[2001:db8::60]:4000".parse().unwrap()]
+            address.ip_addrs().copied().collect::<HashSet<_>>(),
+            HashSet::from([
+                "198.51.100.60:4000".parse().unwrap(),
+                "[2001:db8::60]:4000".parse().unwrap(),
+            ])
         );
         assert_eq!(
-            preferred.relay_urls().cloned().collect::<Vec<_>>(),
+            address.relay_urls().cloned().collect::<Vec<_>>(),
             vec![relay]
-        );
-    }
-
-    #[test]
-    fn initial_dial_keeps_available_family_when_preferred_family_is_absent() {
-        let address =
-            EndpointAddr::new(endpoint(60)).with_ip_addr("198.51.100.60:4000".parse().unwrap());
-
-        let preferred = prefer_initial_dial_addr(address, IpFamilyPreference::Ipv6);
-
-        assert_eq!(
-            preferred.ip_addrs().copied().collect::<Vec<_>>(),
-            vec!["198.51.100.60:4000".parse().unwrap()]
         );
     }
 
@@ -4943,6 +5905,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn immutable_prefix_table_uses_longest_prefix_for_both_families() {
+        let broad = endpoint(38);
+        let narrow = endpoint(39);
+        let table = PrefixOwnerTable::from_origins([
+            (broad, "10.0.0.0/8".parse().unwrap()),
+            (narrow, "10.20.0.0/16".parse().unwrap()),
+            (broad, "2001:db8::/32".parse().unwrap()),
+            (narrow, "2001:db8:20::/48".parse().unwrap()),
+        ]);
+
+        assert_eq!(table.owner("10.20.3.4".parse().unwrap()), Some(narrow));
+        assert_eq!(table.owner("10.30.3.4".parse().unwrap()), Some(broad));
+        assert_eq!(table.owner("2001:db8:20::1".parse().unwrap()), Some(narrow));
+        assert_eq!(table.owner("2001:db8:30::1".parse().unwrap()), Some(broad));
+        assert_eq!(table.owner("192.0.2.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn flow_sharding_is_stable_and_uses_multiple_router_owners() {
+        let base = PacketInfo {
+            source: "10.0.0.1".parse().unwrap(),
+            destination: "10.0.0.2".parse().unwrap(),
+            protocol: 6,
+            source_port: Some(40_000),
+            destination_port: Some(443),
+            length: 1_500,
+        };
+        assert_eq!(flow_shard(base, 8), flow_shard(base, 8));
+        let occupied = (40_000..40_128)
+            .map(|source_port| {
+                flow_shard(
+                    PacketInfo {
+                        source_port: Some(source_port),
+                        ..base
+                    },
+                    8,
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert!(occupied.len() > 1);
+    }
+
     fn measured_table(
         destination: EndpointId,
         routes: &[(EndpointId, u64)],
@@ -4998,6 +6003,26 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].endpoint_id, transit);
         assert_eq!(choices[0].candidate.capacity_bps, 25_000_000);
+    }
+
+    #[test]
+    fn degraded_connected_owner_no_longer_hides_transit() {
+        let owner = endpoint(43);
+        let transit = endpoint(44);
+        let mut direct = route_input(owner, true, false);
+        direct.metrics.loss_ppm = DIRECT_OWNER_MAX_LOSS_PPM;
+        let links = [direct, route_input(transit, true, true)];
+        let now = Instant::now();
+        let estimates = measured_table(owner, &[(owner, 25_000_000), (transit, 25_000_000)], now);
+        let choices = route_candidates(Some(owner), None, &links, &estimates, None, now);
+
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.endpoint_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([owner, transit])
+        );
     }
 
     #[test]
@@ -5185,10 +6210,113 @@ mod tests {
     }
 
     #[test]
-    fn transit_delivery_binding_is_kept_alive_by_tagged_data() {
+    fn delivery_fast_path_allocates_unique_tags_and_tracks_queue_state() {
         let origin = endpoint(56);
-        let transit = endpoint(57);
+        let first_hop = endpoint(57);
         let destination = endpoint(58);
+        let route = RouteKey {
+            destination,
+            first_hop,
+        };
+        let registration = DeliverySessionRegister {
+            session_id: 99,
+            origin,
+            destination,
+            first_hop,
+            path_epoch: 7,
+            forward_hops: vec![origin, first_hop, destination],
+        };
+        let fast = Arc::new(DeliveryFastPath::default());
+        fast.install_source(registration.clone(), 41);
+        fast.install_forwarding(registration.clone());
+
+        let workers = 8;
+        let tags_per_worker = 512;
+        let mut joins = Vec::new();
+        for _ in 0..workers {
+            let fast = fast.clone();
+            joins.push(std::thread::spawn(move || {
+                (0..tags_per_worker)
+                    .map(|_| fast.next_source_tag(route, 7, true).unwrap().sequence)
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut sequences = joins
+            .into_iter()
+            .flat_map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences.first(), Some(&41));
+        assert_eq!(sequences.len(), workers * tags_per_worker);
+        assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert!(
+            fast.source_queue_nonempty_since(registration.session_id)
+                .is_some()
+        );
+        assert!(fast.touch_forwarding(registration.session_id));
+        assert_eq!(
+            fast.forwarding_registration(registration.session_id),
+            Some(registration.clone())
+        );
+
+        fast.next_source_tag(route, 7, false).unwrap();
+        assert!(
+            fast.source_queue_nonempty_since(registration.session_id)
+                .is_none()
+        );
+        assert!(fast.next_source_tag(route, 8, true).is_none());
+        fast.remove_source_session(registration.session_id);
+        assert!(fast.next_source_tag(route, 7, true).is_none());
+    }
+
+    #[test]
+    fn periodic_fast_liveness_keeps_cold_report_state_alive() {
+        let origin = endpoint(59);
+        let first_hop = endpoint(60);
+        let destination = endpoint(61);
+        let route = RouteKey {
+            destination,
+            first_hop,
+        };
+        let started = Instant::now();
+        let mut coordinator = DeliveryCoordinator::default();
+        let registration = coordinator
+            .install_source_route(
+                origin,
+                route,
+                3,
+                vec![origin, first_hop, destination],
+                started,
+            )
+            .unwrap();
+        let fast = DeliveryFastPath::default();
+        fast.install_source(registration.clone(), 0);
+        fast.next_source_tag(route, 3, true).unwrap();
+
+        let refresh_at = started + DELIVERY_SESSION_TTL - Duration::from_millis(1);
+        for liveness in fast.source_liveness() {
+            coordinator.synchronize_source_liveness(liveness, refresh_at);
+        }
+        let after_original_ttl = started + DELIVERY_SESSION_TTL + Duration::from_millis(1);
+        coordinator.prune(after_original_ttl);
+
+        assert!(
+            coordinator
+                .next_tag(route, 3, true, after_original_ttl)
+                .tag
+                .is_some()
+        );
+        assert_eq!(
+            coordinator.forwarding_hops(origin, registration.session_id, after_original_ttl,),
+            Some(vec![origin, first_hop, destination])
+        );
+    }
+
+    #[test]
+    fn transit_delivery_binding_is_kept_alive_by_tagged_data() {
+        let origin = endpoint(62);
+        let transit = endpoint(63);
+        let destination = endpoint(64);
         let route = RouteKey {
             destination,
             first_hop: transit,
@@ -5285,16 +6413,21 @@ mod tests {
             "10.200.0.2/32".parse().unwrap(),
             "10.200.0.3/32".parse().unwrap(),
         ];
-        let overlay = local.iter().chain(&remote).copied().collect::<Vec<_>>();
+        let overlay = IpPrefixSet::from_prefixes(local.iter().chain(&remote).copied());
+        let local = IpPrefixSet::from_prefixes(local);
+        let remote = IpPrefixSet::from_prefixes(remote);
         let allowed = vec!["10.200.0.2/32".parse().unwrap()];
+        let allowed = IpPrefixSet::from_prefixes(allowed);
+        let mesh_owners = PrefixOwnerTable::default();
         let policy = PacketPolicy {
             enforce_overlay_prefixes: true,
             transit_enabled: true,
+            peer_transit_enabled: false,
             overlay_prefixes: &overlay,
             local_prefixes: &local,
             remote_prefixes: &remote,
             allowed_source_prefixes: &allowed,
-            mesh_runtime: None,
+            mesh_owners: &mesh_owners,
             peer_id: SecretKey::from_bytes(&[30; 32]).public(),
         };
         assert!(packet_allowed(
@@ -5318,6 +6451,59 @@ mod tests {
     }
 
     #[test]
+    fn immutable_mesh_policy_allows_owned_or_transit_sources_without_locking() {
+        let peer = SecretKey::from_bytes(&[32; 32]).public();
+        let other = SecretKey::from_bytes(&[33; 32]).public();
+        let local = IpPrefixSet::from_prefixes(["10.200.0.1/32".parse().unwrap()]);
+        let remote = IpPrefixSet::from_prefixes([
+            "10.200.0.2/32".parse().unwrap(),
+            "10.200.0.3/32".parse().unwrap(),
+        ]);
+        let overlay = IpPrefixSet::from_prefixes([
+            "10.200.0.1/32".parse().unwrap(),
+            "10.200.0.2/32".parse().unwrap(),
+            "10.200.0.3/32".parse().unwrap(),
+        ]);
+        let allowed = IpPrefixSet::default();
+        let mesh_owners = PrefixOwnerTable::from_origins([
+            (peer, "10.200.0.2/32".parse().unwrap()),
+            (other, "10.200.0.3/32".parse().unwrap()),
+        ]);
+        let base = PacketPolicy {
+            enforce_overlay_prefixes: true,
+            transit_enabled: true,
+            peer_transit_enabled: false,
+            overlay_prefixes: &overlay,
+            local_prefixes: &local,
+            remote_prefixes: &remote,
+            allowed_source_prefixes: &allowed,
+            mesh_owners: &mesh_owners,
+            peer_id: peer,
+        };
+        assert!(packet_allowed(
+            base,
+            "10.200.0.2".parse().unwrap(),
+            "10.200.0.1".parse().unwrap(),
+            true,
+        ));
+        assert!(!packet_allowed(
+            base,
+            "10.200.0.3".parse().unwrap(),
+            "10.200.0.1".parse().unwrap(),
+            true,
+        ));
+        assert!(packet_allowed(
+            PacketPolicy {
+                peer_transit_enabled: true,
+                ..base
+            },
+            "10.200.0.3".parse().unwrap(),
+            "10.200.0.1".parse().unwrap(),
+            true,
+        ));
+    }
+
+    #[test]
     fn non_transit_node_rejects_only_inbound_remote_destinations() {
         let local = vec![
             "10.200.0.2/32".parse().unwrap(),
@@ -5327,16 +6513,21 @@ mod tests {
             "10.200.0.1/32".parse().unwrap(),
             "10.200.0.3/32".parse().unwrap(),
         ];
-        let overlay = local.iter().chain(&remote).copied().collect::<Vec<_>>();
+        let overlay = IpPrefixSet::from_prefixes(local.iter().chain(&remote).copied());
+        let local = IpPrefixSet::from_prefixes(local);
+        let remote = IpPrefixSet::from_prefixes(remote);
         let allowed = vec!["10.200.0.1/32".parse().unwrap()];
+        let allowed = IpPrefixSet::from_prefixes(allowed);
+        let mesh_owners = PrefixOwnerTable::default();
         let non_transit_policy = PacketPolicy {
             enforce_overlay_prefixes: true,
             transit_enabled: false,
+            peer_transit_enabled: false,
             overlay_prefixes: &overlay,
             local_prefixes: &local,
             remote_prefixes: &remote,
             allowed_source_prefixes: &allowed,
-            mesh_runtime: None,
+            mesh_owners: &mesh_owners,
             peer_id: SecretKey::from_bytes(&[31; 32]).public(),
         };
 
@@ -5428,7 +6619,7 @@ mod tests {
     }
 
     #[test]
-    fn liveness_requires_both_application_and_transport_silence() {
+    fn liveness_uses_transport_grace_but_has_a_hard_overlay_deadline() {
         let timeout = Duration::from_secs(2);
         assert!(!liveness_expired(
             Duration::from_secs(3),
@@ -5443,6 +6634,11 @@ mod tests {
         assert!(liveness_expired(
             Duration::from_secs(2),
             Duration::from_secs(2),
+            timeout,
+        ));
+        assert!(liveness_expired(
+            Duration::from_secs(6),
+            Duration::from_millis(100),
             timeout,
         ));
     }
@@ -5462,5 +6658,17 @@ mod tests {
         // of pressure and therefore slipped just below the 64 KiB class
         // boundary. Packet size now independently keeps it in Bulk service.
         assert!(!latency_service(65_279, 65_535));
+    }
+
+    #[test]
+    fn only_single_healthy_direct_route_omits_delivery_tracking() {
+        let owner = endpoint(90);
+        let transit = endpoint(91);
+        assert!(!delivery_tracking_required(owner, owner, 1, 1));
+        assert!(delivery_tracking_required(owner, transit, 1, 1));
+        assert!(delivery_tracking_required(owner, owner, 2, 1));
+        assert!(delivery_tracking_required(owner, owner, 1, 0));
+        assert!(delivery_tracking_required(owner, owner, 1, 2));
+        assert!(delivery_tracking_required(owner, owner, 1, 4));
     }
 }

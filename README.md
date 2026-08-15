@@ -1,14 +1,15 @@
 # Ironet
 
-`ironet` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在单个 TUN 接口上处理覆盖网流量，并通过 FlowRouter 按实时路径状态选择首跳。
+`ironet` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在一个多队列 GSO/GRO TUN 接口上处理覆盖网流量，并通过分片 FlowRouter 按实时路径状态选择首跳。
 
 当前软件版本为 `0.1.0`，当前网络协议正式定位为 **Ironet Protocol V1（1.0）**。协议分层、兼容边界和稳定性规则见 [Protocol V1](docs/protocol-v1.md)。配置格式、Presence 格式和内部 wire format 在首次稳定发布前可能发生不兼容变更。
 
 ## 项目范围
 
-- 每个守护进程创建并管理一个三层 TUN 接口，默认名称为 `ironet0`。
+- 每个守护进程创建并管理一个三层 TUN 接口，默认名称为 `ironet0`；接口内部按 CPU 数使用最多 8 条队列。
 - 节点使用签名 Presence 传播节点地址、前缀归属和转发能力；固定 peer 用于引导连接。
 - 同一流在短租约内固定到一条路径；租约到期后可根据延迟、抖动、丢包、队列压力和实测容量重新选择路径。
+- 路由与策略使用不可变 generation；peer 发送队列采用有界无共享互斥热路径和单写者调度，连接读取通过原子快照完成。
 - 容量以 `(目的节点所有者, 首跳节点)` 为键，分别维护两个方向的测量值。主动探测和接收端确认的业务交付样本共同参与估计。
 - 开启发现时会发布直连候选，并通过已连接 peer 交换观察到的 NAT 映射以协调打洞；硬 NAT 节点可先通过 DERP 或已有覆盖邻接建立连接。
 - 固定 bootstrap peer 继续交换签名 Presence 和经过过滤的 NAT 地址候选；普通 transit peer 是覆盖层的额外兜底，不与底层 relay 混为一层。
@@ -21,8 +22,8 @@
 
 ```mermaid
 flowchart LR
-    R["Linux 策略路由"] --> T["单个 L3 TUN：ironet0"]
-    T --> F["FlowRouter\n流键、压力与路径租约"]
+    R["Linux 策略路由"] --> T["多队列 L3 TUN：ironet0\nGSO/GRO"]
+    T --> F["FlowRouter shards\n流键、压力与路径租约"]
     F --> B["首跳 B 的发送队列"]
     F --> D["首跳 D 的发送队列"]
     B --> U1["iroh/QUIC\n直连、relay 或 DERP"]

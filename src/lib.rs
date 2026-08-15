@@ -1,4 +1,5 @@
 pub mod address;
+pub mod buffer;
 pub mod capacity;
 pub mod capacity_probe;
 pub mod config;

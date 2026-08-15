@@ -806,6 +806,14 @@ impl MeshRuntime {
             .collect()
     }
 
+    /// Clone the small control-plane policy as one coherent generation. Data
+    /// plane route snapshots call this off the packet path, avoiding one lock
+    /// acquisition per prefix lookup and another per adjacency.
+    pub fn routing_policy_snapshot(&self) -> (Vec<(EndpointId, IpNet)>, HashMap<EndpointId, bool>) {
+        let policy = self.read_policy();
+        (policy.origins.clone(), policy.transit_by_owner.clone())
+    }
+
     pub async fn presence(&self, owner: EndpointId) -> Option<SignedPresence> {
         let directory = self.directory.lock().await;
         directory
