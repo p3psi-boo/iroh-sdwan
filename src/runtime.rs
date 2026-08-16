@@ -2897,10 +2897,28 @@ fn transport_capabilities(config: &Config) -> TransportCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdaptiveFecProfile {
+    data_shards: u8,
+    recovery_shards: u8,
+    block_timeout_millis: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FecNetworkSample {
+    loss_ppm: u32,
+    rtt: Duration,
+    jitter: Duration,
+    packets: u64,
+    rate_bps: u64,
+}
+
 #[derive(Debug, Default)]
 struct AdaptiveFecController {
     impaired_intervals: u8,
     healthy_intervals: u8,
+    profile_candidate: Option<AdaptiveFecProfile>,
+    profile_intervals: u8,
 }
 
 #[derive(Debug, Default)]
@@ -2958,20 +2976,24 @@ impl AdaptiveLaneController {
 }
 
 impl AdaptiveFecController {
-    fn update(&mut self, active: bool, loss_ppm: u32, sample_packets: u64, rate_bps: u64) -> bool {
-        const MIN_SAMPLE_PACKETS: u64 = 1_000;
-        const MAX_AUTO_FEC_RATE_BPS: u64 = 50_000_000;
+    fn update(&mut self, active: bool, loss_ppm: u32, sample_packets: u64, _rate_bps: u64) -> bool {
         const ENABLE_LOSS_PPM: u32 = 20_000;
         const DISABLE_LOSS_PPM: u32 = 1_000;
-        const ENABLE_INTERVALS: u8 = 3;
         const DISABLE_INTERVALS: u8 = 20;
 
-        if rate_bps > MAX_AUTO_FEC_RATE_BPS {
-            self.impaired_intervals = 0;
-            self.healthy_intervals = 0;
-            return false;
-        }
-        if sample_packets < MIN_SAMPLE_PACKETS {
+        // At high loss, requiring several thousand-packet intervals creates a
+        // bootstrap deadlock: the inner TCP flow stalls before the controller
+        // has enough samples to enable FEC.  Confidence therefore scales with
+        // impairment severity.  Rate remains an input for profile selection;
+        // it must not disable protection on fast but lossy links.
+        let required_samples = if loss_ppm >= 100_000 {
+            64
+        } else if loss_ppm >= 50_000 {
+            128
+        } else {
+            256
+        };
+        if sample_packets < required_samples {
             return active;
         }
         if active {
@@ -2989,8 +3011,109 @@ impl AdaptiveFecController {
             } else {
                 self.impaired_intervals = 0;
             }
-            self.impaired_intervals >= ENABLE_INTERVALS
+            let required_intervals = if loss_ppm >= 100_000 {
+                1
+            } else if loss_ppm >= 50_000 {
+                2
+            } else {
+                3
+            };
+            self.impaired_intervals >= required_intervals
         }
+    }
+
+    fn select_profile(
+        &mut self,
+        current: AdaptiveFecProfile,
+        sample: FecNetworkSample,
+        immediate: bool,
+    ) -> AdaptiveFecProfile {
+        if sample.packets < 64 {
+            self.profile_candidate = None;
+            self.profile_intervals = 0;
+            return current;
+        }
+        let desired = adaptive_fec_profile(sample);
+        if desired == current {
+            self.profile_candidate = None;
+            self.profile_intervals = 0;
+            return current;
+        }
+        if immediate {
+            self.profile_candidate = None;
+            self.profile_intervals = 0;
+            return desired;
+        }
+        if self.profile_candidate == Some(desired) {
+            self.profile_intervals = self.profile_intervals.saturating_add(1);
+        } else {
+            self.profile_candidate = Some(desired);
+            self.profile_intervals = 1;
+        }
+        if self.profile_intervals >= 3 {
+            self.profile_candidate = None;
+            self.profile_intervals = 0;
+            desired
+        } else {
+            current
+        }
+    }
+}
+
+fn adaptive_fec_profile(sample: FecNetworkSample) -> AdaptiveFecProfile {
+    let rtt_millis = sample.rtt.as_millis().clamp(1, 1_000) as u64;
+    let jitter_millis = sample.jitter.as_millis().min(250) as u64;
+    // Fill one block within roughly one RTT, but keep blocks small enough to
+    // protect sparse startup/control traffic and large enough to amortize
+    // parity at high throughput.
+    let target_fill_millis = rtt_millis.clamp(8, 40);
+    let estimated = sample
+        .packets
+        .saturating_mul(target_fill_millis)
+        .saturating_add(999)
+        / 1_000;
+    let minimum = if sample.rate_bps >= 1_000_000_000 {
+        16
+    } else if sample.rate_bps >= 100_000_000 {
+        8
+    } else {
+        2
+    };
+    let raw_data_shards = estimated.clamp(minimum, 16);
+    let data_shards: u8 = match raw_data_shards {
+        0..=2 => 2,
+        3..=4 => 4,
+        5..=8 => 8,
+        9..=12 => 12,
+        _ => 16,
+    };
+
+    // Carry enough parity for the expected losses plus one safety shard.  The
+    // 1.8 multiplier absorbs short random bursts without jumping straight to
+    // 100% redundancy on ordinary WAN loss.
+    let expected = u64::from(data_shards)
+        .saturating_mul(u64::from(sample.loss_ppm))
+        .saturating_mul(18);
+    let recovery_shards = expected
+        .saturating_add(9_999_999)
+        .checked_div(10_000_000)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .clamp(1, u64::from(data_shards)) as u8;
+
+    let fill_millis = u64::from(data_shards)
+        .saturating_mul(1_000)
+        .saturating_add(sample.packets.saturating_sub(1))
+        / sample.packets.max(1);
+    let block_timeout_millis = fill_millis
+        .saturating_mul(2)
+        .saturating_add(jitter_millis.saturating_mul(2))
+        .max(rtt_millis.saturating_mul(2))
+        .clamp(15, 120);
+    AdaptiveFecProfile {
+        data_shards,
+        recovery_shards,
+        block_timeout_millis,
     }
 }
 
@@ -3997,6 +4120,9 @@ struct Peer {
     /// Taken once by `queue_to_network`; encoder mutation is single-writer.
     fec_encoder: StdMutex<Option<FecEncoder>>,
     fec_reset_epoch: AtomicU64,
+    fec_data_shards: AtomicU64,
+    fec_recovery_shards: AtomicU64,
+    fec_block_timeout_millis: AtomicU64,
     fec_decoder_ttl: Duration,
     fec_buffer_limit: usize,
     fec_available: bool,
@@ -4213,6 +4339,15 @@ impl Peer {
         counters
             .tun_mtu
             .store(u64::from(config.tun_mtu), Ordering::Relaxed);
+        counters
+            .fec_data_shards
+            .store(u64::from(config.fec.data_shards), Ordering::Relaxed);
+        counters
+            .fec_recovery_shards
+            .store(u64::from(config.fec.recovery_shards), Ordering::Relaxed);
+        counters
+            .fec_block_timeout_millis
+            .store(config.fec.block_timeout_millis, Ordering::Relaxed);
         let mesh_pool_per_peer = config
             .mesh
             .enabled
@@ -4342,6 +4477,9 @@ impl Peer {
             effective_frame_size: AtomicU64::new(effective_frame_size as u64),
             fec_encoder: StdMutex::new(fec_encoder),
             fec_reset_epoch: AtomicU64::new(0),
+            fec_data_shards: AtomicU64::new(u64::from(config.fec.data_shards)),
+            fec_recovery_shards: AtomicU64::new(u64::from(config.fec.recovery_shards)),
+            fec_block_timeout_millis: AtomicU64::new(config.fec.block_timeout_millis),
             fec_decoder_ttl: Duration::from_millis(config.fec.decoder_ttl_millis),
             fec_buffer_limit,
             fec_available,
@@ -4374,7 +4512,13 @@ impl Peer {
             let reset_epoch = self.fec_reset_epoch.load(Ordering::Acquire);
             if reset_epoch != observed_fec_reset {
                 if let Some(encoder) = fec_encoder.as_mut() {
-                    let unprotected = encoder.reset();
+                    let unprotected = encoder.reconfigure(
+                        self.fec_data_shards.load(Ordering::Relaxed) as usize,
+                        self.fec_recovery_shards.load(Ordering::Relaxed) as usize,
+                        Duration::from_millis(
+                            self.fec_block_timeout_millis.load(Ordering::Relaxed),
+                        ),
+                    )?;
                     self.counters
                         .fec_unprotected_shards
                         .fetch_add(unprotected, Ordering::Relaxed);
@@ -5166,14 +5310,15 @@ impl Peer {
                 Ordering::Relaxed,
             );
         }
-        self.fec_active.store(
-            fec_negotiated
-                && (self.fec_forced
-                    || negotiated
-                        .transport
-                        .is_some_and(|profile| profile.outbound.fec_enabled)),
-            Ordering::Relaxed,
-        );
+        let fec_active = fec_negotiated
+            && (self.fec_forced
+                || negotiated
+                    .transport
+                    .is_some_and(|profile| profile.outbound.fec_enabled));
+        self.fec_active.store(fec_active, Ordering::Relaxed);
+        self.counters
+            .fec_active
+            .store(fec_active, Ordering::Relaxed);
         self.negotiated_frame_size_ceiling.store(
             negotiated
                 .transport
@@ -5748,6 +5893,7 @@ impl Peer {
                             );
                             if current != previous {
                                 peer.fec_active.store(current, Ordering::Relaxed);
+                                peer.counters.fec_active.store(current, Ordering::Relaxed);
                                 peer.fec_reset_epoch.fetch_add(1, Ordering::Release);
                                 if current {
                                     peer.desired_secondary_data_lanes
@@ -5760,6 +5906,69 @@ impl Peer {
                                     loss_ppm = metrics.loss_ppm,
                                     "adapted path FEC"
                                 );
+                            }
+                            if current {
+                                let active_profile = AdaptiveFecProfile {
+                                    data_shards: peer
+                                        .fec_data_shards
+                                        .load(Ordering::Relaxed) as u8,
+                                    recovery_shards: peer
+                                        .fec_recovery_shards
+                                        .load(Ordering::Relaxed) as u8,
+                                    block_timeout_millis: peer
+                                        .fec_block_timeout_millis
+                                        .load(Ordering::Relaxed),
+                                };
+                                let profile = fec_controller.select_profile(
+                                    active_profile,
+                                    FecNetworkSample {
+                                        loss_ppm: metrics.loss_ppm,
+                                        rtt: stats.rtt,
+                                        jitter: metrics.jitter,
+                                        packets: tx_delta,
+                                        rate_bps,
+                                    },
+                                    !previous,
+                                );
+                                if profile != active_profile {
+                                    peer.fec_data_shards.store(
+                                        u64::from(profile.data_shards),
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.fec_recovery_shards.store(
+                                        u64::from(profile.recovery_shards),
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.fec_block_timeout_millis.store(
+                                        profile.block_timeout_millis,
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.counters.fec_data_shards.store(
+                                        u64::from(profile.data_shards),
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.counters.fec_recovery_shards.store(
+                                        u64::from(profile.recovery_shards),
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.counters.fec_block_timeout_millis.store(
+                                        profile.block_timeout_millis,
+                                        Ordering::Relaxed,
+                                    );
+                                    peer.fec_reset_epoch.fetch_add(1, Ordering::Release);
+                                    info!(
+                                        peer = %peer.name,
+                                        loss_ppm = metrics.loss_ppm,
+                                        rtt_micros = stats.rtt.as_micros(),
+                                        jitter_micros = metrics.jitter.as_micros(),
+                                        rate_bps,
+                                        sample_packets = tx_delta,
+                                        data_shards = profile.data_shards,
+                                        recovery_shards = profile.recovery_shards,
+                                        block_timeout_millis = profile.block_timeout_millis,
+                                        "adapted path FEC profile"
+                                    );
+                                }
                             }
                         }
                         if peer.auto_tune && peer.max_secondary_data_lanes > 0 {
@@ -6110,6 +6319,9 @@ impl Peer {
 
     fn mark_disconnected(&self) {
         self.counters.connected.store(false, Ordering::Relaxed);
+        self.fec_active.store(false, Ordering::Relaxed);
+        self.counters.fec_active.store(false, Ordering::Relaxed);
+        self.fec_reset_epoch.fetch_add(1, Ordering::Release);
         self.counters
             .selected_path_transport
             .store(0, Ordering::Relaxed);
@@ -6517,11 +6729,7 @@ mod tests {
     #[test]
     fn adaptive_fec_uses_sustained_loss_and_long_healthy_hysteresis() {
         let mut controller = AdaptiveFecController::default();
-        assert!(!controller.update(false, 30_000, 999, 10_000_000));
-        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
-        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
-        assert!(controller.update(false, 30_000, 10_000, 10_000_000));
-        assert!(!controller.update(true, 30_000, 10_000, 100_000_000));
+        assert!(!controller.update(false, 30_000, 255, 10_000_000));
         assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
         assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
         assert!(controller.update(false, 30_000, 10_000, 10_000_000));
@@ -6529,6 +6737,58 @@ mod tests {
             assert!(controller.update(true, 500, 10_000, 10_000_000));
         }
         assert!(!controller.update(true, 500, 10_000, 10_000_000));
+    }
+
+    #[test]
+    fn adaptive_fec_bootstraps_immediately_on_catastrophic_loss() {
+        let mut controller = AdaptiveFecController::default();
+        assert!(!controller.update(false, 150_000, 63, 1_000_000));
+        assert!(controller.update(false, 150_000, 64, 1_000_000));
+    }
+
+    #[test]
+    fn adaptive_fec_profile_uses_loss_latency_rate_and_packet_rate() {
+        let sparse = adaptive_fec_profile(FecNetworkSample {
+            loss_ppm: 200_000,
+            rtt: Duration::from_millis(8),
+            jitter: Duration::from_millis(1),
+            packets: 120,
+            rate_bps: 2_000_000,
+        });
+        assert_eq!(sparse.data_shards, 2);
+        assert_eq!(sparse.recovery_shards, 2);
+        assert_eq!(sparse.block_timeout_millis, 36);
+
+        let fast = adaptive_fec_profile(FecNetworkSample {
+            loss_ppm: 30_000,
+            rtt: Duration::from_millis(30),
+            jitter: Duration::from_millis(4),
+            packets: 80_000,
+            rate_bps: 1_500_000_000,
+        });
+        assert_eq!(fast.data_shards, 16);
+        assert_eq!(fast.recovery_shards, 2);
+        assert_eq!(fast.block_timeout_millis, 60);
+    }
+
+    #[test]
+    fn adaptive_fec_profile_freezes_without_a_credible_traffic_sample() {
+        let mut controller = AdaptiveFecController::default();
+        let current = AdaptiveFecProfile {
+            data_shards: 16,
+            recovery_shards: 3,
+            block_timeout_millis: 20,
+        };
+        let idle = FecNetworkSample {
+            loss_ppm: 200_000,
+            rtt: Duration::from_millis(8),
+            jitter: Duration::from_millis(1),
+            packets: 5,
+            rate_bps: 0,
+        };
+        for _ in 0..10 {
+            assert_eq!(controller.select_profile(current, idle, false), current);
+        }
     }
 
     #[test]

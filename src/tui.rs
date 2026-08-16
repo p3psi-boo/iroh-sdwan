@@ -1918,6 +1918,12 @@ fn error_detail(peer: &PeerStatus) -> String {
 
 fn fec_detail(peer: &PeerStatus) -> String {
     let mut fields = Vec::new();
+    if peer.fec_active {
+        fields.push(format!(
+            "profile={}+{}@{}ms",
+            peer.fec_data_shards, peer.fec_recovery_shards, peer.fec_block_timeout_millis
+        ));
+    }
     for (label, count) in [
         ("tx", peer.fec_tx_recovery_shards),
         ("rx", peer.fec_rx_recovery_shards),

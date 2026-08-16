@@ -1,0 +1,119 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 9433087135
+#
+# Overhead  Command          Shared Object         Symbol                                                                                                                                                                                                                                                                                                                           
+# ........  ...............  ....................  .................................................................................................................................................................................................................................................................................................................................
+#
+     6.60%  tokio-rt-worker  ironetd               [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
+            |
+            ---ring_core_0_17_14__chacha20_poly1305_seal_avx2
+
+     4.42%  tokio-rt-worker  ironetd               [.] memcpy
+            |          
+             --4.21%--memcpy
+
+     1.81%  tokio-rt-worker  ironetd               [.] noq_proto::connection::Connection::poll_transmit
+            |
+            ---noq_proto::connection::Connection::poll_transmit
+
+     1.41%  tokio-rt-worker  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
+            |          
+             --1.13%--entry_SYSRETQ_unsafe_stack
+                       |          
+                        --0.94%--sccp
+
+     1.32%  tokio-rt-worker  ironetd               [.] noq_proto::connection::Connection::populate_packet
+            |
+            ---noq_proto::connection::Connection::populate_packet
+
+     1.30%  tokio-rt-worker  [kernel.kallsyms]     [k] clflush_cache_range
+            |
+            ---clflush_cache_range
+               |          
+                --1.20%--intel_iommu_map_pages
+                          __iommu_map
+                          iommu_map
+                          __iommu_dma_map
+                          iommu_dma_map_page
+                          dma_map_page_attrs
+                          igc_xmit_frame
+                          dev_hard_start_xmit
+                          sch_direct_xmit
+                          __dev_queue_xmit
+                          ip6_finish_output2
+                          ip6_finish_output
+                          ip6_send_skb
+                          udp_v6_send_skb
+                          udpv6_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmsg
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          sccp
+
+     1.20%  tokio-rt-worker  ironetd               [.] ring_core_0_17_14__ChaCha20_ctr32_nohw
+            |
+            ---ring_core_0_17_14__ChaCha20_ctr32_nohw
+
+     1.12%  tokio-rt-worker  ironetd               [.] __libc_free
+            |
+            ---__libc_free
+
+     0.90%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_to_iter
+            |
+            ---_copy_to_iter
+               |          
+                --0.73%--__skb_datagram_iter
+                          skb_copy_datagram_iter
+                          tun_do_read
+                          tun_chr_read_iter
+                          vfs_read
+                          ksys_read
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          sccp
+                          0x1
+
+     0.82%  tokio-rt-worker  ironetd               [.] tokio::runtime::scheduler::multi_thread::worker::run
+            |          
+             --0.78%--tokio::runtime::scheduler::multi_thread::worker::run
+
+     0.79%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_from_iter
+            |
+            ---_copy_from_iter
+               ip_generic_getfrag
+               __ip6_append_data
+               ip6_make_skb
+               udpv6_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               sccp
+
+     0.76%  tokio-rt-worker  ironetd               [.] alloc_slot
+            |
+            ---alloc_slot
+
+     0.73%  tokio-rt-worker  [kernel.kallsyms]     [k] __seccomp_filter
+     0.73%  tokio-rt-worker  ironetd               [.] enframe
+     0.73%  tokio-rt-worker  ironetd               [.] noq_proto::connection::Connection::process_payload
+            |
+            ---noq_proto::connection::Connection::process_payload
+
+     0.72%  tokio-rt-worker  ironetd               [.] tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+            |
+            ---tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+
+
+
+#
+# (Tip: Use parent filter to see specific call path: perf report -p <regex>)
+#

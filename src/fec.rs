@@ -194,6 +194,28 @@ impl FecEncoder {
             .take()
             .map_or(0, |block| block.originals.len() as u64)
     }
+
+    /// Change the sender-side FEC geometry without rebuilding the process.
+    ///
+    /// FEC envelopes describe their own geometry, so the decoder does not
+    /// need a matching out-of-band configuration.  Dropping the incomplete
+    /// block is required because its already-emitted systematic shards carry
+    /// the old geometry.
+    pub fn reconfigure(
+        &mut self,
+        data_shards: usize,
+        recovery_shards: usize,
+        block_timeout: Duration,
+    ) -> Result<u64> {
+        validate_counts(data_shards, recovery_shards)?;
+        ensure!(!block_timeout.is_zero(), "FEC block timeout cannot be zero");
+        let unprotected = self.reset();
+        self.data_shards = data_shards;
+        self.recovery_shards = recovery_shards;
+        self.block_timeout = block_timeout;
+        self.codec = None;
+        Ok(unprotected)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -803,6 +825,27 @@ mod tests {
         let decoded = decoder.push(batch.datagrams[0].bytes.clone()).unwrap();
         assert_eq!(decoded.frames, [Bytes::from_static(b"one")]);
         assert_eq!(decoded.recovered_shards, 0);
+    }
+
+    #[test]
+    fn encoder_geometry_can_be_reconfigured_between_blocks() {
+        let mut encoder = encoder();
+        encoder.push(Bytes::from_static(b"old"), 128).unwrap();
+        assert_eq!(
+            encoder
+                .reconfigure(2, 1, Duration::from_millis(25))
+                .unwrap(),
+            1
+        );
+        let first = encoder.push(Bytes::from_static(b"new-1"), 128).unwrap();
+        let second = encoder.push(Bytes::from_static(b"new-2"), 128).unwrap();
+        assert_eq!(first.datagrams.len(), 1);
+        assert_eq!(second.datagrams.len(), 2);
+        assert!(second.datagrams[1].recovery);
+        let v1 = V1Envelope::decode(second.datagrams[1].bytes.clone()).unwrap();
+        let envelope = Envelope::parse(v1.payload).unwrap();
+        assert_eq!(envelope.data_shards, 2);
+        assert_eq!(envelope.recovery_shards, 1);
     }
 
     #[test]

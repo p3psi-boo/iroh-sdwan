@@ -1627,7 +1627,7 @@ fn render_peers(peers: &[PeerStatus], output: OutputFormat) -> Result<String> {
 
 fn format_peer_human(peer: &PeerStatus) -> String {
     format!(
-        "peer {}: endpoint_id={} interface={} connected={} path={}:{} rtt={} jitter={} loss={} queue={} tx_packets={} tx={} rx_packets={} rx={} policy_drops={} connection_errors={} send_errors={}",
+        "peer {}: endpoint_id={} interface={} connected={} path={}:{} rtt={} jitter={} loss={} fec={} queue={} tx_packets={} tx={} rx_packets={} rx={} policy_drops={} connection_errors={} send_errors={}",
         single_line(&peer.name),
         single_line(&peer.endpoint_id),
         single_line(&peer.interface),
@@ -1645,6 +1645,14 @@ fn format_peer_human(peer: &PeerStatus) -> String {
         human_micros(peer.path_rtt_micros),
         human_micros(peer.path_jitter_micros),
         format_loss(peer.path_loss_ppm),
+        if peer.fec_active {
+            format!(
+                "{}+{}@{}ms",
+                peer.fec_data_shards, peer.fec_recovery_shards, peer.fec_block_timeout_millis
+            )
+        } else {
+            "off".into()
+        },
         display::bytes(peer.queue_bytes),
         peer.tx_packets,
         display::bytes(peer.tx_bytes),
@@ -2279,7 +2287,7 @@ mod tests {
         let human = render_peers(std::slice::from_ref(&peer), OutputFormat::Human).unwrap();
         assert_eq!(
             human,
-            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=ironet0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
+            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=ironet0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% fec=off queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
         );
         assert!(!human.contains("bad\nname"));
 
