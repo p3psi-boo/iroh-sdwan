@@ -20,6 +20,26 @@ tun_mtu = 65535
 # 自动帧大小的安全上限。QUIC 从 1400 字节 UDP 负载开始；检测到 MTU 黑洞时，
 # 自动回退到 1200 字节的安全下限。
 max_frame_size = 1400
+# QUIC 数据面的运行时调优项；修改配置并 reload 即可，无需重新编译。
+udp_segmentation_offload = false
+quic_send_buffer_bytes = 131072
+quic_receive_buffer_bytes = 8388608
+# 单 lane 是稳定默认值；多 lane 仅在验证过的并行路径上显式开启。
+quic_data_lanes = 1
+quic_congestion_controller = "cubic"
+quic_initial_rtt_millis = 100
+quic_initial_mtu = 1400
+# 开启后，误判 MTU 黑洞回退到 1200 时会自动重新探测。
+quic_mtu_discovery_enabled = false
+quic_mtu_black_hole_cooldown_millis = 10000
+quic_keep_alive_millis = 1000
+quic_passthrough_window_bytes = 16777216
+# quic_passthrough_pacing_mbps = 900
+quic_adaptive_initial_mbps = 850
+quic_adaptive_min_mbps = 100
+quic_adaptive_max_mbps = 950
+quic_adaptive_loss_backoff_bps = 50
+quic_pacing_quantum_bytes = 8192
 node_interface = "ironet0"
 
 # 配置到 ironet0 虚拟接口的稳定节点/管理地址。

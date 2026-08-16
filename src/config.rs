@@ -42,6 +42,86 @@ pub struct Config {
     /// Keep disabled unless the host UDP stack and network interface support it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub udp_segmentation_offload: bool,
+    /// Bounded userspace QUIC DATAGRAM send queue per connection. Larger
+    /// values reduce producer/driver wakeups on fast paths at the cost of a
+    /// larger non-preemptible burst.
+    #[serde(
+        default = "default_quic_send_buffer_bytes",
+        skip_serializing_if = "is_default_quic_send_buffer_bytes"
+    )]
+    pub quic_send_buffer_bytes: usize,
+    #[serde(
+        default = "default_quic_receive_buffer_bytes",
+        skip_serializing_if = "is_default_quic_receive_buffer_bytes"
+    )]
+    pub quic_receive_buffer_bytes: usize,
+    /// Total authenticated QUIC connections per peer, including the primary.
+    #[serde(
+        default = "default_quic_data_lanes",
+        skip_serializing_if = "is_default_quic_data_lanes"
+    )]
+    pub quic_data_lanes: usize,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub quic_congestion_controller: QuicCongestionController,
+    #[serde(
+        default = "default_quic_initial_rtt_millis",
+        skip_serializing_if = "is_default_quic_initial_rtt_millis"
+    )]
+    pub quic_initial_rtt_millis: u64,
+    #[serde(
+        default = "default_quic_initial_mtu",
+        skip_serializing_if = "is_default_quic_initial_mtu"
+    )]
+    pub quic_initial_mtu: u16,
+    /// Run DPLPMTUD and re-probe after a congestion-induced black-hole
+    /// fallback instead of remaining at the 1200-byte minimum indefinitely.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quic_mtu_discovery_enabled: bool,
+    #[serde(
+        default = "default_quic_mtu_black_hole_cooldown_millis",
+        skip_serializing_if = "is_default_quic_mtu_black_hole_cooldown_millis"
+    )]
+    pub quic_mtu_black_hole_cooldown_millis: u64,
+    #[serde(
+        default = "default_quic_keep_alive_millis",
+        skip_serializing_if = "is_default_quic_keep_alive_millis"
+    )]
+    pub quic_keep_alive_millis: u64,
+    #[serde(
+        default = "default_quic_passthrough_window_bytes",
+        skip_serializing_if = "is_default_quic_passthrough_window_bytes"
+    )]
+    pub quic_passthrough_window_bytes: u64,
+    /// Optional outer pacing ceiling for passthrough mode. Inner TCP retains
+    /// end-to-end congestion control; this ceiling protects non-TCP traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_passthrough_pacing_mbps: Option<u64>,
+    #[serde(
+        default = "default_quic_adaptive_initial_mbps",
+        skip_serializing_if = "is_default_quic_adaptive_initial_mbps"
+    )]
+    pub quic_adaptive_initial_mbps: u64,
+    #[serde(
+        default = "default_quic_adaptive_min_mbps",
+        skip_serializing_if = "is_default_quic_adaptive_min_mbps"
+    )]
+    pub quic_adaptive_min_mbps: u64,
+    #[serde(
+        default = "default_quic_adaptive_max_mbps",
+        skip_serializing_if = "is_default_quic_adaptive_max_mbps"
+    )]
+    pub quic_adaptive_max_mbps: u64,
+    /// Pacing reduction per congestion event in basis points (100 = 1%).
+    #[serde(
+        default = "default_quic_adaptive_loss_backoff_bps",
+        skip_serializing_if = "is_default_quic_adaptive_loss_backoff_bps"
+    )]
+    pub quic_adaptive_loss_backoff_bps: u16,
+    #[serde(
+        default = "default_quic_pacing_quantum_bytes",
+        skip_serializing_if = "is_default_quic_pacing_quantum_bytes"
+    )]
+    pub quic_pacing_quantum_bytes: u64,
     #[serde(
         default = "default_node_interface",
         skip_serializing_if = "is_default_node_interface"
@@ -89,6 +169,16 @@ pub enum AttachmentMode {
     #[default]
     Tun,
     None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuicCongestionController {
+    #[default]
+    Cubic,
+    Bbr3,
+    Passthrough,
+    Adaptive,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +611,59 @@ impl Config {
         ensure!(
             self.max_frame_size >= 256,
             "max_frame_size must be at least 256"
+        );
+        ensure!(
+            (8 * 1024..=8 * 1024 * 1024).contains(&self.quic_send_buffer_bytes),
+            "quic_send_buffer_bytes must be between 8192 and 8388608"
+        );
+        ensure!(
+            (64 * 1024..=64 * 1024 * 1024).contains(&self.quic_receive_buffer_bytes),
+            "quic_receive_buffer_bytes must be between 65536 and 67108864"
+        );
+        ensure!(
+            (1..=8).contains(&self.quic_data_lanes),
+            "quic_data_lanes must be between 1 and 8"
+        );
+        ensure!(
+            (1..=10_000).contains(&self.quic_initial_rtt_millis),
+            "quic_initial_rtt_millis must be between 1 and 10000"
+        );
+        ensure!(
+            (1_200..=1_452).contains(&self.quic_initial_mtu),
+            "quic_initial_mtu must be between 1200 and 1452"
+        );
+        ensure!(
+            (1_000..=600_000).contains(&self.quic_mtu_black_hole_cooldown_millis),
+            "quic_mtu_black_hole_cooldown_millis must be between 1000 and 600000"
+        );
+        ensure!(
+            (100..=60_000).contains(&self.quic_keep_alive_millis),
+            "quic_keep_alive_millis must be between 100 and 60000"
+        );
+        ensure!(
+            (64 * 1024..=256 * 1024 * 1024).contains(&self.quic_passthrough_window_bytes),
+            "quic_passthrough_window_bytes must be between 65536 and 268435456"
+        );
+        if let Some(mbps) = self.quic_passthrough_pacing_mbps {
+            ensure!(
+                (1..=100_000).contains(&mbps),
+                "quic_passthrough_pacing_mbps must be between 1 and 100000"
+            );
+        }
+        ensure!(
+            self.quic_adaptive_min_mbps > 0
+                && self.quic_adaptive_min_mbps <= self.quic_adaptive_initial_mbps
+                && self.quic_adaptive_initial_mbps <= self.quic_adaptive_max_mbps
+                && self.quic_adaptive_max_mbps <= 100_000,
+            "adaptive QUIC rates must satisfy 0 < min <= initial <= max <= 100000 Mbps"
+        );
+        ensure!(
+            (1..=5_000).contains(&self.quic_adaptive_loss_backoff_bps),
+            "quic_adaptive_loss_backoff_bps must be between 1 and 5000"
+        );
+        ensure!(
+            (1_200..=65_536).contains(&self.quic_pacing_quantum_bytes),
+            "quic_pacing_quantum_bytes must be between 1200 and 65536"
         );
         ensure!(
             (2..=64).contains(&self.fec.data_shards),
@@ -1177,6 +1320,110 @@ fn is_default_max_frame_size(value: &u16) -> bool {
     *value == default_max_frame_size()
 }
 
+pub const fn default_quic_send_buffer_bytes() -> usize {
+    128 * 1024
+}
+
+fn is_default_quic_send_buffer_bytes(value: &usize) -> bool {
+    *value == default_quic_send_buffer_bytes()
+}
+
+pub const fn default_quic_receive_buffer_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn is_default_quic_receive_buffer_bytes(value: &usize) -> bool {
+    *value == default_quic_receive_buffer_bytes()
+}
+
+pub const fn default_quic_data_lanes() -> usize {
+    1
+}
+
+fn is_default_quic_data_lanes(value: &usize) -> bool {
+    *value == default_quic_data_lanes()
+}
+
+pub const fn default_quic_initial_rtt_millis() -> u64 {
+    100
+}
+
+fn is_default_quic_initial_rtt_millis(value: &u64) -> bool {
+    *value == default_quic_initial_rtt_millis()
+}
+
+pub const fn default_quic_initial_mtu() -> u16 {
+    1_400
+}
+
+pub const fn default_quic_mtu_black_hole_cooldown_millis() -> u64 {
+    10_000
+}
+
+fn is_default_quic_mtu_black_hole_cooldown_millis(value: &u64) -> bool {
+    *value == default_quic_mtu_black_hole_cooldown_millis()
+}
+
+fn is_default_quic_initial_mtu(value: &u16) -> bool {
+    *value == default_quic_initial_mtu()
+}
+
+pub const fn default_quic_keep_alive_millis() -> u64 {
+    1_000
+}
+
+fn is_default_quic_keep_alive_millis(value: &u64) -> bool {
+    *value == default_quic_keep_alive_millis()
+}
+
+pub const fn default_quic_passthrough_window_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn is_default_quic_passthrough_window_bytes(value: &u64) -> bool {
+    *value == default_quic_passthrough_window_bytes()
+}
+
+pub const fn default_quic_adaptive_initial_mbps() -> u64 {
+    850
+}
+
+fn is_default_quic_adaptive_initial_mbps(value: &u64) -> bool {
+    *value == default_quic_adaptive_initial_mbps()
+}
+
+pub const fn default_quic_adaptive_min_mbps() -> u64 {
+    100
+}
+
+fn is_default_quic_adaptive_min_mbps(value: &u64) -> bool {
+    *value == default_quic_adaptive_min_mbps()
+}
+
+pub const fn default_quic_adaptive_max_mbps() -> u64 {
+    950
+}
+
+fn is_default_quic_adaptive_max_mbps(value: &u64) -> bool {
+    *value == default_quic_adaptive_max_mbps()
+}
+
+pub const fn default_quic_adaptive_loss_backoff_bps() -> u16 {
+    50
+}
+
+fn is_default_quic_adaptive_loss_backoff_bps(value: &u16) -> bool {
+    *value == default_quic_adaptive_loss_backoff_bps()
+}
+
+pub const fn default_quic_pacing_quantum_bytes() -> u64 {
+    8 * 1024
+}
+
+fn is_default_quic_pacing_quantum_bytes(value: &u64) -> bool {
+    *value == default_quic_pacing_quantum_bytes()
+}
+
 fn default_node_interface() -> String {
     "ironet0".into()
 }
@@ -1316,6 +1563,22 @@ mod tests {
             tun_mtu: 1280,
             max_frame_size: 1400,
             udp_segmentation_offload: false,
+            quic_send_buffer_bytes: default_quic_send_buffer_bytes(),
+            quic_receive_buffer_bytes: default_quic_receive_buffer_bytes(),
+            quic_data_lanes: default_quic_data_lanes(),
+            quic_congestion_controller: QuicCongestionController::default(),
+            quic_initial_rtt_millis: default_quic_initial_rtt_millis(),
+            quic_initial_mtu: default_quic_initial_mtu(),
+            quic_mtu_discovery_enabled: false,
+            quic_mtu_black_hole_cooldown_millis: default_quic_mtu_black_hole_cooldown_millis(),
+            quic_keep_alive_millis: default_quic_keep_alive_millis(),
+            quic_passthrough_window_bytes: default_quic_passthrough_window_bytes(),
+            quic_passthrough_pacing_mbps: None,
+            quic_adaptive_initial_mbps: default_quic_adaptive_initial_mbps(),
+            quic_adaptive_min_mbps: default_quic_adaptive_min_mbps(),
+            quic_adaptive_max_mbps: default_quic_adaptive_max_mbps(),
+            quic_adaptive_loss_backoff_bps: default_quic_adaptive_loss_backoff_bps(),
+            quic_pacing_quantum_bytes: default_quic_pacing_quantum_bytes(),
             node_interface: "ironet0".into(),
             node_addresses: Vec::new(),
             advertised_prefixes: Vec::new(),

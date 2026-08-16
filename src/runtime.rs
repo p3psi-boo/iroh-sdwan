@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
+    hash::{DefaultHasher, Hash, Hasher},
     net::IpAddr,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
@@ -11,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use ipnet::IpNet;
@@ -24,7 +25,10 @@ use iroh::{
     },
 };
 use n0_watcher::Watcher as _;
-use noq_proto::congestion::CubicConfig;
+use noq_proto::{
+    MtuDiscoveryConfig,
+    congestion::{Bbr3Config, CubicConfig},
+};
 use rustc_hash::FxHashMap;
 use rustls::{CipherSuite, crypto::CryptoProvider};
 use tokio::{
@@ -50,7 +54,7 @@ use crate::{
         CapacityProbeStart, ProbeReceiver, ProbeRequest, ProbeStatusSnapshot, append_probe_hop,
         encode_probe, forward_next_hop, reverse_next_hop,
     },
-    config::{AttachmentMode, Config, DialRole, PeerConfig, RelayConfig},
+    config::{AttachmentMode, Config, DialRole, PeerConfig, QuicCongestionController, RelayConfig},
     delivery::{
         DELIVERY_ROUTE_TEMPLATE_TTL, DELIVERY_SESSION_TTL, DELIVERY_TAG_WIRE_BYTES,
         DeliveryMessage, DeliveryReceiver, DeliveryReport, DeliverySessionRegister, DeliverySource,
@@ -101,13 +105,8 @@ use dispatch::{InboundDispatcher, RouteDispatcher};
 use prefix::{IpPrefixSet, PrefixOwnerTable};
 
 // Keep noq's non-preemptible FIFO smaller than a short interactive burst.
-// Large TUN super-packets remain in the application scheduler between wire
-// datagrams, where control/latency work can preempt them, instead of hiding a
-// whole 64 KiB packet behind bulk traffic inside QUIC.
-const QUIC_SEND_BUFFER_BYTES: usize = 8 * 1024;
-// Keep 8 MiB receive so FEC/repair can absorb a BDP of loss. Shrinking it
-// without a measured loss/FEC regression would trade recoverability for RSS.
-const QUIC_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+// Parallel data lanes provide aggregate batching without hiding a large burst
+// behind one connection's congestion window.
 const SMALL_PACKET_LIMIT: usize = 512;
 const OVERLAY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 // Retire a silent direct path quickly enough to use an already-open relay
@@ -192,6 +191,7 @@ struct TransmissionJob {
     packet_bytes: u64,
     fragment_count: u64,
     latency_sensitive: bool,
+    lane_hash: u64,
 }
 
 enum TransmissionWork {
@@ -2888,6 +2888,177 @@ fn underlay_publish_exclusion_prefixes(config: &Config) -> Vec<IpNet> {
         .collect()
 }
 
+/// Tunnel-oriented controller: end-to-end TCP already owns congestion
+/// control, so the outer QUIC layer supplies only a bounded flight window and
+/// an optional operator/auto-tuner pacing ceiling. This removes the CUBIC-on-
+/// TCP feedback loop while retaining QUIC loss accounting and retransmission
+/// of control streams.
+#[derive(Debug, Clone)]
+struct PassthroughControllerConfig {
+    window: u64,
+    pacing_rate: Option<u64>,
+    pacing_quantum: u64,
+}
+
+impl noq_proto::congestion::ControllerFactory for PassthroughControllerConfig {
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn noq_proto::congestion::Controller> {
+        Box::new(PassthroughController { config: self })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PassthroughController {
+    config: Arc<PassthroughControllerConfig>,
+}
+
+impl noq_proto::congestion::Controller for PassthroughController {
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost_pn: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.config.window
+    }
+
+    fn metrics(&self) -> noq_proto::congestion::ControllerMetrics {
+        let mut metrics = noq_proto::congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.config.window;
+        metrics.pacing_rate = self.config.pacing_rate;
+        metrics.send_quantum = Some(self.config.pacing_quantum);
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn noq_proto::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveTunnelControllerConfig {
+    window: u64,
+    initial_rate: u64,
+    min_rate: u64,
+    max_rate: u64,
+    loss_backoff_bps: u16,
+    pacing_quantum: u64,
+}
+
+impl noq_proto::congestion::ControllerFactory for AdaptiveTunnelControllerConfig {
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn noq_proto::congestion::Controller> {
+        let pacing_rate = self.initial_rate;
+        Box::new(AdaptiveTunnelController {
+            config: self,
+            pacing_rate,
+        })
+    }
+}
+
+/// Loss-aware outer pacer for IP tunnels. It keeps a large flight window so
+/// inner TCP does not fight a second cwnd, but adjusts the wire rate directly:
+/// ACKed bytes provide fast additive recovery while each distinct congestion
+/// event applies a small configurable multiplicative backoff.
+#[derive(Debug, Clone)]
+struct AdaptiveTunnelController {
+    config: Arc<AdaptiveTunnelControllerConfig>,
+    pacing_rate: u64,
+}
+
+impl noq_proto::congestion::Controller for AdaptiveTunnelController {
+    fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+    ) {
+        if !app_limited {
+            self.pacing_rate = self
+                .pacing_rate
+                .saturating_add(4 * 1024)
+                .min(self.config.max_rate);
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost_pn: u64,
+    ) {
+        let retained_bps = 10_000_u64.saturating_sub(u64::from(self.config.loss_backoff_bps));
+        self.pacing_rate = self
+            .pacing_rate
+            .saturating_mul(retained_bps)
+            .checked_div(10_000)
+            .unwrap_or(self.config.min_rate)
+            .max(self.config.min_rate);
+        if is_persistent_congestion {
+            self.pacing_rate = (self.pacing_rate / 2).max(self.config.min_rate);
+        }
+    }
+
+    fn on_spurious_congestion_event(&mut self) {
+        self.pacing_rate = self
+            .pacing_rate
+            .saturating_add(self.config.max_rate / 100)
+            .min(self.config.max_rate);
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.config.window
+    }
+
+    fn metrics(&self) -> noq_proto::congestion::ControllerMetrics {
+        let mut metrics = noq_proto::congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.config.window;
+        metrics.pacing_rate = Some(self.pacing_rate);
+        metrics.send_quantum = Some(self.config.pacing_quantum);
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn noq_proto::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
 async fn build_endpoint(
     config: &Config,
     secret_key: SecretKey,
@@ -2897,30 +3068,55 @@ async fn build_endpoint(
 ) -> Result<Endpoint> {
     let configured_relays = config.inherited_peer_relays()?;
     let relay_mode = iroh_relay_mode(config, configured_relays);
-    // Keep CUBIC's MTU-scaled initial window until a path has a measured BDP.
-    // A fixed 512 KiB startup burst represents more than four seconds of data
-    // on a 1 Mbit/s WAN and makes loss recovery dominate initial convergence.
-    // noq's BBR3 currently leaves a long-lived, low-RTT QUIC path at a reduced
-    // window after a short UDP loss burst; repeated saturation then decays even
-    // though the underlay has recovered. CUBIC recovered between runs in the
-    // same profile and raised stable throughput without enlarging startup.
-    let cubic = CubicConfig::default();
+    // Flow-affine parallel lanes isolate loss recovery while CUBIC retains an
+    // aggregate congestion window for several flows on each lane.
+    let congestion_controller: Arc<
+        dyn noq_proto::congestion::ControllerFactory + Send + Sync + 'static,
+    > = match config.quic_congestion_controller {
+        QuicCongestionController::Cubic => Arc::new(CubicConfig::default()),
+        QuicCongestionController::Bbr3 => Arc::new(Bbr3Config::default()),
+        QuicCongestionController::Passthrough => Arc::new(PassthroughControllerConfig {
+            window: config.quic_passthrough_window_bytes,
+            pacing_rate: config
+                .quic_passthrough_pacing_mbps
+                .and_then(|mbps| mbps.checked_mul(125_000)),
+            pacing_quantum: config.quic_pacing_quantum_bytes,
+        }),
+        QuicCongestionController::Adaptive => Arc::new(AdaptiveTunnelControllerConfig {
+            window: config.quic_passthrough_window_bytes,
+            initial_rate: config.quic_adaptive_initial_mbps.saturating_mul(125_000),
+            min_rate: config.quic_adaptive_min_mbps.saturating_mul(125_000),
+            max_rate: config.quic_adaptive_max_mbps.saturating_mul(125_000),
+            loss_backoff_bps: config.quic_adaptive_loss_backoff_bps,
+            pacing_quantum: config.quic_pacing_quantum_bytes,
+        }),
+    };
+    let keep_alive = Duration::from_millis(config.quic_keep_alive_millis);
     let path_idle_timeout = quic_path_idle_timeout(&config.relay);
+    let mtu_discovery = config.quic_mtu_discovery_enabled.then(|| {
+        let mut discovery = MtuDiscoveryConfig::default();
+        discovery
+            .upper_bound(config.quic_initial_mtu)
+            .black_hole_cooldown(Duration::from_millis(
+                config.quic_mtu_black_hole_cooldown_millis,
+            ));
+        discovery
+    });
     let transport = QuicTransportConfig::builder()
-        .congestion_controller_factory(Arc::new(cubic))
-        .initial_rtt(Duration::from_millis(100))
+        .congestion_controller_factory(congestion_controller)
+        .initial_rtt(Duration::from_millis(config.quic_initial_rtt_millis))
         // noq's periodic DPLPMTUD probe currently tears down the only direct
         // path on some symmetric-NAT/GSO combinations. Start at the proven
         // 1400-byte UDP payload instead and keep black-hole detection active;
         // noq will still fall back to 1200 when the live path requires it.
-        .initial_mtu(1_400)
-        .mtu_discovery_config(None)
+        .initial_mtu(config.quic_initial_mtu)
+        .mtu_discovery_config(mtu_discovery)
         // A five-second heartbeat leaves only three attempts before iroh's
         // fixed 15-second per-path idle guard fires. Symmetric and carrier NAT
         // paths can lose several consecutive small UDP packets while rotating
         // mappings, so use one-second connection and per-path heartbeats.
-        .keep_alive_interval(Duration::from_secs(1))
-        .default_path_keep_alive_interval(Duration::from_secs(1))
+        .keep_alive_interval(keep_alive)
+        .default_path_keep_alive_interval(keep_alive)
         .default_path_max_idle_timeout(path_idle_timeout)
         // Several cloud/NAT virtual NICs accept UDP_SEGMENT at socket setup
         // but return EIO on the first real GSO batch. noq then disables GSO,
@@ -2928,8 +3124,8 @@ async fn build_endpoint(
         // plus the large virtual TUN MTU keep
         // syscall cost low without that WAN-visible one-time outage.
         .enable_segmentation_offload(config.udp_segmentation_offload)
-        .datagram_send_buffer_size(QUIC_SEND_BUFFER_BYTES)
-        .datagram_receive_buffer_size(Some(QUIC_RECEIVE_BUFFER_BYTES))
+        .datagram_send_buffer_size(config.quic_send_buffer_bytes)
+        .datagram_receive_buffer_size(Some(config.quic_receive_buffer_bytes))
         // Peer-observed socket addresses are endpoint-wide and can therefore
         // be the address of our own overlay TUN on a multi-homed router. That
         // creates recursive "direct" paths which work briefly and then
@@ -3634,6 +3830,9 @@ struct Peer {
     inbound_packets: InboundDispatcher,
     capacity_events: mpsc::Sender<CapacityEvent>,
     connection: ArcSwapOption<Connection>,
+    /// Extra authenticated QUIC connections carry only flow-affine packet
+    /// data. Control, telemetry and liveness remain owned by the primary.
+    data_lanes: ArcSwap<Vec<DataLane>>,
     connection_updates: tokio::sync::watch::Sender<u64>,
     /// Serializes rare install/clear transitions. Packet transmission reads
     /// the active Arc through ArcSwap without a mutex or watch-channel guard.
@@ -3673,12 +3872,15 @@ struct Peer {
     path_epoch: AtomicU64,
     selected_path_fingerprint: StdRwLock<String>,
     frame_size_ceiling: usize,
+    quic_send_buffer_bytes: usize,
+    secondary_data_lanes: usize,
     effective_frame_size: AtomicU64,
     /// Taken once by `queue_to_network`; encoder mutation is single-writer.
     fec_encoder: StdMutex<Option<FecEncoder>>,
     fec_reset_epoch: AtomicU64,
     fec_decoder_ttl: Duration,
     fec_buffer_limit: usize,
+    fec_enabled: bool,
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
     nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
@@ -3687,6 +3889,12 @@ struct Peer {
 #[derive(Debug, Default)]
 struct ConnectionTaskGeneration {
     active: Option<(usize, CancellationToken)>,
+}
+
+#[derive(Clone)]
+struct DataLane {
+    connection: Connection,
+    cancel: CancellationToken,
 }
 
 impl ConnectionTaskGeneration {
@@ -3744,6 +3952,23 @@ impl Peer {
         self.connection
             .load_full()
             .map(|connection| connection.as_ref().clone())
+    }
+
+    fn connection_for_lane_hash(&self, primary: &Connection, lane_hash: u64) -> Connection {
+        if self.fec_enabled {
+            return primary.clone();
+        }
+        let lanes = self.data_lanes.load();
+        let slot = (lane_hash as usize) % (lanes.len() + 1);
+        if slot == 0 {
+            primary.clone()
+        } else {
+            lanes[slot - 1].connection.clone()
+        }
+    }
+
+    fn data_lane_count(&self) -> usize {
+        self.data_lanes.load().len()
     }
 
     fn create(
@@ -3908,6 +4133,7 @@ impl Peer {
             inbound_packets: services.inbound_packets,
             capacity_events: services.capacity_events,
             connection: ArcSwapOption::from(None),
+            data_lanes: ArcSwap::from_pointee(Vec::new()),
             connection_updates: tokio::sync::watch::channel(0).0,
             connection_update: StdMutex::new(()),
             connection_tasks: StdMutex::new(ConnectionTaskGeneration::default()),
@@ -3955,11 +4181,14 @@ impl Peer {
             path_epoch: AtomicU64::new(0),
             selected_path_fingerprint: StdRwLock::new(String::new()),
             frame_size_ceiling,
+            quic_send_buffer_bytes: config.quic_send_buffer_bytes,
+            secondary_data_lanes: config.quic_data_lanes.saturating_sub(1),
             effective_frame_size: AtomicU64::new(effective_frame_size as u64),
             fec_encoder: StdMutex::new(fec_encoder),
             fec_reset_epoch: AtomicU64::new(0),
             fec_decoder_ttl: Duration::from_millis(config.fec.decoder_ttl_millis),
             fec_buffer_limit,
+            fec_enabled: config.fec.enabled,
             derp_transport: services.derp_transport.cloned(),
             mesh_runtime: services.mesh_runtime,
             nat64_prefix: services.nat64_prefix,
@@ -4105,8 +4334,9 @@ impl Peer {
                     job
                 }
             };
+            let data_connection = self.connection_for_lane_hash(&connection, job.lane_hash);
             match self
-                .send_transmission(&connection, &mut job, queue_max_age, &mut outbound)
+                .send_transmission(&data_connection, &mut job, queue_max_age, &mut outbound)
                 .await
             {
                 TransmissionOutcome::Complete => self.complete_transmission(job),
@@ -4129,7 +4359,7 @@ impl Peer {
                 }
                 TransmissionOutcome::Failed => {
                     self.requeue_transmission(job).await;
-                    self.clear_connection(connection.stable_id()).await;
+                    self.clear_any_connection(data_connection.stable_id()).await;
                 }
             }
         }
@@ -4143,6 +4373,13 @@ impl Peer {
         outbound: &mut OutboundConsumer,
         fec_encoder: &mut Option<FecEncoder>,
     ) -> Result<Option<TransmissionJob>> {
+        let mut lane_hasher = DefaultHasher::new();
+        if let Ok(packet_info) = inspect_ip_packet(first.data.as_slice()) {
+            FlowKey::from(packet_info).hash(&mut lane_hasher);
+        } else {
+            first.data.as_slice().hash(&mut lane_hasher);
+        }
+        let lane_hash = lane_hasher.finish();
         // DERP already carries every QUIC packet over an ordered, reliable
         // TCP/TLS byte stream. Adding recovery shards there cannot repair
         // underlay loss; it only consumes the QUIC congestion window and can
@@ -4271,6 +4508,7 @@ impl Peer {
             packet_bytes,
             fragment_count,
             latency_sensitive,
+            lane_hash,
         }))
     }
 
@@ -4288,6 +4526,15 @@ impl Peer {
                 .max_datagram_size()
                 .is_some_and(|maximum| frame.len() > maximum)
             {
+                if should_log(&self.counters.mtu_reframes) {
+                    warn!(
+                        peer = %self.name,
+                        frame_bytes = frame.len(),
+                        maximum = connection.max_datagram_size().unwrap_or_default(),
+                        recovery,
+                        "reframing datagram larger than the live QUIC path limit"
+                    );
+                }
                 if recovery {
                     self.counters
                         .fec_unprotected_shards
@@ -4297,8 +4544,8 @@ impl Peer {
                 return TransmissionOutcome::Reframe;
             }
             self.counters.quic_send_buffer_used_bytes.store(
-                QUIC_SEND_BUFFER_BYTES.saturating_sub(connection.datagram_send_buffer_space())
-                    as u64,
+                self.quic_send_buffer_bytes
+                    .saturating_sub(connection.datagram_send_buffer_space()) as u64,
                 Ordering::Relaxed,
             );
             if let Err(error) = connection.send_datagram_wait(frame).await {
@@ -4346,7 +4593,8 @@ impl Peer {
             }
         }
         self.counters.quic_send_buffer_used_bytes.store(
-            QUIC_SEND_BUFFER_BYTES.saturating_sub(connection.datagram_send_buffer_space()) as u64,
+            self.quic_send_buffer_bytes
+                .saturating_sub(connection.datagram_send_buffer_space()) as u64,
             Ordering::Relaxed,
         );
         TransmissionOutcome::Complete
@@ -4404,6 +4652,13 @@ impl Peer {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
+            if let Err(error) = self.ensure_data_lanes().await {
+                if should_log(&self.counters.connection_errors) {
+                    warn!(peer = %self.name, %error, "failed expanding parallel data lanes");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             if self.refresh_requested.swap(false, Ordering::Relaxed) {
                 if let Err(error) = self.refresh_connection().await {
                     warn!(peer = %self.name, %error, "requested peer connection refresh failed");
@@ -4413,6 +4668,30 @@ impl Peer {
             }
             self.reconnect_needed.notified().await;
         }
+    }
+
+    async fn ensure_data_lanes(self: &Arc<Self>) -> Result<()> {
+        if self.fec_enabled || self.secondary_data_lanes == 0 {
+            return Ok(());
+        }
+        let Some(primary) = self.current_connection() else {
+            return Ok(());
+        };
+        // Only the owner of the primary client direction creates lanes. This
+        // avoids a connection race while allowing the passive peer to accept
+        // every lane through the normal authenticated admission path.
+        if primary.side() != Side::Client {
+            return Ok(());
+        }
+        while self.data_lane_count() < self.secondary_data_lanes {
+            let endpoint_addr = self.dial_addr().await;
+            let connection = self
+                .connect_best_available(endpoint_addr)
+                .await
+                .with_context(|| format!("failed opening data lane for {}", self.name))?;
+            self.install_connection(connection).await?;
+        }
+        Ok(())
     }
 
     async fn refresh_connection(self: &Arc<Self>) -> Result<()> {
@@ -4637,9 +4916,11 @@ impl Peer {
             Side::Server
         };
         let accepted_side = match self.connection_mode {
-            ConnectionMode::Canonical => {
-                connection.side() == canonical_side || connection.side() == Side::Client
-            }
+            // Canonical direction is a tie-breaker, not an admission rule. A
+            // NATed canonical dialer may be unreachable while the reciprocal
+            // side can establish immediately. The replacement check below
+            // still prefers the EndpointId-derived direction when both exist.
+            ConnectionMode::Canonical => true,
             ConnectionMode::Outbound => connection.side() == Side::Client,
             ConnectionMode::Inbound => connection.side() == Side::Server,
         };
@@ -4686,6 +4967,14 @@ impl Peer {
                 }
             },
         };
+        if !self.fec_enabled
+            && self.data_lane_count() < self.secondary_data_lanes
+            && self
+                .current_connection()
+                .is_some_and(|current| current.side() == connection.side())
+        {
+            return self.install_data_lane(connection, negotiated).await;
+        }
         let transition = self
             .connection_update
             .lock()
@@ -4730,6 +5019,7 @@ impl Peer {
             .connection
             .swap(Some(Arc::new(connection.clone())))
             .map(|connection| connection.as_ref().clone());
+        let retired_lanes = self.data_lanes.swap(Arc::new(Vec::new()));
         self.connection_updates.send_modify(|epoch| *epoch += 1);
         self.counters.connected.store(true, Ordering::Relaxed);
         self.counters
@@ -4740,6 +5030,10 @@ impl Peer {
             && old.stable_id() != connection.stable_id()
         {
             old.close(0_u8.into(), b"replaced");
+        }
+        for lane in retired_lanes.iter() {
+            lane.cancel.cancel();
+            lane.connection.close(0_u8.into(), b"primary replaced");
         }
         info!(
             peer = %self.name,
@@ -5193,7 +5487,7 @@ impl Peer {
                         peer.counters.path_mtu.store(u64::from(stats.current_mtu), Ordering::Relaxed);
                         peer.counters.path_cwnd_bytes.store(stats.cwnd, Ordering::Relaxed);
                         peer.counters.quic_send_buffer_used_bytes.store(
-                            QUIC_SEND_BUFFER_BYTES
+                            peer.quic_send_buffer_bytes
                                 .saturating_sub(connection.datagram_send_buffer_space())
                                 as u64,
                             Ordering::Relaxed,
@@ -5230,6 +5524,184 @@ impl Peer {
                     }
                 }
             }
+        });
+        Ok(())
+    }
+
+    async fn install_data_lane(
+        self: &Arc<Self>,
+        connection: Connection,
+        negotiated: NegotiatedSession,
+    ) -> Result<()> {
+        ensure!(
+            connection.max_datagram_size().is_some(),
+            "peer {} data lane has no DATAGRAM support",
+            self.name
+        );
+        let cancel = CancellationToken::new();
+        {
+            let _transition = self
+                .connection_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut lanes = self.data_lanes.load().as_ref().clone();
+            if lanes.len() >= self.secondary_data_lanes {
+                connection.close(0_u8.into(), b"parallel lane set complete");
+                return Ok(());
+            }
+            lanes.push(DataLane {
+                connection: connection.clone(),
+                cancel: cancel.clone(),
+            });
+            self.data_lanes.store(Arc::new(lanes));
+            self.connection_updates.send_modify(|epoch| *epoch += 1);
+        }
+        info!(
+            peer = %self.name,
+            stable_id = connection.stable_id(),
+            lanes = self.data_lane_count() + 1,
+            protocol_minor = negotiated.minor,
+            "parallel data lane active"
+        );
+        let peer = self.clone();
+        tokio::spawn(async move {
+            let stable_id = connection.stable_id();
+            let mut decoder = FecDecoder::with_max_buffered_bytes_and_budget(
+                peer.fec_decoder_ttl,
+                peer.fec_buffer_limit,
+                Some(peer.buffer_budget.clone()),
+            )
+            .expect("validated FEC decoder configuration");
+            let mut reassembler = Reassembler::with_max_buffered_bytes_and_budget(
+                peer.reassembly_buffer_limit,
+                Some(peer.buffer_budget.clone()),
+            );
+            let mut repair_tick = tokio::time::interval(Duration::from_millis(10));
+            repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut repair_budget = 64_usize;
+            let mut repair_refill = Instant::now() + Duration::from_secs(1);
+            loop {
+                let datagram = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = repair_tick.tick() => {
+                        let now = Instant::now();
+                        if now >= repair_refill {
+                            repair_budget = 64;
+                            repair_refill = now + Duration::from_secs(1);
+                        }
+                        if repair_budget != 0 {
+                            let delay = Duration::from_micros(
+                                peer.counters.path_rtt_micros.load(Ordering::Relaxed),
+                            )
+                            .mul_f32(1.25)
+                            .clamp(Duration::from_millis(15), Duration::from_millis(200));
+                            let requests = reassembler.repair_requests(delay, repair_budget);
+                            repair_budget = repair_budget.saturating_sub(requests.len());
+                            for request in requests {
+                                let packet_id = request.packet_id;
+                                let request = match encode_repair_request(&request) {
+                                    Ok(request) => request,
+                                    Err(error) => {
+                                        debug!(peer = %peer.name, stable_id, packet_id, %error, "failed encoding data-lane repair request");
+                                        continue;
+                                    }
+                                };
+                                if connection.send_datagram_wait(request).await.is_err() {
+                                    break;
+                                }
+                                peer.counters
+                                    .repair_requests_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
+                    result = connection.read_datagram() => match result {
+                        Ok(datagram) => datagram,
+                        Err(error) => {
+                            debug!(peer = %peer.name, stable_id, %error, "parallel data lane ended");
+                            break;
+                        }
+                    }
+                };
+                let decoded = match decoder.push(datagram) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        if should_log(&peer.counters.frame_drops) {
+                            warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane datagram");
+                        }
+                        continue;
+                    }
+                };
+                peer.counters
+                    .fec_rx_recovery_shards
+                    .fetch_add(decoded.recovery_shards, Ordering::Relaxed);
+                peer.counters
+                    .fec_recovered_shards
+                    .fetch_add(decoded.recovered_shards, Ordering::Relaxed);
+                for overlay_datagram in decoded.frames {
+                    let wire = match decode_datagram(overlay_datagram) {
+                        Ok(wire) => wire,
+                        Err(error) => {
+                            if should_log(&peer.counters.frame_drops) {
+                                warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane frame");
+                            }
+                            continue;
+                        }
+                    };
+                    match wire {
+                        WireDatagram::Frames(frames) => {
+                            peer.counters
+                                .rx_fragments
+                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                            for frame in frames {
+                                let result = reassembler.push_tagged(frame);
+                                peer.counters
+                                    .reassembly_evictions
+                                    .fetch_add(reassembler.take_evictions(), Ordering::Relaxed);
+                                let packet = match result {
+                                    Ok(Some(packet)) => packet,
+                                    Ok(None) => continue,
+                                    Err(error) => {
+                                        if should_log(&peer.counters.frame_drops) {
+                                            warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane overlay frame");
+                                        }
+                                        continue;
+                                    }
+                                };
+                                if let Err(error) =
+                                    peer.deliver_packet(packet.data, packet.delivery_tag).await
+                                {
+                                    warn!(peer = %peer.name, stable_id, %error, "failed delivering data-lane packet");
+                                    connection.close(3_u8.into(), b"TUN write failed");
+                                    break;
+                                }
+                            }
+                        }
+                        WireDatagram::RepairRequest(request) => {
+                            let frames = peer
+                                .repair_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&request);
+                            if let Some(frames) = frames {
+                                for frame in frames {
+                                    if connection.send_datagram_wait(frame).await.is_err() {
+                                        break;
+                                    }
+                                    peer.counters
+                                        .repair_fragments_sent
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!(peer = %peer.name, stable_id, "ignoring control datagram on data-only lane");
+                        }
+                    }
+                }
+            }
+            peer.clear_any_connection(stable_id).await;
         });
         Ok(())
     }
@@ -5306,6 +5778,44 @@ impl Peer {
         drop(transition);
     }
 
+    async fn clear_any_connection(&self, stable_id: usize) {
+        if self
+            .current_connection()
+            .is_some_and(|connection| connection.stable_id() == stable_id)
+        {
+            self.clear_connection(stable_id).await;
+            return;
+        }
+        let removed = {
+            let _transition = self
+                .connection_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = self.data_lanes.load();
+            let mut retained = Vec::with_capacity(current.len());
+            let mut removed = None;
+            for lane in current.iter() {
+                if lane.connection.stable_id() == stable_id {
+                    removed = Some(lane.clone());
+                } else {
+                    retained.push(lane.clone());
+                }
+            }
+            if removed.is_some() {
+                self.data_lanes.store(Arc::new(retained));
+                self.connection_updates.send_modify(|epoch| *epoch += 1);
+            }
+            removed
+        };
+        if let Some(lane) = removed {
+            lane.cancel.cancel();
+            lane.connection.close(0_u8.into(), b"data lane retired");
+            if !self.shutting_down.load(Ordering::Acquire) {
+                self.reconnect_needed.notify_one();
+            }
+        }
+    }
+
     fn mark_disconnected(&self) {
         self.counters.connected.store(false, Ordering::Relaxed);
         self.counters
@@ -5359,21 +5869,26 @@ impl Peer {
 
     async fn close(&self) {
         self.shutting_down.store(true, Ordering::Release);
-        let connection = {
+        let (connection, lanes) = {
             let _transition = self
                 .connection_update
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let connection = self.connection.swap(None);
+            let lanes = self.data_lanes.swap(Arc::new(Vec::new()));
             self.connection_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .cancel(None);
             self.connection_updates.send_modify(|epoch| *epoch += 1);
-            connection
+            (connection, lanes)
         };
         if let Some(connection) = connection {
             connection.close(0_u8.into(), b"shutdown");
+        }
+        for lane in lanes.iter() {
+            lane.cancel.cancel();
+            lane.connection.close(0_u8.into(), b"shutdown");
         }
         self.mark_disconnected();
         self.reconnect_needed.notify_waiters();
@@ -6570,6 +7085,45 @@ mod tests {
             Some(&CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
         );
         assert!(suites.contains(&CipherSuite::TLS13_AES_128_GCM_SHA256));
+    }
+
+    #[test]
+    fn adaptive_tunnel_pacer_recovers_and_backs_off_without_collapsing_cwnd() {
+        let config = Arc::new(AdaptiveTunnelControllerConfig {
+            window: 16 * 1024 * 1024,
+            initial_rate: 100_000_000,
+            min_rate: 50_000_000,
+            max_rate: 120_000_000,
+            loss_backoff_bps: 50,
+            pacing_quantum: 8 * 1024,
+        });
+        let mut controller = AdaptiveTunnelController {
+            config,
+            pacing_rate: 100_000_000,
+        };
+        noq_proto::congestion::Controller::on_end_acks(
+            &mut controller,
+            Instant::now(),
+            0,
+            false,
+            Some(1),
+        );
+        assert_eq!(controller.pacing_rate, 100_004_096);
+        noq_proto::congestion::Controller::on_congestion_event(
+            &mut controller,
+            Instant::now(),
+            Instant::now(),
+            false,
+            false,
+            1_400,
+            2,
+        );
+        assert!(controller.pacing_rate < 100_004_096);
+        assert!(controller.pacing_rate >= 50_000_000);
+        assert_eq!(
+            noq_proto::congestion::Controller::window(&controller),
+            16 * 1024 * 1024
+        );
     }
 
     #[test]

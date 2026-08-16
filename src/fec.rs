@@ -674,13 +674,22 @@ fn even_shard_bytes(maximum: usize) -> Result<usize> {
         "FEC datagram limit exceeds wire maximum"
     );
     ensure!(maximum > WIRE_OVERHEAD, "FEC datagram limit is too small");
-    let available = maximum - HEADER_LEN;
+    // `encode_envelope` wraps the FEC header in the protocol-v1 envelope.
+    // Account for both headers here; otherwise a maximum-sized original and
+    // every full recovery shard exceed QUIC's datagram limit by
+    // `V1_HEADER_LEN`.  The send path then continuously reframes originals and
+    // drops parity, which makes FEC unusable for MTU-sized bulk traffic.
+    let available = maximum - V1_HEADER_LEN - HEADER_LEN;
     Ok(available - available % 2)
 }
 
-/// Select a stable size class for a frame instead of padding every recovery
-/// shard to the path MTU. This keeps FEC for FlowRouter and interactive packets
-/// from turning each small block into multiple full-MTU datagrams.
+/// Use one stable shard size for the current path MTU.
+///
+/// A TUN commonly yields alternating full and short fragments for every inner
+/// packet. Size-classing those frames with a single in-progress block resets
+/// the block on every fragment, so it never reaches the parity threshold under
+/// real bulk traffic. Originals remain unpadded on the wire; only recovery
+/// shards pay the full path-MTU size.
 fn shard_bytes_for_frame(frame_len: usize, maximum: usize) -> Result<usize> {
     let maximum_shard = even_shard_bytes(maximum)?;
     let required = frame_len
@@ -690,11 +699,7 @@ fn shard_bytes_for_frame(frame_len: usize, maximum: usize) -> Result<usize> {
         required <= maximum_shard,
         "overlay frame exceeds FEC shard capacity"
     );
-    let size_class = required
-        .checked_next_power_of_two()
-        .unwrap_or(maximum_shard)
-        .max(64);
-    Ok(size_class.min(maximum_shard))
+    Ok(maximum_shard)
 }
 
 fn encode_envelope(
@@ -962,12 +967,12 @@ mod tests {
         let batch = encoder.push(Bytes::from_static(b"two"), 128).unwrap();
         assert_eq!(batch.unprotected_shards, 1);
 
-        let resized = encoder.push(Bytes::from(vec![3; 80]), 128).unwrap();
+        let resized = encoder.push(Bytes::from(vec![3; 80]), 126).unwrap();
         assert_eq!(resized.unprotected_shards, 1);
     }
 
     #[test]
-    fn small_frames_do_not_generate_full_mtu_recovery_shards() {
+    fn mixed_frame_sizes_share_a_stable_mtu_sized_block() {
         let mut encoder = encoder();
         let mut datagrams = Vec::new();
         for frame in [b"zero".as_slice(), b"one", b"two", b"three"] {
@@ -983,8 +988,33 @@ mod tests {
         assert!(
             datagrams[4..]
                 .iter()
-                .all(|datagram| datagram.bytes.len() == V1_HEADER_LEN + HEADER_LEN + 64)
+                .all(|datagram| datagram.bytes.len() <= 1_400)
         );
+        assert_eq!(datagrams[4].bytes.len(), 1_400);
+    }
+
+    #[test]
+    fn mtu_sized_originals_and_recovery_stay_within_datagram_limit() {
+        let maximum = 1_362;
+        let inner_maximum = FecEncoder::inner_frame_limit(maximum).unwrap();
+        let mut encoder = encoder();
+        let mut datagrams = Vec::new();
+        for value in 0..4_u8 {
+            datagrams.extend(
+                encoder
+                    .push(Bytes::from(vec![value; inner_maximum]), maximum)
+                    .unwrap()
+                    .datagrams,
+            );
+        }
+
+        assert_eq!(datagrams.len(), 6);
+        assert!(
+            datagrams
+                .iter()
+                .all(|datagram| datagram.bytes.len() <= maximum)
+        );
+        assert!(datagrams[4..].iter().all(|datagram| datagram.recovery));
     }
 
     #[test]
