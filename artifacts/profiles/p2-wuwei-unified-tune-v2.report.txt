@@ -1,0 +1,1507 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cycles:P'
+# Event count (approx.): 14732628698
+#
+# Overhead  Command          Shared Object         Symbol
+# ........  ...............  ....................  ..........................................
+#
+     4.79%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fea
+            |
+             --4.70%--0x7fe2e66b5fed
+
+     2.11%  tokio-rt-worker  [kernel.kallsyms]     [k] clflush_cache_range
+            |
+             --2.07%--clflush_cache_range
+                       |
+                       |--1.43%--intel_iommu_map_pages
+                       |          __iommu_map
+                       |          iommu_map
+                       |          __iommu_dma_map
+                       |          iommu_dma_map_page
+                       |          dma_map_page_attrs
+                       |          igc_xmit_frame
+                       |          dev_hard_start_xmit
+                       |          sch_direct_xmit
+                       |          __dev_queue_xmit
+                       |          ip6_finish_output2
+                       |          ip6_finish_output
+                       |          ip6_send_skb
+                       |          udp_v6_send_skb
+                       |          udpv6_sendmsg
+                       |          ____sys_sendmsg
+                       |          ___sys_sendmsg
+                       |          __sys_sendmsg
+                       |          do_syscall_64
+                       |          entry_SYSCALL_64_after_hwframe
+                       |          0x7fe2e66b61e6
+                       |
+                        --0.64%--dma_pte_clear_level
+                                  dma_pte_clear_level
+                                  dma_pte_clear_level
+                                  domain_unmap
+                                  intel_iommu_unmap_pages
+                                  __iommu_unmap
+                                  __iommu_dma_unmap
+                                  iommu_dma_unmap_page
+                                  dma_unmap_page_attrs
+                                  igc_poll
+                                  __napi_poll
+                                  net_rx_action
+                                  handle_softirqs
+                                  |
+                                   --0.60%--__irq_exit_rcu
+                                             common_interrupt
+                                             asm_common_interrupt
+
+     1.29%  tokio-rt-worker  [kernel.kallsyms]     [k] intel_iommu_map_pages
+            |
+            ---intel_iommu_map_pages
+               __iommu_map
+               iommu_map
+               __iommu_dma_map
+               iommu_dma_map_page
+               dma_map_page_attrs
+               igc_xmit_frame
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip6_finish_output2
+               ip6_finish_output
+               ip6_send_skb
+               udp_v6_send_skb
+               udpv6_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               0x7fe2e66b61e6
+
+     1.27%  tokio-rt-worker  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
+            |
+             --0.98%--entry_SYSRETQ_unsafe_stack
+                       |
+                        --0.66%--0x7fe2e66b61e6
+
+     0.97%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_from_iter
+            |
+            ---_copy_from_iter
+               ip_generic_getfrag
+               __ip6_append_data
+               ip6_make_skb
+               udpv6_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               0x7fe2e66b61e6
+
+     0.91%  tokio-rt-worker  ironetd               [.] 0x00000000010b5ff2
+            |
+            ---0x7fe2e66b5ff3
+
+     0.85%  tokio-rt-worker  [kernel.kallsyms]     [k] sched_balance_update_blocked_averages
+            |
+            ---sched_balance_update_blocked_averages
+               |
+                --0.66%--sched_balance_newidle
+                          pick_next_task_fair
+                          __schedule
+                          schedule
+
+     0.84%  tokio-rt-worker  [kernel.kallsyms]     [k] clear_page_erms
+            |
+            ---clear_page_erms
+               prep_new_page
+               get_page_from_freelist
+               __alloc_pages_noprof
+               alloc_pages_mpol_noprof
+
+     0.69%  tokio-rt-worker  [vdso]                [.] __vdso_clock_gettime
+            |
+            ---__vdso_clock_gettime
+               |
+                --0.58%--0x7fe2e66b7aa6
+
+     0.67%  tokio-rt-worker  [kernel.kallsyms]     [k] pfn_to_dma_pte
+            |
+            ---pfn_to_dma_pte
+
+     0.62%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_lock_irqsave
+            |
+             --0.58%--_raw_spin_lock_irqsave
+
+     0.59%  tokio-rt-worker  ironetd               [.] 0x00000000010b619e
+            |
+            ---0x7fe2e66b61a2
+
+     0.58%  tokio-rt-worker  [kernel.kallsyms]     [k] __list_del_entry_valid_or_report
+            |
+            ---__list_del_entry_valid_or_report
+
+     0.57%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_to_iter
+            |
+            ---_copy_to_iter
+               |
+                --0.53%--__skb_datagram_iter
+                          skb_copy_datagram_iter
+                          tun_do_read
+                          tun_chr_read_iter
+                          vfs_read
+                          ksys_read
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          0x7fe2e66b61e6
+                          0x1
+
+     0.55%  tokio-rt-worker  ironetd               [.] 0x00000000010b60f7
+            |
+            ---0x7fe2e66b60fb
+
+     0.53%  tokio-rt-worker  ironetd               [.] 0x00000000010adcb7
+            |
+            ---0x7fe2e66adcbc
+
+     0.48%  tokio-rt-worker  [kernel.kallsyms]     [k] entry_SYSCALL_64
+     0.47%  tokio-rt-worker  [kernel.kallsyms]     [k] igc_xmit_frame
+     0.45%  tokio-rt-worker  [kernel.kallsyms]     [k] datagram_poll
+     0.42%  tokio-rt-worker  [kernel.kallsyms]     [k] __memset
+     0.41%  tokio-rt-worker  [kernel.kallsyms]     [k] __memcg_slab_free_hook
+     0.40%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_lock
+     0.38%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_segment
+     0.37%  tokio-rt-worker  [kernel.kallsyms]     [k] read_tsc
+     0.36%  tokio-rt-worker  ironetd               [.] 0x00000000010adbdd
+     0.35%  tokio-rt-worker  [kernel.kallsyms]     [k] __alloc_skb
+     0.35%  tokio-rt-worker  [kernel.kallsyms]     [k] __schedule
+     0.33%  tokio-rt-worker  [kernel.kallsyms]     [k] kmem_cache_alloc_node_noprof
+     0.31%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fd7
+     0.31%  tokio-rt-worker  ironetd               [.] 0x00000000001653a0
+     0.31%  tokio-rt-worker  ironetd               [.] 0x00000000010b6015
+     0.31%  tokio-rt-worker  [kernel.kallsyms]     [k] do_epoll_wait
+     0.30%  tokio-rt-worker  [kernel.kallsyms]     [k] __seccomp_filter
+     0.29%  tokio-rt-worker  [kernel.kallsyms]     [k] nft_do_chain
+     0.29%  tokio-rt-worker  [kernel.kallsyms]     [k] ___slab_alloc
+     0.29%  tokio-rt-worker  [kernel.kallsyms]     [k] psi_task_switch
+     0.29%  tokio-rt-worker  [kernel.kallsyms]     [k] __siphash_unaligned
+     0.28%  tokio-rt-worker  [kernel.kallsyms]     [k] ____sys_sendmsg
+     0.28%  tokio-rt-worker  [kernel.kallsyms]     [k] native_irq_return_iret
+     0.28%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_from_user
+     0.27%  tokio-rt-worker  [kernel.kallsyms]     [k] alloc_iova_fast
+     0.26%  tokio-rt-worker  [kernel.kallsyms]     [k] fib6_node_lookup_1
+     0.26%  tokio-rt-worker  [kernel.kallsyms]     [k] try_to_wake_up
+     0.26%  tokio-rt-worker  ironetd               [.] 0x00000000010ae30f
+     0.26%  tokio-rt-worker  [kernel.kallsyms]     [k] __memcpy
+     0.26%  tokio-rt-worker  [kernel.kallsyms]     [k] __update_load_avg_cfs_rq
+     0.25%  tokio-rt-worker  [kernel.kallsyms]     [k] kmem_cache_free
+     0.24%  tokio-rt-worker  [kernel.kallsyms]     [k] arch_exit_to_user_mode_prepare.isra.0
+     0.23%  tokio-rt-worker  [kernel.kallsyms]     [k] update_curr
+     0.23%  tokio-rt-worker  [kernel.kallsyms]     [k] native_sched_clock
+     0.23%  tokio-rt-worker  [kernel.kallsyms]     [k] dma_pte_clear_level
+     0.23%  tokio-rt-worker  ironetd               [.] 0x00000000010b5ff7
+     0.22%  tokio-rt-worker  [kernel.kallsyms]     [k] psi_group_change
+     0.22%  tokio-rt-worker  [kernel.kallsyms]     [k] __ip6_append_data
+     0.22%  tokio-rt-worker  [kernel.kallsyms]     [k] sock_poll
+     0.22%  tokio-rt-worker  [kernel.kallsyms]     [k] error_entry
+     0.22%  tokio-rt-worker  [kernel.kallsyms]     [k] tomoyo_check_inet_address
+     0.22%  tokio-rt-worker  ironetd               [.] 0x00000000010adc00
+     0.20%  tokio-rt-worker  [kernel.kallsyms]     [k] finish_task_switch.isra.0
+     0.20%  tokio-rt-worker  [kernel.kallsyms]     [k] update_load_avg
+     0.20%  tokio-rt-worker  ironetd               [.] 0x0000000000fc40cc
+     0.20%  tokio-rt-worker  [kernel.kallsyms]     [k] ___sys_sendmsg
+     0.20%  tokio-rt-worker  ironetd               [.] 0x0000000000180b33
+     0.19%  tokio-rt-worker  ironetd               [.] 0x00000000010b7a90
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] __iommu_map
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] memcmp
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] __copy_skb_header
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] copy_msghdr_from_user
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] dequeue_entity
+     0.19%  tokio-rt-worker  [kernel.kallsyms]     [k] mutex_lock
+     0.19%  tokio-rt-worker  ironetd               [.] 0x00000000010ae79d
+     0.18%  tokio-rt-worker  ironetd               [.] 0x000000000109a3ae
+     0.18%  tokio-rt-worker  [kernel.kallsyms]     [k] fdget
+     0.18%  tokio-rt-worker  [kernel.kallsyms]     [k] switch_fpu_return
+     0.18%  tokio-rt-worker  [kernel.kallsyms]     [k] __irqentry_text_end
+     0.18%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_walk
+     0.18%  tokio-rt-worker  [kernel.kallsyms]     [k] fib6_table_lookup
+     0.17%  tokio-rt-worker  ironetd               [.] 0x0000000000f190f0
+     0.17%  tokio-rt-worker  [kernel.kallsyms]     [k] timerqueue_add
+     0.17%  tokio-rt-worker  [kernel.kallsyms]     [k] __check_object_size
+     0.17%  tokio-rt-worker  [kernel.kallsyms]     [k] restore_fpregs_from_fpstate
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] udpv6_sendmsg
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] __iommu_dma_unmap
+     0.16%  tokio-rt-worker  ironetd               [.] 0x0000000000b728e0
+     0.16%  tokio-rt-worker  ironetd               [.] 0x00000000010addc0
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] iommu_get_dma_domain
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] __put_user_nocheck_4
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] select_task_rq_fair
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] iommu_pgsize.isra.0
+     0.16%  tokio-rt-worker  [kernel.kallsyms]     [k] ep_poll_callback
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] __nf_conntrack_find_get
+     0.15%  tokio-rt-worker  ironetd               [.] 0x00000000010ad7e7
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] __update_load_avg_se
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] native_flush_tlb_one_user
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] dma_map_page_attrs
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] __lruvec_stat_mod_folio
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] sock_kmalloc
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] __rcu_read_lock
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] __mmap_region
+     0.15%  tokio-rt-worker  ironetd               [.] 0x0000000001099820
+     0.15%  tokio-rt-worker  [kernel.kallsyms]     [k] get_futex_key
+     0.15%  tokio-rt-worker  ironetd               [.] 0x0000000000f18d50
+     0.15%  tokio-rt-worker  ironetd               [.] 0x0000000000ff9b90
+     0.14%  tokio-rt-worker  ironetd               [.] 0x00000000010ae2df
+     0.14%  tokio-rt-worker  ironetd               [.] 0x00000000010ae3b5
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] __ip6_make_skb
+     0.14%  tokio-rt-worker  ironetd               [.] 0x0000000001092c6c
+     0.14%  tokio-rt-worker  ironetd               [.] 0x000000000109a570
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_wake_mark
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] syscall_return_via_sysret
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_dst_lookup_tail.constprop.0
+     0.14%  tokio-rt-worker  ironetd               [.] 0x0000000000b43270
+     0.14%  tokio-rt-worker  ironetd               [.] 0x000000000109b14f
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] intel_iommu_unmap_pages
+     0.14%  tokio-rt-worker  [kernel.kallsyms]     [k] handle_softirqs
+     0.13%  tokio-rt-worker  ironetd               [.] 0x000000000109c460
+     0.13%  tokio-rt-worker  ironetd               [.] 0x0000000001092c6f
+     0.13%  tokio-rt-worker  ironetd               [.] 0x0000000000c394d3
+     0.13%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fc6
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] __handle_mm_fault
+     0.13%  tokio-rt-worker  ironetd               [.] 0x00000000000fcc0b
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] nft_immediate_eval
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] igc_poll
+     0.13%  tokio-rt-worker  ironetd               [.] 0x00000000010b1ba1
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] should_flush_tlb
+     0.13%  tokio-rt-worker  ironetd               [.] 0x000000000018117c
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] tun_get_user
+     0.13%  tokio-rt-worker  ironetd               [.] 0x00000000004c450a
+     0.13%  tokio-rt-worker  [kernel.kallsyms]     [k] page_frag_free
+     0.12%  tokio-rt-worker  ironetd               [.] 0x000000000109a54f
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000fb0a78
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] do_recvmmsg
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] net_rx_action
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] __list_add_valid_or_report
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000bcc05a
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] free_unref_folios
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000faef50
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000e84820
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] down_write
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_wr_node_store
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] iommu_dma_alloc_iova
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] iommu_dma_map_page
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000c31bd8
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] netif_skb_features
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000bd1050
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] sched_balance_newidle
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] kfree
+     0.12%  tokio-rt-worker  ironetd               [.] 0x000000000108362c
+     0.12%  tokio-rt-worker  ironetd               [.] 0x0000000000503e70
+     0.12%  tokio-rt-worker  [kernel.kallsyms]     [k] iommu_map
+     0.12%  tokio-rt-worker  ironetd               [.] 0x00000000010ad7f3
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] handle_mm_fault
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] sock_wfree
+     0.11%  tokio-rt-worker  ironetd               [.] 0x00000000010ade5d
+     0.11%  tokio-rt-worker  ironetd               [.] 0x0000000000be3adf
+     0.11%  tokio-rt-worker  ironetd               [.] 0x0000000000642630
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] update_rq_clock
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] smp_call_function_many_cond
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] __rcu_read_unlock
+     0.11%  tokio-rt-worker  ironetd               [.] 0x00000000010adde1
+     0.11%  tokio-rt-worker  ironetd               [.] 0x000000000109a5d3
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] igc_features_check
+     0.11%  tokio-rt-worker  [kernel.kallsyms]     [k] __mod_memcg_lruvec_state
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] put_prev_entity
+     0.10%  tokio-rt-worker  ironetd               [.] 0x000000000109a3cf
+     0.10%  tokio-rt-worker  ironetd               [.] 0x00000000010adb72
+     0.10%  tokio-rt-worker  ironetd               [.] 0x000000000109afc2
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] ipv6_defrag
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] xfrm_lookup_with_ifid
+     0.10%  tokio-rt-worker  ironetd               [.] 0x0000000000c6258a
+     0.10%  tokio-rt-worker  ironetd               [.] 0x0000000000b78c5d
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] free_unref_page_commit
+     0.10%  tokio-rt-worker  ironetd               [.] 0x000000000109c499
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] __ip_queue_xmit
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] apparmor_ip_postroute
+     0.10%  tokio-rt-worker  ironetd               [.] 0x00000000010b61e6
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] dev_hard_start_xmit
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] __dev_queue_xmit
+     0.10%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b73e
+     0.10%  tokio-rt-worker  ironetd               [.] 0x0000000001099abb
+     0.10%  tokio-rt-worker  ironetd               [.] 0x00000000004c44bd
+     0.10%  tokio-rt-worker  [kernel.kallsyms]     [k] do_syscall_64
+     0.10%  tokio-rt-worker  ironetd               [.] 0x00000000001c5230
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] call_function_single_prep_ipi
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000771eb0
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000b8fbc5
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_wr_store_type
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010b60c4
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000004fd1fb
+     0.09%  tokio-rt-worker  ironetd               [.] 0x000000000109a473
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010adf1d
+     0.09%  tokio-rt-worker  ironetd               [.] 0x000000000109a9c6
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] udp_v6_send_skb
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000be62ae
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000fff9a0
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] free_iova_fast
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] aa_sk_perm
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010adb84
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010adf26
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] nft_ct_get_fast_eval
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000004c4300
+     0.09%  tokio-rt-worker  ironetd               [.] 0x000000000100383e
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_conntrack_in
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000001099935
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] idle_cpu
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_lock_irq
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000bd47a8
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000001099a33
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010999b7
+     0.09%  tokio-rt-worker  ironetd               [.] 0x000000000109a3f1
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] update_entity_lag
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010835fe
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010b90bf
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] perf_event_mmap_output
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000fb4bb7
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000fc4111
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000001c6da0
+     0.09%  tokio-rt-worker  ironetd               [.] 0x00000000010970c0
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] ktime_get_ts64
+     0.09%  tokio-rt-worker  [kernel.kallsyms]     [k] __vm_munmap
+     0.09%  tokio-rt-worker  ironetd               [.] 0x0000000000f73b70
+     0.08%  tokio-rt-worker  ironetd               [.] 0x000000000109a620
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_conntrack_udp_packet
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_wake
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] check_stack_object
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] unmap_page_range
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000010ad7b4
+     0.08%  tokio-rt-worker  ironetd               [.] 0x000000000109b065
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c35eff
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000010adf3e
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] sync_regs
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] __alloc_pages_noprof
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c0f53f
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_nat_ipv6_out
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000d51fc2
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000001099a79
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_nat_inet_fn
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] schedule
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000d5747f
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000177b81
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] __rt6_find_exception_rcu
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] __calc_delta.constprop.0
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000003b7ec0
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000764ae0
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000010b5ff0
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000bc8248
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7bc0
+     0.08%  tokio-rt-worker  ironetd               [.] 0x000000000062e5fa
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c39fa4
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c19688
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] vms_gather_munmap_vmas
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c1f58b
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] native_write_msr
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] down_write_killable
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000001c7740
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000b528b2
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000b6b0d2
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] do_anonymous_page
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] ipv6_gso_segment
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] consume_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] slab_update_freelist.isra.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] path_from_stashed
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] native_queued_spin_lock_slowpath
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] kmalloc_reserve
+     0.08%  tokio-rt-worker  ironetd               [.] 0x000000000097c7c1
+     0.08%  tokio-rt-worker  ironetd               [.] 0x00000000010adbd0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_finish_output2
+     0.08%  tokio-rt-worker  ironetd               [.] 0x0000000000c5c1c1
+     0.08%  tokio-rt-worker  [kernel.kallsyms]     [k] schedule_hrtimeout_range_clock
+     0.07%  tokio-rt-worker  ironetd               [.] 0x00000000010adc95
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __slab_free
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __kmalloc_noprof
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] folio_batch_move_lru
+     0.07%  tokio-rt-worker  ironetd               [.] 0x000000000109a283
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000b43c50
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __common_interrupt
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000001099801
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_release_data
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_v4_early_demux
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] vma_merge_new_range
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __split_vma
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] nft_do_chain_inet
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000180aa4
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __memcg_slab_post_alloc_hook
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __hrtimer_init
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000001099862
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] __virt_addr_valid
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c65bfd
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000be61c5
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] ep_item_poll.isra.0
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000b75c78
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] folio_add_new_anon_rmap
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c18352
+     0.07%  tokio-rt-worker  ironetd               [.] 0x00000000007edbf0
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c1199b
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7cfb
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] lapic_next_deadline
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] csum_ipv6_magic
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000001010056
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_free_head
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c46635
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] get_pfnblock_flags_mask
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] kmem_cache_alloc_noprof
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] dequeue_entities
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c358a3
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000fc9fda
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] perf_adjust_freq_unthr_context
+     0.07%  tokio-rt-worker  ironetd               [.] 0x00000000010ade1b
+     0.07%  tokio-rt-worker  ironetd               [.] 0x00000000010af08d
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_dst_hoplimit
+     0.07%  tokio-rt-worker  ironetd               [.] 0x00000000010ade09
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] up_write
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c359c5
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] avg_vruntime
+     0.07%  tokio-rt-worker  [kernel.kallsyms]     [k] wake_q_add_safe
+     0.07%  tokio-rt-worker  ironetd               [.] 0x0000000000c35482
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] task_non_contending
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c3bca7
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] fib6_rule_action
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000bee0b0
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] do_futex
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010999a3
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] alloc_pages_noprof
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109a4e3
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000461b3f
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000006f02c0
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] intel_iommu_iotlb_sync_map
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000108360f
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] mlock_drain_local
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000b72d10
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109affe
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] native_apic_msr_eoi
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109bbb9
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] anon_vma_interval_tree_remove
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000001099908
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] folios_put_refs
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010adeee
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000bd4501
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __put_user_nocheck_8
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010ae255
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __build_skb_around
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010998a0
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000bd33a3
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c1ebab
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __cond_resched
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010adb9b
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] set_user_sigmask
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010ad770
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000be3848
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] fib_rules_lookup
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000b5284e
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000001c7732
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000010af4f5
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000001c70f0
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109990d
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] migrate_task_rq_fair
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000074e6a5
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109c488
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000be46a8
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000996a2e
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000bf1a95
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c06fe3
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] update_curr_dl_se
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] fput
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000bea501
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __x64_sys_recvmmsg
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __ipv6_chk_addr_and_flags
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] anon_vma_interval_tree_insert
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] hrtimer_start_range_ns
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000fb97fc
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7c80
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000fc3af7
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000001083597
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109aaf6
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109b0c4
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] free_unref_page
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000001099965
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000643c54
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000001c6ee2
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000b415d7
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109aef0
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000001c6eff
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c101b0
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_zerocopy_clone
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000fc222a
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c23667
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] __consume_stateless_skb
+     0.06%  tokio-rt-worker  ironetd               [.] 0x000000000109af2b
+     0.06%  tokio-rt-worker  ironetd               [.] 0x00000000007646fb
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c1947e
+     0.06%  tokio-rt-worker  ironetd               [.] 0x0000000000c11e07
+     0.06%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_current_mss
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d5217c
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b96f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a8a7
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] uncharge_folio
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b5315e
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c1d202
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c10886
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c3ad65
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c1028d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099983
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010835bc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c65b20
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d4e071
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109971c
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4668d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000097ca47
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001c4641
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109ba8d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000e8486f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010999f9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c2e1b5
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001227c0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001c4633
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b91f9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000647a7d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a42f
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] khugepaged_enter_vma
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010aded0
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __local_bh_enable_ip
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010835ea
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4dccb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ad7ef
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000097d999
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b096
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c20230
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] folio_add_lru
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000071a5a0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a3c7
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a511
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c2df4b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ae44a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b09b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bc2520
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000be3860
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000004c458e
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bc7bd8
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010afbef
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b902e
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __pm_relax
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_new
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] copy_iovec_from_user
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2447
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ae782
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b8fa77
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b0a0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109bb9e
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ipv6_gro_receive
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c2e1c0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000009785ab
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bcf160
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c195b9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c31bf6
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000f190c2
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000107e235
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ktime_get_seconds
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c0f0a0
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __tcp_select_window
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001092c66
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ff9c49
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] irqentry_enter
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_nat_ipv6_fn
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] cap_vm_enough_memory
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b8a05a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000101a354
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010101cd
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000101a38f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d51c3d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000be5f90
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099805
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] pid_vnr
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109698d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000100ff30
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b626
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] lock_vma_under_rcu
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fc3ca2
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c35648
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bece39
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c35e02
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] pick_eevdf
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] tmigr_requires_handle_remote
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_page_frag_refill
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ae955
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a3c3
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001011ee8
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b8eb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c104bf
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001cfc7b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ff8d4a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a46e
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099fdd
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000be5b11
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109affb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c1f269
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000088cda0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d51e7a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b2f3
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c5c168
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c387cf
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c387c8
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bf8837
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fb0b4b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c1f06f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000f18f50
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c17bfb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3970
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __pte_offset_map_lock
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c147ad
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000006f0a61
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000101a38b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099ba1
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000762052
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fc207e
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000068e1ec
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] vfs_write
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b61a2
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a4b5
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4664b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ae7cf
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b90fc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b0ff
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c34fe7
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000461730
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000097f484
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b90bc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b60fb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000faef7a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bf5279
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] timespec64_add_safe
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bc7ed3
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a3ab
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] lru_gen_add_folio
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fc45c5
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fcd
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7c81
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000006f0a84
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000066e8b5
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c38c37
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ____sys_recvmsg
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] fdget_pos
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] dequeue_task_fair
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099834
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000177ac9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c21122
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b436b9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c1a22f
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_prev_slot
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c35331
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c10284
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b760cc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ff9f71
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b6b0c7
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] drain_obj_stock
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3a45
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] build_detached_freelist
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] l3mdev_update_flow
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c2023d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000be5dd2
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b528c0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c10173
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001099a15
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a89b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b415de
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010adcdc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a2ef
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __udp_gso_segment
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000e84869
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] napi_consume_skb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000074f3d0
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __count_memcg_events
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d518cf
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ff8d39
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c3587f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010afab5
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bf1a2a
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ttwu_queue_wakelist
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000074c0ff
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000715dd7
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000064748f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4a9a8
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ___sys_recvmsg
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_ct_frag6_gather
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c35372
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bd80e0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b0d3
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a5c9
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109b917
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000688adf
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] update_sd_lb_stats.constprop.0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bd823d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c65ec5
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] security_sk_classify_flow
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c3942f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000a0883a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fc21ab
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000006b4e70
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4aafa
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000997bdb
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_wr_bnode
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c109b4
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_pop_node
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4a93b
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b91a7
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c480f2
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000a087ff
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ad790
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a450
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ba6f50
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010836cd
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010999d3
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c202aa
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010ae93b
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] mod_objcg_state
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000be376a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c4a974
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] ktime_get
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c17eee
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] plist_add
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000004ca950
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d57c7c
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000fb8edd
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109699a
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000007616bb
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c2e2ce
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] udp_rmem_release
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010835bf
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d52096
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] __secure_computing
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109a3e2
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] get_partial_node.part.0
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_destroy
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_conntrack_tcp_packet
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bcdc5c
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000bf4ac0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001820e0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b432cb
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_wait_queue
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b78290
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c5bab4
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b306
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000f190bc
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000d51c74
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000010b7aa4
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000001652f0
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109ba3d
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c194f4
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000c3597f
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000ff2600
+     0.05%  tokio-rt-worker  ironetd               [.] 0x00000000004fcb79
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000095b87e
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000165393
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000000f73ad7
+     0.05%  tokio-rt-worker  ironetd               [.] 0x000000000109bac3
+     0.05%  tokio-rt-worker  [kernel.kallsyms]     [k] rcu_core
+     0.05%  tokio-rt-worker  ironetd               [.] 0x0000000001003990
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ae8be
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c3a03d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b778c4
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_store_gfp
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000647a82
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b44e33
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ff9cda
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c47a23
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000074db82
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083586
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] tomoyo_domain
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ade04
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b75bb2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a4a9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adbeb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a49d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc385c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b270e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000074cd49
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001096bf2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ae3c1
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000009496ee
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001dd7b2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c228b0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083651
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000097f50e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fcc010
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109b0f5
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010addc9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000996fab
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __perf_event_task_sched_in
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] set_next_task_idle
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a97e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000beb2d3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000074bd23
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] alloc_skb_with_frags
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109bc56
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd32f7
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] can_vma_merge_right
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7b90
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010998b0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c4aaa0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010949e0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000009726d9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099bae
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000182113
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc38a7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c147e3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c35b50
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb0f3d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb0133
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c10374
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c34c7e
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_route_output_flags
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ae7d4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b0f1
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c496
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000108356c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000101a37b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c5c7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a71d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c4a5
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000006c88fb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000831ed0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c3a111
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b75350
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b606c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ba93e0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c11ce9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be622d
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] get_mem_cgroup_from_mm
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ad820
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004fcbaf
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bcc1ef
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] netdev_pick_tx
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109aecb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c3eeb0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c4dc33
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010835f8
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001c71a9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c10153
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000177b73
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a4d7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d51c97
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c4a992
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bcacda
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c453
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c2e1de
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000006c7700
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a4b2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adc06
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd5216
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001653a2
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] userfaultfd_unmap_prep
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __futex_unqueue
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c35e16
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083682
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000101a350
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] x64_sys_call
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a663
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ad805
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd3f33
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2291
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] ipv6_conntrack_local
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bec017
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc272b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ade83
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7608c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7c90
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_data_end
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ae7e5
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010999dd
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b4368c
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] fib6_rule_lookup
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] x86_pmu_disable
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010998bc
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000940135
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000e87081
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b44e35
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f73b7d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a5a5
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010835e0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d52052
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099b07
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001011ea0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c4eb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] sched_balance_rq
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] rcu_segcblist_pend_cbs
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] hash_conntrack_raw
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] lru_add_drain_cpu
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109b083
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ade3f
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_nat_ipv4_pre_routing
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a37b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b75254
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ad855
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000e86e3c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c445
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb8d9b
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] dql_completed
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c1011d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a47d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd4718
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000101a386
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099c45
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d51e16
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] free_pgd_range
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a376
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be5cd8
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be3dd2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d57c47
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be9683
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c474
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000009b3b92
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001d1fc2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7aa70
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b5daaa
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c2214d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099ea0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a529
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be3c08
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001d1db6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c38579
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd45bc
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_nomem
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] sk_page_frag_refill
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] rcu_disable_urgency_upon_qs
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c2de1b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ba68bb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] clockevents_program_event
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004636be
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109aeb9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bcd13d
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] igc_tx_ctxtdesc
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bbaed0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000faef9b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fffa11
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc4aa0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b43c8d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c392df
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b72602
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c354a0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d4e13f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b78974
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001009e18
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000074db3f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010bb810
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be3afa
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109ab16
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ba9b7e
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] cpuacct_charge
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000940c49
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c5f6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be37e2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010998fb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c35a07
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fffb07
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083541
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c31b8d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004c456f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b601d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010999bf
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000649b65
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000046343b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c3eeba
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010af22a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099f00
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001229d1
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c463dc
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7516e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bf322c
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] fpregs_assert_state_consistent
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b257
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109afcf
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c1d103
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010999f4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fba063
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b758a0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] try_charge_memcg
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001098fc0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b6aec4
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] cap_mmap_addr
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb2d3b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bf9041
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] entry_SYSCALL_64_after_hwframe
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c45ef7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000100375f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a322
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c46683
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099a10
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bc9fb5
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] unlink_file_vma_batch_init
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099926
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109699e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc428a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000006b4e78
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b652
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adc99
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ada68
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c19160
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fcb450
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099850
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b52830
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc28f0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc1c9c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b31ee
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083486
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd38f7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ae7eb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001c7165
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be3b4c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001652f9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001011764
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000a07118
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083480
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010991b9
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_rack_update_reo_wnd
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109aee7
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] sched_balance_trigger
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001083636
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_find
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a5f6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c31bbc
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b4354c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d51bfa
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3980
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc380b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b43fb2
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc43d4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099ec3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109ae5d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb2c08
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adbc4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be543f
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __netif_receive_skb_list_core
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bed319
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109aef8
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b7a98
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3c64
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000077117d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d52108
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] validate_xmit_skb_list
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001004050
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109baf7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d57e5b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b7585a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c392e6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b61cc
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000beeadb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b9126
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bbbb7f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b757ca
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be9692
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f18fcd
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ade01
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f015df
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b61e4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f73ae0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010998c1
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a3cb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] cgroup_rstat_updated
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109b119
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a2b3
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_rq_lock_irqsave
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010835b5
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] ip_rcv
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fd8
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109982f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ade84
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be40b7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099a9a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bf53a0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bf9158
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a63e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000096c21c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b43c57
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_unlock_irq
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fbb670
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] llist_add_batch
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] ep_done_scan
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109bbfd
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109b15b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010add33
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001c7606
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c07022
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099a42
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f0170a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a38f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a6f6
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __srcu_read_unlock
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fed
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004edee6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109af83
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc403a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bc2567
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ad849
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adb35
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000085dbd3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c65d2a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010836e6
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bc825c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001c549e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010adb4d
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a446
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_copy_bits
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000074cd5a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be46f3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d4e859
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109b05b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b60ea
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010835da
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001c760e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ff8ce0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b44e4a
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd2b83
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004ffb4f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000006f03c4
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c4d9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc40e9
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b43300
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ffd1b7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb7b57
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] igc_process_skb_fields
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c449
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be3a6c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d52180
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b75c61
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109af46
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010afab8
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c1ab35
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000009f01e0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000b43f55
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] cpus_share_cache
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] nf_confirm
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __netif_receive_skb_one_core
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be4320
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c1ec81
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c05a7b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc3a2e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c35d93
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000085893e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2666
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010ad34c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001fa4da
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000ba6890
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_rack_advance
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_unlock
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __mod_memcg_state
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bd475c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a3bd
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109c46e
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d51c38
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000064808f
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c100e7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fc215b
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000f015c0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] perf_ctx_unlock
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] policy_nodemask
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c35b77
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c5beb3
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] udpv6_recvmsg
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000d4e866
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] fib_get_table
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109af89
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000177b84
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c105ad
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __perf_event_task_sched_out
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109a3e7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000bf5324
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c104ba
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109991c
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000001099ac5
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] tcp_ack
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004ff237
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010addb4
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] security_socket_recvmsg
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000c050b1
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __ip6_local_out
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000006f0b4d
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] netif_receive_skb
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000010b5ff3
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fcd687
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000001cfc76
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000be5dc0
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000009798e7
+     0.04%  tokio-rt-worker  ironetd               [.] 0x0000000000fb9e76
+     0.04%  tokio-rt-worker  [kernel.kallsyms]     [k] __pte_offset_map
+     0.04%  tokio-rt-worker  ironetd               [.] 0x000000000109aeaa
+     0.04%  tokio-rt-worker  ironetd               [.] 0x00000000004fc4d7
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fc9
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_pol_route
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c22813
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000007edc9c
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000009798ee
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ad7ff
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010adc87
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109bbc8
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000096d084
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fafd93
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a519
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099971
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c10dd7
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b76641
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000f18e31
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000001d3480
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000e86d9d
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099bd5
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ff27a8
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c46651
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c6293f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010997f5
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c661ec
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000101a376
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] exc_page_fault
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] __msecs_to_jiffies
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c3ef37
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000999a49
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000087312e
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099876
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000d57b64
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c625ee
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099163
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fb8caa
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ade51
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b72921
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b757eb
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ba72ee
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fb9ae4
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] ip_finish_output2
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000001cfc50
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010adb7d
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000074bb60
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_network_protocol
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001083526
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c3f20d
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] put_prev_task_fair
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000007430c7
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b68f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000d4e861
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3c73
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c35b66
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] xhci_ring_ep_doorbell
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b8fbcf
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c24a1f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a60a
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a5e2
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c4aab0
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] unmap_vmas
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] do_mmap
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c3a602
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] is_vmalloc_addr
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c66351
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a2e5
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099a74
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010b5ff8
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a589
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] perf_iterate_ctx
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c65f83
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ffaae0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ffb03f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000000fc46e
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] rcu_segcblist_add_len
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] pick_task_fair
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fc1ff0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000007f9300
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] page_counter_try_charge
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c4aaaa
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ae942
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c6256a
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] ip6_finish_output
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] inet6_recvmsg
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ad061
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_q_lock
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fcc028
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010adb8c
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000003abf00
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c38c86
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] __get_user_nocheck_4
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000062e5fe
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109c516
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109b0ba
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000004ec252
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109b017
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c1a115
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c3f16b
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001096974
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010afab3
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fb3be4
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000006485bc
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001096c54
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000bc81e2
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ad84d
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001083644
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001096c42
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ae7ee
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c11895
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] vma_prepare
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a5c0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fbb92c
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000be34c0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000648040
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ff9bc4
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] psi_flags_change
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000a08a0e
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c66357
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000006c887c
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000001c463a
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109bcd1
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000097c789
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109b06f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010b5fe6
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000bd001d
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000bee980
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000347a2b
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a70e
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001083520
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109aeaf
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000bee9ce
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c10110
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000108354b
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c40b8d
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b631
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] __flow_hash_from_keys
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001003944
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c11680
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c19fff
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c62659
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010afc10
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109c1fe
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] unmap_single_vma
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] init_multi_vma_prep
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000074cd30
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fba070
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010ad9d7
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] _raw_spin_trylock
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000beb879
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2782
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000be50dd
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099a6f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099110
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109c60c
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c29cf8
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a6de
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099811
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c3a13a
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_wait_setup
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000bd7350
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000010998a8
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c624b0
+     0.03%  ip               [kernel.kallsyms]     [k] nft_do_chain
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] lru_gen_del_folio.constprop.0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x000000000109a853
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b7b264
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000006f0342
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000001dee40
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c4aaba
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] futex_wait
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c4663f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fc26cd
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000be3a91
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b7aa75
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000001819f0
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000ff975f
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fb2c0a
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c29d4a
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c0fe10
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000baa3b8
+     0.03%  ip               libcap.so.2.75        [.] 0x0000000000007cfc
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000c35872
+     0.03%  tokio-rt-worker  ironetd               [.] 0x00000000007646ce
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000b8fbc0
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] syscall_trace_enter
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] down_read_trylock
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000001099ced
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] vma_dup_policy
+     0.03%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_next_slot
+     0.03%  tokio-rt-worker  ironetd               [.] 0x0000000000fc0ce3
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c34237
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000b74db0
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c1e8b0
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c1818c
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] rb_insert_color
+     0.02%  ip               [kernel.kallsyms]     [k] getname_flags.part.0
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000095f367
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000e92180
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000b6b093
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fcae3f
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000bcf151
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000001010081
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] udp_poll
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109987b
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] nft_counter_eval
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c31be4
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000bf880b
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000bc7da0
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] kmem_cache_alloc_bulk_noprof
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] __srcu_read_lock
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000b7251c
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] security_inode_create
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109a54a
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] ext4_invalidate_folio
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109bb05
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000ff8d33
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc0cf7
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] mas_preallocate
+     0.02%  ip               [kernel.kallsyms]     [k] mas_wr_node_store
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fcd670
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000649d17
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000001083676
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000faef65
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000af039f
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c3ef1a
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc4407
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc0d53
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000001092c5d
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] tun_do_read
+     0.02%  tokio-rt-worker  ironetd               [.] 0x00000000004c46cf
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c1d19b
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fb2d30
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000be3ad8
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109b9a8
+     0.02%  ip               [kernel.kallsyms]     [k] mas_walk
+     0.02%  ip               ld-linux-x86-64.so.2  [.] 0x0000000000025a54
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] __d_lookup_rcu
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] __x64_sys_close
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] intel_iommu_iova_to_phys
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] mark_buffer_dirty
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] perf_iterate_sb.constprop.0
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] sched_clock_cpu
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] sd_send_cmd_get_rsp
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] skb_gso_transport_seglen
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] strcmp
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] update_dl_rq_load_avg
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000715fa7
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000073fe70
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c10880
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc24e8
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2853
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000fc2af4
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000ff2ffe
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109b8cd
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000b8a699
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000109a673
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c46658
+     0.02%  tokio-rt-worker  ironetd               [.] 0x00000000001c6f4f
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000c4a8e9
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] ext4_rename
+     0.02%  tokio-rt-worker  ironetd               [.] 0x00000000010990b1
+     0.02%  tokio-rt-worker  [kernel.kallsyms]     [k] tun_chr_write_iter
+     0.02%  tokio-rt-worker  ironetd               [.] 0x000000000095b743
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000b43bbb
+     0.02%  tokio-rt-worker  ironetd               [.] 0x0000000000be5cff
+
+
+#
+# (Tip: For a higher level overview, try: perf report --sort comm,dso)
+#

@@ -1,0 +1,320 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 814  of event 'task-clock'
+# Event count (approx.): 8222222140
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  ...........................................................................................................................................................................................
+#
+     5.53%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |
+               |--3.81%--try_to_wake_up
+               |          wake_up_q
+               |          futex_wake
+               |          do_futex
+               |          __x64_sys_futex
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          syscall
+               |
+                --0.61%--sock_def_readable
+
+     4.67%  tokio-rt-worker  ironetd            [.] ring_core_0_17_14__chacha20_poly1305_open_sse41
+            |
+            ---ring_core_0_17_14__chacha20_poly1305_open_sse41
+               ring::aead::algorithm::chacha20_poly1305_open
+               <rustls::crypto::ring::quic::PacketKey as rustls::quic::PacketKey>::decrypt_in_place_for_path
+               noq_proto::crypto::rustls::<impl noq_proto::crypto::PacketKey for alloc::boxed::Box<dyn rustls::quic::PacketKey>>::decrypt
+               noq_proto::connection::Connection::handle_packet
+               noq_proto::connection::Connection::handle_decode
+               noq_proto::connection::Connection::handle_event
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+
+     3.93%  tokio-rt-worker  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |
+               |--2.21%--futex_wait_queue
+               |          __futex_wait
+               |          futex_wait
+               |          do_futex
+               |          __x64_sys_futex
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          syscall
+               |          |
+               |           --0.61%--<noq::connection::ReadDatagram as core::future::future::Future>::poll
+               |                     ironet::runtime::Peer::install_connection_with_session::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h91000f78188b0820
+               |                     tokio::runtime::task::raw::poll
+               |                     tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               |                     tokio::runtime::scheduler::multi_thread::worker::run
+               |                     tokio::runtime::task::raw::poll
+               |                     std::sys::backtrace::__rust_begin_short_backtrace
+               |                     core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               |                     std::sys::thread::unix::Thread::new::thread_start
+               |                     start
+               |
+                --1.72%--schedule_hrtimeout_range_clock
+                          do_epoll_wait
+                          do_epoll_pwait.part.0
+                          __x64_sys_epoll_pwait
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          sccp
+
+     3.69%  tokio-rt-worker  ironetd            [.] memcpy
+            |
+            ---memcpy
+
+     3.32%  tokio-rt-worker  [kernel.kallsyms]  [k] iowrite16
+            |
+            ---iowrite16
+               vp_notify
+               virtqueue_notify
+               start_xmit
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_queue_xmit
+               ip6_finish_output2
+               ip6_finish_output
+               ip6_send_skb
+               udp_v6_send_skb
+               udpv6_sendmsg
+               ____sys_sendmsg
+               ___sys_sendmsg
+               __sys_sendmsg
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               sccp
+
+     1.72%  tokio-rt-worker  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               |
+                --0.74%--syscall
+
+     1.47%  tokio-rt-worker  ironetd            [.] __libc_malloc_impl
+            |
+            ---__libc_malloc_impl
+
+     1.47%  tokio-rt-worker  ironetd            [.] enframe
+            |
+            ---enframe
+
+     1.47%  tokio-rt-worker  ironetd            [.] syscall
+            |
+            ---syscall
+
+     1.35%  tokio-rt-worker  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               |
+                --0.86%--_copy_to_iter
+                          __skb_datagram_iter
+                          skb_copy_datagram_iter
+                          udpv6_recvmsg
+                          inet6_recvmsg
+                          |
+                           --0.74%--sock_recvmsg
+                                     ____sys_recvmsg
+                                     ___sys_recvmsg
+                                     do_recvmmsg
+                                     __x64_sys_recvmmsg
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     sccp
+
+     1.11%  tokio-rt-worker  ironetd            [.] __libc_free
+            |
+            ---__libc_free
+
+     1.11%  tokio-rt-worker  ironetd            [.] memset
+            |
+            ---memset
+
+     1.11%  tokio-rt-worker  ironetd            [.] noq_proto::connection::Connection::handle_packet
+            |
+            ---noq_proto::connection::Connection::handle_packet
+               noq_proto::connection::Connection::handle_decode
+               noq_proto::connection::Connection::handle_event
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.98%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+            |
+            ---_raw_spin_unlock_irq
+               eventfd_write
+               vfs_write
+               ksys_write
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               sccp
+
+     0.98%  tokio-rt-worker  ironetd            [.] alloc_slot
+            |
+            ---alloc_slot
+
+     0.86%  tokio-rt-worker  [kernel.kallsyms]  [k] fdget
+            |
+            ---fdget
+
+     0.86%  tokio-rt-worker  [kernel.kallsyms]  [k] smp_call_function_many_cond
+            |
+            ---smp_call_function_many_cond
+               on_each_cpu_cond_mask
+               flush_tlb_mm_range
+
+     0.86%  tokio-rt-worker  ironetd            [.] noq::endpoint::RecvState::poll_socket
+            |
+            ---noq::endpoint::RecvState::poll_socket
+               <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.86%  tokio-rt-worker  ironetd            [.] tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+            |
+            ---tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.74%  tokio-rt-worker  [vdso]             [.] __vdso_clock_gettime
+            |
+            ---__vdso_clock_gettime
+               __clock_gettime
+
+     0.74%  tokio-rt-worker  ironetd            [.] <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+            |
+            ---<noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.74%  tokio-rt-worker  ironetd            [.] get_meta
+            |
+            ---get_meta
+
+     0.74%  tokio-rt-worker  ironetd            [.] noq_proto::connection::Connection::poll_transmit
+            |
+            ---noq_proto::connection::Connection::poll_transmit
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.74%  tokio-rt-worker  ironetd            [.] noq_proto::connection::Connection::process_payload
+            |
+            ---noq_proto::connection::Connection::process_payload
+               noq_proto::connection::Connection::process_decrypted_packet
+               noq_proto::connection::Connection::handle_packet
+               noq_proto::connection::Connection::handle_decode
+               noq_proto::connection::Connection::handle_event
+
+     0.74%  tokio-rt-worker  ironetd            [.] noq_udp::imp::UdpSocketState::recv
+            |
+            ---noq_udp::imp::UdpSocketState::recv
+
+     0.74%  tokio-rt-worker  ironetd            [.] sccp
+            |
+            ---sccp
+
+     0.74%  tokio-rt-worker  ironetd            [.] tokio::runtime::io::driver::Driver::turn
+            |
+            ---tokio::runtime::io::driver::Driver::turn
+               tokio::runtime::time::Driver::park_thread_timeout
+               tokio::runtime::time::Driver::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.74%  tokio-rt-worker  ironetd            [.] tokio::runtime::scheduler::multi_thread::worker::run
+            |
+            ---tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::heddd8494bf22edc3
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+
+     0.61%  tokio-rt-worker  [kernel.kallsyms]  [k] aa_sk_perm
+            |
+            ---aa_sk_perm
+
+     0.61%  tokio-rt-worker  [kernel.kallsyms]  [k] clear_page_orig
+            |
+            ---clear_page_orig
+               prep_new_page
+               get_page_from_freelist
+               __alloc_pages_noprof
+               alloc_pages_mpol_noprof
+
+     0.61%  tokio-rt-worker  ironetd            [.] _ZN5tokio7runtime9scheduler12multi_thread6worker73_$LT$impl$u20$tokio..runtime..scheduler..multi_thread..handle..Handle$GT$13schedule_task17ha5bcb5e527be57caE.llvm.4175376452288768373
+            |
+            ---_ZN5tokio7runtime9scheduler12multi_thread6worker73_$LT$impl$u20$tokio..runtime..scheduler..multi_thread..handle..Handle$GT$13schedule_task17ha5bcb5e527be57caE.llvm.4175376452288768373
+               tokio::runtime::task::waker::wake_by_val
+
+     0.61%  tokio-rt-worker  ironetd            [.] __clock_gettime
+            |
+            ---__clock_gettime
+
+     0.61%  tokio-rt-worker  ironetd            [.] bytes::bytes_mut::shared_v_drop
+            |
+            ---bytes::bytes_mut::shared_v_drop
+
+     0.61%  tokio-rt-worker  ironetd            [.] calloc
+            |
+            ---calloc
+
+
+
+#
+# (Tip: Show user configuration overrides: perf config --user --list)
+#

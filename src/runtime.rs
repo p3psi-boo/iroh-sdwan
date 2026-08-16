@@ -3207,24 +3207,98 @@ impl noq_proto::congestion::ControllerFactory for AdaptiveTunnelControllerConfig
         _current_mtu: u16,
     ) -> Box<dyn noq_proto::congestion::Controller> {
         let pacing_rate = self.initial_rate;
+        let flight_window = self.window;
         Box::new(AdaptiveTunnelController {
             config: self,
             pacing_rate,
+            flight_window,
+            acked_since_sample: 0,
+            sample_started: None,
+            delivery_rate: 0,
         })
     }
 }
 
 /// Loss-aware outer pacer for IP tunnels. It keeps a large flight window so
 /// inner TCP does not fight a second cwnd, but adjusts the wire rate directly:
-/// ACKed bytes provide fast additive recovery while each distinct congestion
-/// event applies a small configurable multiplicative backoff.
+/// ACK delivery samples probe available capacity and derive a bounded BDP
+/// window, while each distinct congestion event applies a small configurable
+/// multiplicative backoff to both pacing and the flight window.
 #[derive(Debug, Clone)]
 struct AdaptiveTunnelController {
     config: Arc<AdaptiveTunnelControllerConfig>,
     pacing_rate: u64,
+    flight_window: u64,
+    acked_since_sample: u64,
+    sample_started: Option<Instant>,
+    delivery_rate: u64,
+}
+
+fn adaptive_flight_window(pacing_rate: u64, rtt: Duration, window_cap: u64) -> u64 {
+    let bdp = u128::from(pacing_rate)
+        .saturating_mul(rtt.max(Duration::from_millis(1)).as_nanos())
+        .checked_div(1_000_000_000)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64;
+    let window_floor = window_cap.min(256 * 1024);
+    bdp.saturating_mul(8).clamp(window_floor, window_cap)
 }
 
 impl noq_proto::congestion::Controller for AdaptiveTunnelController {
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        bytes: u64,
+        _pn: u64,
+        app_limited: bool,
+        rtt: &noq_proto::RttEstimator,
+    ) {
+        if app_limited {
+            self.acked_since_sample = 0;
+            self.sample_started = Some(now);
+            return;
+        }
+        self.acked_since_sample = self.acked_since_sample.saturating_add(bytes);
+        let started = self.sample_started.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(*started);
+        let sampling_period = rtt.get().max(Duration::from_millis(25));
+        if elapsed < sampling_period {
+            return;
+        }
+        let nanos = elapsed.as_nanos().max(1);
+        let sample_rate = u128::from(self.acked_since_sample)
+            .saturating_mul(1_000_000_000)
+            .checked_div(nanos)
+            .unwrap_or(0)
+            .min(u128::from(u64::MAX)) as u64;
+        self.acked_since_sample = 0;
+        self.sample_started = Some(now);
+        if sample_rate == 0 {
+            return;
+        }
+        // A decaying max filter tolerates ACK compression while still
+        // forgetting obsolete capacity.  A gain above one continuously probes
+        // for headroom instead of converging to the currently paced rate.
+        self.delivery_rate = sample_rate.max(self.delivery_rate.saturating_mul(7) / 8);
+        let rtt_inflated = rtt.get() > rtt.min().saturating_mul(3) / 2;
+        let gain_bps = if rtt_inflated { 10_500 } else { 12_500 };
+        let target = self
+            .delivery_rate
+            .saturating_mul(gain_bps)
+            .checked_div(10_000)
+            .unwrap_or(self.config.min_rate)
+            .clamp(self.config.min_rate, self.config.max_rate);
+        if target < self.pacing_rate {
+            self.pacing_rate = self.pacing_rate.saturating_mul(3).saturating_add(target) / 4;
+        } else {
+            let probe_step = (self.pacing_rate / 8).max(1_000_000);
+            self.pacing_rate = self.pacing_rate.saturating_add(probe_step).min(target);
+        }
+        self.flight_window =
+            adaptive_flight_window(self.pacing_rate, rtt.get(), self.config.window);
+    }
+
     fn on_end_acks(
         &mut self,
         _now: Instant,
@@ -3249,6 +3323,7 @@ impl noq_proto::congestion::Controller for AdaptiveTunnelController {
         _lost_bytes: u64,
         _largest_lost_pn: u64,
     ) {
+        let previous_rate = self.pacing_rate;
         let retained_bps = 10_000_u64.saturating_sub(u64::from(self.config.loss_backoff_bps));
         self.pacing_rate = self
             .pacing_rate
@@ -3258,6 +3333,15 @@ impl noq_proto::congestion::Controller for AdaptiveTunnelController {
             .max(self.config.min_rate);
         if is_persistent_congestion {
             self.pacing_rate = (self.pacing_rate / 2).max(self.config.min_rate);
+        }
+        if self.pacing_rate < previous_rate {
+            let window_floor = self.config.window.min(256 * 1024);
+            self.flight_window = (u128::from(self.flight_window)
+                .saturating_mul(u128::from(self.pacing_rate))
+                .checked_div(u128::from(previous_rate))
+                .unwrap_or(u128::from(window_floor))
+                .min(u128::from(u64::MAX)) as u64)
+                .clamp(window_floor, self.config.window);
         }
     }
 
@@ -3271,14 +3355,15 @@ impl noq_proto::congestion::Controller for AdaptiveTunnelController {
     fn on_mtu_update(&mut self, _new_mtu: u16) {}
 
     fn window(&self) -> u64 {
-        self.config.window
+        self.flight_window
     }
 
     fn metrics(&self) -> noq_proto::congestion::ControllerMetrics {
         let mut metrics = noq_proto::congestion::ControllerMetrics::default();
-        metrics.congestion_window = self.config.window;
+        metrics.congestion_window = self.flight_window;
         metrics.pacing_rate = Some(self.pacing_rate);
-        metrics.send_quantum = Some(self.config.pacing_quantum);
+        metrics.send_quantum =
+            Some((self.pacing_rate / 1_000).clamp(self.config.pacing_quantum, 64 * 1024));
         metrics
     }
 
@@ -3304,11 +3389,17 @@ async fn build_endpoint(
 ) -> Result<Endpoint> {
     let configured_relays = config.inherited_peer_relays()?;
     let relay_mode = iroh_relay_mode(config, configured_relays);
-    // Flow-affine parallel lanes isolate loss recovery while CUBIC retains an
-    // aggregate congestion window for several flows on each lane.
+    // Auto mode uses the tunnel-aware controller so inner TCP does not fight a
+    // second fixed congestion loop. Fixed controllers remain available when
+    // auto tuning is explicitly disabled.
+    let selected_congestion_controller = if config.quic_auto_tune {
+        QuicCongestionController::Adaptive
+    } else {
+        config.quic_congestion_controller
+    };
     let congestion_controller: Arc<
         dyn noq_proto::congestion::ControllerFactory + Send + Sync + 'static,
-    > = match config.quic_congestion_controller {
+    > = match selected_congestion_controller {
         QuicCongestionController::Cubic => Arc::new(CubicConfig::default()),
         QuicCongestionController::Bbr3 => Arc::new(Bbr3Config::default()),
         QuicCongestionController::Passthrough => Arc::new(PassthroughControllerConfig {
@@ -3320,7 +3411,12 @@ async fn build_endpoint(
         }),
         QuicCongestionController::Adaptive => Arc::new(AdaptiveTunnelControllerConfig {
             window: config.quic_passthrough_window_bytes,
-            initial_rate: config.quic_adaptive_initial_mbps.saturating_mul(125_000),
+            initial_rate: if config.quic_auto_tune {
+                config.quic_adaptive_min_mbps
+            } else {
+                config.quic_adaptive_initial_mbps
+            }
+            .saturating_mul(125_000),
             min_rate: config.quic_adaptive_min_mbps.saturating_mul(125_000),
             max_rate: config.quic_adaptive_max_mbps.saturating_mul(125_000),
             loss_backoff_bps: config.quic_adaptive_loss_backoff_bps,
@@ -7683,6 +7779,10 @@ mod tests {
         let mut controller = AdaptiveTunnelController {
             config,
             pacing_rate: 100_000_000,
+            flight_window: 16 * 1024 * 1024,
+            acked_since_sample: 0,
+            sample_started: None,
+            delivery_rate: 0,
         };
         noq_proto::congestion::Controller::on_end_acks(
             &mut controller,
@@ -7705,7 +7805,19 @@ mod tests {
         assert!(controller.pacing_rate >= 50_000_000);
         assert_eq!(
             noq_proto::congestion::Controller::window(&controller),
-            16 * 1024 * 1024
+            16 * 1024 * 1024 * controller.pacing_rate / 100_004_096
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_window_respects_small_operator_cap() {
+        assert_eq!(
+            adaptive_flight_window(125_000_000, Duration::from_millis(100), 64 * 1024),
+            64 * 1024
+        );
+        assert_eq!(
+            adaptive_flight_window(125_000, Duration::from_millis(1), 16 * 1024 * 1024),
+            256 * 1024
         );
     }
 

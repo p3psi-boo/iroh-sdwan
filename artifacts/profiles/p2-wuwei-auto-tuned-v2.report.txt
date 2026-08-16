@@ -6,7 +6,7 @@
 # Samples: 1K of event 'cycles:P'
 # Event count (approx.): 9433087135
 #
-# Overhead  Command          Shared Object         Symbol                                                                                                                                                                                                                                                                                                                           
+# Overhead  Command          Shared Object         Symbol
 # ........  ...............  ....................  .................................................................................................................................................................................................................................................................................................................................
 #
      6.60%  tokio-rt-worker  ironetd               [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
@@ -14,7 +14,7 @@
             ---ring_core_0_17_14__chacha20_poly1305_seal_avx2
 
      4.42%  tokio-rt-worker  ironetd               [.] memcpy
-            |          
+            |
              --4.21%--memcpy
 
      1.81%  tokio-rt-worker  ironetd               [.] noq_proto::connection::Connection::poll_transmit
@@ -22,9 +22,9 @@
             ---noq_proto::connection::Connection::poll_transmit
 
      1.41%  tokio-rt-worker  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
-            |          
+            |
              --1.13%--entry_SYSRETQ_unsafe_stack
-                       |          
+                       |
                         --0.94%--sccp
 
      1.32%  tokio-rt-worker  ironetd               [.] noq_proto::connection::Connection::populate_packet
@@ -34,7 +34,7 @@
      1.30%  tokio-rt-worker  [kernel.kallsyms]     [k] clflush_cache_range
             |
             ---clflush_cache_range
-               |          
+               |
                 --1.20%--intel_iommu_map_pages
                           __iommu_map
                           iommu_map
@@ -68,7 +68,7 @@
      0.90%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_to_iter
             |
             ---_copy_to_iter
-               |          
+               |
                 --0.73%--__skb_datagram_iter
                           skb_copy_datagram_iter
                           tun_do_read
@@ -81,7 +81,7 @@
                           0x1
 
      0.82%  tokio-rt-worker  ironetd               [.] tokio::runtime::scheduler::multi_thread::worker::run
-            |          
+            |
              --0.78%--tokio::runtime::scheduler::multi_thread::worker::run
 
      0.79%  tokio-rt-worker  [kernel.kallsyms]     [k] _copy_from_iter
