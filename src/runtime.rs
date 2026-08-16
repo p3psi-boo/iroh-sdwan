@@ -24,8 +24,9 @@ use iroh::{
     },
 };
 use n0_watcher::Watcher as _;
-use noq_proto::congestion::Bbr3Config;
+use noq_proto::congestion::CubicConfig;
 use rustc_hash::FxHashMap;
+use rustls::{CipherSuite, crypto::CryptoProvider};
 use tokio::{
     sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot},
     task::JoinSet,
@@ -2896,13 +2897,17 @@ async fn build_endpoint(
 ) -> Result<Endpoint> {
     let configured_relays = config.inherited_peer_relays()?;
     let relay_mode = iroh_relay_mode(config, configured_relays);
-    // Keep BBR3's MTU-scaled initial window until a path has a measured BDP.
+    // Keep CUBIC's MTU-scaled initial window until a path has a measured BDP.
     // A fixed 512 KiB startup burst represents more than four seconds of data
     // on a 1 Mbit/s WAN and makes loss recovery dominate initial convergence.
-    let bbr3 = Bbr3Config::default();
+    // noq's BBR3 currently leaves a long-lived, low-RTT QUIC path at a reduced
+    // window after a short UDP loss burst; repeated saturation then decays even
+    // though the underlay has recovered. CUBIC recovered between runs in the
+    // same profile and raised stable throughput without enlarging startup.
+    let cubic = CubicConfig::default();
     let path_idle_timeout = quic_path_idle_timeout(&config.relay);
     let transport = QuicTransportConfig::builder()
-        .congestion_controller_factory(Arc::new(bbr3))
+        .congestion_controller_factory(Arc::new(cubic))
         .initial_rtt(Duration::from_millis(100))
         // noq's periodic DPLPMTUD probe currently tears down the only direct
         // path on some symmetric-NAT/GSO combinations. Start at the proven
@@ -2956,6 +2961,7 @@ async fn build_endpoint(
         vec![alpn.to_vec()]
     };
     let mut builder = Endpoint::builder(presets::N0)
+        .crypto_provider(dataplane_crypto_provider())
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
@@ -2976,6 +2982,30 @@ async fn build_endpoint(
         builder = builder.add_custom_transport(transport);
     }
     builder.bind().await.context("failed to bind iroh endpoint")
+}
+
+/// Prefer ChaCha20 for QUIC payload protection while retaining AES-GCM for
+/// QUIC initial packets and interoperability.
+///
+/// A peer may expose AES-NI without PCLMULQDQ (notably older/default QEMU CPU
+/// models). ring then combines AES assembly with its scalar GHASH fallback;
+/// production profiles showed that pair consuming roughly 30% of all sender
+/// CPU and capping one direct overlay near 370 Mbit/s. rustls servers honor the
+/// client's suite order by default, so every endpoint must advertise ChaCha20
+/// first rather than trying to make a local CPU-only choice. On modern x86 and
+/// ARM, ring's vectorized ChaCha20 remains comfortably above the WAN rates this
+/// dataplane targets.
+fn dataplane_crypto_provider() -> Arc<CryptoProvider> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .sort_by_key(|suite| match suite.suite() {
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 0,
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => 1,
+            CipherSuite::TLS13_AES_256_GCM_SHA384 => 2,
+            _ => 3,
+        });
+    Arc::new(provider)
 }
 
 fn iroh_relay_mode(config: &Config, configured_relays: Vec<RelayUrl>) -> RelayMode {
@@ -6526,6 +6556,20 @@ mod tests {
             &TransportAddr::Ip("192.168.10.2:4000".parse().unwrap()),
             &hidden,
         ));
+    }
+
+    #[test]
+    fn dataplane_prefers_chacha_without_removing_quic_initial_aes() {
+        let suites = dataplane_crypto_provider()
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suites.first(),
+            Some(&CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+        );
+        assert!(suites.contains(&CipherSuite::TLS13_AES_128_GCM_SHA256));
     }
 
     #[test]
