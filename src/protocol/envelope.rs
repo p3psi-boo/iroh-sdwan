@@ -119,7 +119,10 @@ pub fn write_header(out: &mut BytesMut, kind: MessageType, flags: u16, header_le
 /// Patch a header into bytes that already contain the payload at
 /// `payload_start`. Used by the single-datagram in-place path.
 pub fn write_header_at(dest: &mut [u8], kind: MessageType, flags: u16) -> Result<()> {
-    ensure!(dest.len() >= HEADER_LEN, "envelope header destination is too small");
+    ensure!(
+        dest.len() >= HEADER_LEN,
+        "envelope header destination is too small"
+    );
     dest[..4].copy_from_slice(MAGIC);
     dest[4..6].copy_from_slice(&(kind as u16).to_be_bytes());
     dest[6..8].copy_from_slice(&flags.to_be_bytes());
@@ -156,6 +159,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn unknown_messages_are_rejected_without_parsing_payload() {
         let mut bytes = Envelope::new(MessageType::Heartbeat, Bytes::new())
             .encode()

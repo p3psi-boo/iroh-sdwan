@@ -106,7 +106,10 @@ impl OverlayTunnelQueueWriter {
     }
 
     pub async fn send_slices(&mut self, packets: &[&[u8]]) -> std::io::Result<usize> {
-        let mut buffers = packets.iter().map(|packet| attach_virtio_copy(packet)).collect::<Vec<_>>();
+        let mut buffers = packets
+            .iter()
+            .map(|packet| attach_virtio_copy(packet))
+            .collect::<Vec<_>>();
         self.device
             .send_multiple(&mut self.gro_table, &mut buffers, VIRTIO_NET_HDR_LEN)
             .await
@@ -119,19 +122,28 @@ impl OverlayTunnelQueueWriter {
     }
 }
 
-pub fn tun_read_pool() -> PacketSlotPool {
-    PacketSlotPool::new(tun_rs::IDEAL_BATCH_SIZE, OVERLAY_HEADER_HEADROOM)
+pub fn tun_read_pool(mtu: u16) -> PacketSlotPool {
+    PacketSlotPool::with_small_payload(
+        tun_rs::IDEAL_BATCH_SIZE,
+        OVERLAY_HEADER_HEADROOM,
+        usize::from(mtu),
+    )
 }
 
 /// Place a virtio-net header in unused prefix bytes when the packet is unique.
 pub fn attach_virtio(packet: DataplaneBuf) -> BytesMut {
     const HDR: usize = VIRTIO_NET_HDR_LEN;
-    if packet.can_prepend(HDR)
-        && let Ok(sealed) = packet.clone().try_prepend(&[0_u8; HDR])
-        && let Ok(mut unique) = sealed.try_into_mut()
-    {
-        unique[..HDR].fill(0);
-        return unique;
+    if packet.can_prepend(HDR) {
+        match packet.try_prepend(&[0_u8; HDR]) {
+            Ok(sealed) => match sealed.try_into_mut() {
+                Ok(mut unique) => {
+                    unique[..HDR].fill(0);
+                    return unique;
+                }
+                Err(sealed) => return attach_virtio_copy(&sealed[HDR..]),
+            },
+            Err(packet) => return attach_virtio_copy(packet.as_slice()),
+        }
     }
     attach_virtio_copy(packet.as_slice())
 }
@@ -159,8 +171,9 @@ mod tests {
 
     #[test]
     fn tun_read_pool_is_not_all_jumbo() {
-        let pool = tun_read_pool();
+        let pool = tun_read_pool(9_000);
         assert!(pool.large_slot_count() < pool.slot_count());
         assert_eq!(pool.headroom(), OVERLAY_HEADER_HEADROOM);
+        assert_eq!(pool.slot_payload_capacity(pool.large_slot_count()), 9_000);
     }
 }

@@ -25,12 +25,14 @@ use iroh::{
 };
 use n0_watcher::Watcher as _;
 use noq_proto::congestion::Bbr3Config;
+use rustc_hash::FxHashMap;
 use tokio::{
     sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tun_rs::{AsyncDevice, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+use tun_rs::AsyncDevice;
 
 use crate::{
     address::{
@@ -55,11 +57,10 @@ use crate::{
     },
     derp::{DerpAddr, DerpTransport, identity::load_or_create, tls_config},
     fec::{EncodedDatagram, FecDecoder, FecEncoder},
-    flow_router::{FlowRouter, RouteCandidate, RouteId},
+    flow_router::{FlowRouter, FlowRouterConfig, RouteCandidate, RouteId},
     link_metrics::{LinkEstimator, LinkMetrics},
     mesh::{
-        EVALUATION_INTERVAL, MESH_BUFFER_POOL_BUDGET_BYTES, MeshPlanner, MeshRuntime, PathKind,
-        ProbeObservation, SignedPresence,
+        EVALUATION_INTERVAL, MeshPlanner, MeshRuntime, PathKind, ProbeObservation, SignedPresence,
     },
     observability::{
         CapacityObservability, FlowRouterCounters, PeerCounters, RuntimeState, log_runtime_started,
@@ -90,6 +91,13 @@ use crate::{
         encode_repair_request,
     },
 };
+
+mod dispatch;
+mod prefix;
+#[cfg(test)]
+use dispatch::flow_shard;
+use dispatch::{InboundDispatcher, RouteDispatcher};
+use prefix::{IpPrefixSet, PrefixOwnerTable};
 
 // Keep noq's non-preemptible FIFO smaller than a short interactive burst.
 // Large TUN super-packets remain in the application scheduler between wire
@@ -172,127 +180,6 @@ struct RouteRequest {
     delivery_tag: Option<DeliveryTag>,
 }
 
-#[derive(Clone)]
-struct InboundDispatcher {
-    senders: Arc<Vec<mpsc::Sender<InboundPacket>>>,
-}
-
-impl InboundDispatcher {
-    fn new(senders: Vec<mpsc::Sender<InboundPacket>>) -> Self {
-        assert!(!senders.is_empty(), "at least one inbound shard is required");
-        Self {
-            senders: Arc::new(senders),
-        }
-    }
-
-    fn shard_for(&self, packet: PacketInfo) -> usize {
-        flow_shard(packet, self.senders.len())
-    }
-
-    async fn send(&self, packet: InboundPacket) -> Result<()> {
-        let shard = self.shard_for(packet.packet_info);
-        self.senders[shard]
-            .send(packet)
-            .await
-            .context("inbound shard queue closed")
-    }
-}
-
-#[derive(Clone)]
-struct RouteDispatcher {
-    senders: Arc<Vec<mpsc::Sender<RouteRequest>>>,
-}
-
-impl RouteDispatcher {
-    fn new(senders: Vec<mpsc::Sender<RouteRequest>>) -> Self {
-        assert!(
-            !senders.is_empty(),
-            "at least one FlowRouter shard is required"
-        );
-        Self {
-            senders: Arc::new(senders),
-        }
-    }
-
-    fn shard_count(&self) -> usize {
-        self.senders.len()
-    }
-
-    fn shard_for(&self, packet: PacketInfo) -> usize {
-        flow_shard(packet, self.senders.len())
-    }
-
-    async fn send_batch(&self, requests: &mut Vec<RouteRequest>) -> Result<()> {
-        let mut scratch = (0..self.senders.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        self.send_batch_with_scratch(requests, &mut scratch).await
-    }
-
-    async fn send_batch_with_scratch(
-        &self,
-        requests: &mut Vec<RouteRequest>,
-        by_shard: &mut [Vec<RouteRequest>],
-    ) -> Result<()> {
-        if requests.is_empty() {
-            return Ok(());
-        }
-        debug_assert_eq!(by_shard.len(), self.senders.len());
-        for bucket in by_shard.iter_mut() {
-            bucket.clear();
-        }
-        for request in requests.drain(..) {
-            by_shard[self.shard_for(request.packet_info)].push(request);
-        }
-        for (sender, shard) in self.senders.iter().zip(by_shard.iter_mut()) {
-            while !shard.is_empty() {
-                let count = shard.len().min(FLOW_DISPATCH_QUEUE);
-                let permits = sender
-                    .reserve_many(count)
-                    .await
-                    .context("FlowRouter request queue closed")?;
-                for (permit, request) in permits.zip(shard.drain(..count)) {
-                    permit.send(request);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn flow_shard(packet: PacketInfo, shards: usize) -> usize {
-    debug_assert!(shards > 0);
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let mut mix_u64 = |value: u64| {
-        hash ^= value;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    let mut mix_bytes = |bytes: &[u8]| {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in chunks.by_ref() {
-            mix_u64(u64::from_ne_bytes(chunk.try_into().unwrap()));
-        }
-        let rest = chunks.remainder();
-        if !rest.is_empty() {
-            let mut tail = [0_u8; 8];
-            tail[..rest.len()].copy_from_slice(rest);
-            mix_u64(u64::from_ne_bytes(tail));
-        }
-    };
-    match packet.source {
-        std::net::IpAddr::V4(address) => mix_bytes(&address.octets()),
-        std::net::IpAddr::V6(address) => mix_bytes(&address.octets()),
-    }
-    match packet.destination {
-        std::net::IpAddr::V4(address) => mix_bytes(&address.octets()),
-        std::net::IpAddr::V6(address) => mix_bytes(&address.octets()),
-    }
-    mix_bytes(&[packet.protocol]);
-    mix_bytes(&packet.source_port.unwrap_or_default().to_be_bytes());
-    mix_bytes(&packet.destination_port.unwrap_or_default().to_be_bytes());
-    (hash as usize) % shards
-}
-
 /// One encoded application transmission that may be suspended between wire
 /// datagrams while urgent traffic runs.  This is deliberately sender-local:
 /// FlowRouter keeps no persistent Bulk/Interactive mode, and a suspended bulk
@@ -316,6 +203,13 @@ enum TransmissionOutcome {
     Preempted(OutboundItem),
     Reframe,
     Failed,
+}
+
+fn data_committed_before_recovery_failure(
+    failed_recovery: bool,
+    queued: &VecDeque<EncodedDatagram>,
+) -> bool {
+    failed_recovery && queued.iter().all(|datagram| datagram.recovery)
 }
 
 #[derive(Debug)]
@@ -862,146 +756,6 @@ struct RouteChoice {
     capacity: CapacitySnapshot,
 }
 
-/// Immutable prefix-membership index used by the packet-policy hot path.
-/// Lookup cost depends on the number of distinct prefix lengths, not on the
-/// number of advertised routes, and every FlowRouter shard shares one Arc
-/// generation without taking a mesh/control-plane lock.
-#[derive(Debug, Default)]
-struct IpPrefixSet {
-    v4: HashSet<(u8, u32)>,
-    v6: HashSet<(u8, u128)>,
-    v4_lengths: Vec<u8>,
-    v6_lengths: Vec<u8>,
-}
-
-impl IpPrefixSet {
-    fn from_prefixes(prefixes: impl IntoIterator<Item = IpNet>) -> Self {
-        let mut set = Self::default();
-        for prefix in prefixes {
-            match prefix {
-                IpNet::V4(prefix) => {
-                    let length = prefix.prefix_len();
-                    set.v4
-                        .insert((length, mask_v4(u32::from(prefix.network()), length)));
-                }
-                IpNet::V6(prefix) => {
-                    let length = prefix.prefix_len();
-                    set.v6
-                        .insert((length, mask_v6(u128::from(prefix.network()), length)));
-                }
-            }
-        }
-        set.v4_lengths = set.v4.iter().map(|(length, _)| *length).collect();
-        set.v4_lengths
-            .sort_unstable_by(|left, right| right.cmp(left));
-        set.v4_lengths.dedup();
-        set.v6_lengths = set.v6.iter().map(|(length, _)| *length).collect();
-        set.v6_lengths
-            .sort_unstable_by(|left, right| right.cmp(left));
-        set.v6_lengths.dedup();
-        set
-    }
-
-    fn contains(&self, address: IpAddr) -> bool {
-        match address {
-            IpAddr::V4(address) => {
-                let address = u32::from(address);
-                self.v4_lengths
-                    .iter()
-                    .any(|length| self.v4.contains(&(*length, mask_v4(address, *length))))
-            }
-            IpAddr::V6(address) => {
-                let address = u128::from(address);
-                self.v6_lengths
-                    .iter()
-                    .any(|length| self.v6.contains(&(*length, mask_v6(address, *length))))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct PrefixOwnerTable {
-    v4: HashMap<(u8, u32), EndpointId>,
-    v6: HashMap<(u8, u128), EndpointId>,
-    v4_lengths: Vec<u8>,
-    v6_lengths: Vec<u8>,
-}
-
-impl PrefixOwnerTable {
-    fn from_origins(origins: impl IntoIterator<Item = (EndpointId, IpNet)>) -> Self {
-        let mut table = Self::default();
-        for (owner, prefix) in origins {
-            match prefix {
-                IpNet::V4(prefix) => {
-                    let length = prefix.prefix_len();
-                    table.v4.insert(
-                        (length, mask_v4(u32::from(prefix.network()), length)),
-                        owner,
-                    );
-                    table.v4_lengths.push(length);
-                }
-                IpNet::V6(prefix) => {
-                    let length = prefix.prefix_len();
-                    table.v6.insert(
-                        (length, mask_v6(u128::from(prefix.network()), length)),
-                        owner,
-                    );
-                    table.v6_lengths.push(length);
-                }
-            }
-        }
-        table
-            .v4_lengths
-            .sort_unstable_by(|left, right| right.cmp(left));
-        table.v4_lengths.dedup();
-        table
-            .v6_lengths
-            .sort_unstable_by(|left, right| right.cmp(left));
-        table.v6_lengths.dedup();
-        table
-    }
-
-    fn owner(&self, address: std::net::IpAddr) -> Option<EndpointId> {
-        match address {
-            std::net::IpAddr::V4(address) => {
-                let address = u32::from(address);
-                self.v4_lengths
-                    .iter()
-                    .find_map(|length| self.v4.get(&(*length, mask_v4(address, *length))).copied())
-            }
-            std::net::IpAddr::V6(address) => {
-                let address = u128::from(address);
-                self.v6_lengths
-                    .iter()
-                    .find_map(|length| self.v6.get(&(*length, mask_v6(address, *length))).copied())
-            }
-        }
-    }
-}
-
-fn mask_v4(address: u32, prefix_len: u8) -> u32 {
-    if prefix_len == 0 {
-        0
-    } else {
-        address
-            & u32::MAX
-                .checked_shl(u32::from(32 - prefix_len))
-                .unwrap_or(0)
-    }
-}
-
-fn mask_v6(address: u128, prefix_len: u8) -> u128 {
-    if prefix_len == 0 {
-        0
-    } else {
-        address
-            & u128::MAX
-                .checked_shl(u32::from(128 - prefix_len))
-                .unwrap_or(0)
-    }
-}
-
 struct RouteAdjacencySnapshot {
     input: AdjacencyRouteInput,
     direct_capacity: CapacitySnapshot,
@@ -1015,8 +769,8 @@ struct DataPlaneRouteSnapshot {
     local_prefixes: IpPrefixSet,
     remote_prefixes: IpPrefixSet,
     adjacencies: Vec<RouteAdjacencySnapshot>,
-    adjacency_by_owner: HashMap<EndpointId, usize>,
-    capacities: HashMap<RouteKey, CapacitySnapshot>,
+    adjacency_by_owner: FxHashMap<EndpointId, usize>,
+    capacities: FxHashMap<RouteKey, CapacitySnapshot>,
     max_egress_bps: Option<u64>,
 }
 
@@ -1293,7 +1047,6 @@ async fn run_data_plane(
         tasks.spawn(async move {
             inbound_to_router_shard(
                 config,
-                shard,
                 tunnel_writer,
                 inbound_rx,
                 route_dispatcher,
@@ -1304,8 +1057,7 @@ async fn run_data_plane(
             .await
         });
     }
-    for route_rx in route_receivers {
-        let max_egress_bps = config.routing.max_egress_bps();
+    for (router_shard, route_rx) in route_receivers.into_iter().enumerate() {
         let route_snapshot_rx = route_snapshot_rx.clone();
         let route_estimates = route_estimates.clone();
         let delivery = delivery.clone();
@@ -1313,7 +1065,10 @@ async fn run_data_plane(
         let flow_router_counters = flow_router_counters.clone();
         tasks.spawn(async move {
             run_flow_router(
-                max_egress_bps,
+                FlowRouterConfig::default().max_flows / router_shards
+                    + usize::from(
+                        router_shard < FlowRouterConfig::default().max_flows % router_shards,
+                    ),
                 route_snapshot_rx,
                 route_estimates,
                 delivery,
@@ -1434,27 +1189,25 @@ async fn run_data_plane(
 async fn tunnel_to_router(
     name: String,
     device: Arc<AsyncDevice>,
-    _mtu: u16,
+    mtu: u16,
     read_shard: usize,
     dispatcher: RouteDispatcher,
 ) -> Result<()> {
     let mut original = vec![0_u8; tun_rs::VIRTIO_NET_HDR_LEN + usize::from(u16::MAX)];
-    let mut pool = tun_read_pool();
-    let mut slot_refs = Vec::with_capacity(pool.slot_count());
+    let mut pool = tun_read_pool(mtu);
     let mut sizes = vec![0_usize; pool.slot_count()];
     let mut route_batch = Vec::with_capacity(pool.slot_count());
     let mut dispatch_scratch = (0..dispatcher.shard_count())
         .map(|_| Vec::new())
         .collect::<Vec<_>>();
     loop {
-        pool.fill_batch(&mut slot_refs);
+        let headroom = pool.headroom();
         let count = device
-            .recv_multiple(&mut original, &mut slot_refs, &mut sizes, pool.headroom())
+            .recv_multiple(&mut original, pool.slots_mut(), &mut sizes, headroom)
             .await
             .with_context(|| format!("failed reading {name} queue {read_shard}"))?;
-        slot_refs.clear();
-        for index in 0..count {
-            let packet = pool.take(index, sizes[index]);
+        for (index, payload_len) in sizes.iter().copied().enumerate().take(count) {
+            let packet = pool.take(index, payload_len);
             let packet_info = match inspect_ip_packet(packet.as_slice()) {
                 Ok(info) => info,
                 Err(error) => {
@@ -1477,7 +1230,6 @@ async fn tunnel_to_router(
 
 async fn inbound_to_router_shard(
     config: Config,
-    shard: usize,
     mut tunnel_writer: Option<OverlayTunnelQueueWriter>,
     mut inbound_rx: mpsc::Receiver<InboundPacket>,
     route_dispatcher: RouteDispatcher,
@@ -1488,6 +1240,7 @@ async fn inbound_to_router_shard(
     let mut inbound_batch = Vec::with_capacity(INBOUND_ROUTER_BATCH);
     let mut local = Vec::with_capacity(INBOUND_ROUTER_BATCH);
     let mut tun_buffers = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+    let mut local_delivery = Vec::with_capacity(INBOUND_ROUTER_BATCH);
     let mut transit = Vec::with_capacity(INBOUND_ROUTER_BATCH);
     let mut dispatch_scratch = (0..route_dispatcher.shard_count())
         .map(|_| Vec::new())
@@ -1571,20 +1324,21 @@ async fn inbound_to_router_shard(
             && !local.is_empty()
         {
             tun_buffers.clear();
-            for inbound in &local {
-                tun_buffers.push(attach_virtio(inbound.packet.clone()));
+            local_delivery.clear();
+            for inbound in local.drain(..) {
+                local_delivery.push((inbound.delivery_tag, inbound.packet.len()));
+                tun_buffers.push(attach_virtio(inbound.packet));
             }
             writer
                 .send_owned(&mut tun_buffers)
                 .await
                 .context("failed injecting inbound packet batch into FlowRouter TUN")?;
-            for inbound in local.drain(..) {
-                let Some(tag) = inbound.delivery_tag else {
+            for (delivery_tag, packet_len) in local_delivery.drain(..) {
+                let Some(tag) = delivery_tag else {
                     continue;
                 };
                 if !registered_delivery_sessions.contains(&tag.session_id) {
-                    let Some(registration) =
-                        delivery_fast.forwarding_registration(tag.session_id)
+                    let Some(registration) = delivery_fast.forwarding_registration(tag.session_id)
                     else {
                         continue;
                     };
@@ -1597,7 +1351,7 @@ async fn inbound_to_router_shard(
                     registered_delivery_sessions.insert(tag.session_id);
                 }
                 delivery_fast.touch_forwarding(tag.session_id);
-                let report = delivery_receiver.observe(tag, inbound.packet.len(), batch_now);
+                let report = delivery_receiver.observe(tag, packet_len, batch_now);
                 if let Some(report) = report {
                     let _ = capacity_tx.try_send(CapacityEvent::Delivered { report });
                 }
@@ -1606,7 +1360,6 @@ async fn inbound_to_router_shard(
         route_dispatcher
             .send_batch_with_scratch(&mut transit, &mut dispatch_scratch)
             .await?;
-        let _ = shard;
     }
     bail!("inbound packet queue closed")
 }
@@ -1650,7 +1403,8 @@ async fn build_route_snapshot(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut adjacencies = Vec::with_capacity(peers.len());
-    let mut adjacency_by_owner = HashMap::with_capacity(peers.len());
+    let mut adjacency_by_owner = FxHashMap::default();
+    adjacency_by_owner.reserve(peers.len());
     for peer in peers {
         let metrics = peer
             .link_estimator
@@ -1690,7 +1444,10 @@ async fn build_route_snapshot(
         remote_prefixes,
         adjacencies,
         adjacency_by_owner,
-        capacities: estimates.snapshot_all(now, config.routing.max_egress_bps()),
+        capacities: estimates
+            .snapshot_all(now, config.routing.max_egress_bps())
+            .into_iter()
+            .collect(),
         max_egress_bps: config.routing.max_egress_bps(),
     }
 }
@@ -1752,7 +1509,7 @@ fn direct_route_choice(
 }
 
 async fn run_flow_router(
-    max_egress_bps: Option<u64>,
+    max_flows: usize,
     mut route_snapshots: tokio::sync::watch::Receiver<Arc<DataPlaneRouteSnapshot>>,
     route_estimates: Arc<StdRwLock<RouteEstimateTable>>,
     delivery: Arc<StdMutex<DeliveryCoordinator>>,
@@ -1760,7 +1517,10 @@ async fn run_flow_router(
     counters: Arc<FlowRouterCounters>,
     mut requests: mpsc::Receiver<RouteRequest>,
 ) -> Result<()> {
-    let mut router = FlowRouter::default();
+    let mut router = FlowRouter::new(FlowRouterConfig {
+        max_flows,
+        ..FlowRouterConfig::default()
+    });
     let mut published_active_flows = 0_usize;
     let mut active_snapshot = route_snapshots.borrow_and_update().clone();
     let route_switch_log_events = AtomicU64::new(0);
@@ -1780,6 +1540,7 @@ async fn run_flow_router(
             active_snapshot = route_snapshots.borrow_and_update().clone();
         }
         let batch_now = Instant::now();
+        router.maintain(batch_now);
         for request in request_batch.drain(..) {
             let packet_info = request.packet_info;
             let snapshot = active_snapshot.as_ref();
@@ -1953,8 +1714,7 @@ async fn run_flow_router(
                     first_hop: selected_endpoint,
                 };
                 let path_epoch = peer.path_epoch.load(Ordering::Relaxed);
-                let queue_nonempty =
-                    !latency_sensitive || peer.outbound.queued_bytes() > 0;
+                let queue_nonempty = !latency_sensitive || peer.outbound.queued_bytes() > 0;
                 if let Some(tag) = delivery_fast.next_source_tag(route, path_epoch, queue_nonempty)
                 {
                     DeliveryTagState {
@@ -1991,7 +1751,7 @@ async fn run_flow_router(
                 // retry session renewal on later data.
                 let session_id = registration.session_id;
                 let registered =
-                    queue_delivery_message(&peer, DeliveryMessage::Register(registration)).await;
+                    queue_delivery_message(peer, DeliveryMessage::Register(registration)).await;
                 if !registered {
                     delivery_state.tag = None;
                     delivery_fast.remove_source_session(session_id);
@@ -2975,6 +2735,7 @@ fn fill_route_candidates_from_snapshot(
     }
 }
 
+#[cfg(test)]
 fn fill_route_candidates(
     choices: &mut Vec<RouteChoice>,
     owner: Option<EndpointId>,
@@ -3840,7 +3601,6 @@ struct Peer {
     endpoint: Endpoint,
     alpn: Arc<Vec<u8>>,
     session_policy: SessionPolicy,
-    negotiated_session: StdRwLock<Option<NegotiatedSession>>,
     inbound_packets: InboundDispatcher,
     capacity_events: mpsc::Sender<CapacityEvent>,
     connection: ArcSwapOption<Connection>,
@@ -3848,6 +3608,10 @@ struct Peer {
     /// Serializes rare install/clear transitions. Packet transmission reads
     /// the active Arc through ArcSwap without a mutex or watch-channel guard.
     connection_update: StdMutex<()>,
+    /// Cancellation scope for every task belonging to the published
+    /// connection generation. Replacing the ArcSwap value retires the old
+    /// generation synchronously instead of waiting for each watcher to notice.
+    connection_tasks: StdMutex<ConnectionTaskGeneration>,
     dial_lock: Mutex<()>,
     reconnect_needed: Notify,
     shutdown_ready: Notify,
@@ -3869,6 +3633,7 @@ struct Peer {
     private_remote_addresses: Arc<Vec<std::net::SocketAddr>>,
     private_link_exclusive: bool,
     next_packet_id: AtomicU64,
+    buffer_budget: Arc<BufferBudget>,
     repair_cache: StdMutex<RepairCache>,
     reassembly_buffer_limit: usize,
     repair_buffer_limit: usize,
@@ -3887,6 +3652,36 @@ struct Peer {
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
     nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionTaskGeneration {
+    active: Option<(usize, CancellationToken)>,
+}
+
+impl ConnectionTaskGeneration {
+    fn replace(&mut self, stable_id: usize) -> CancellationToken {
+        if let Some((_, previous)) = self.active.take() {
+            previous.cancel();
+        }
+        let cancel = CancellationToken::new();
+        self.active = Some((stable_id, cancel.clone()));
+        cancel
+    }
+
+    fn cancel(&mut self, stable_id: Option<usize>) -> bool {
+        let matches = self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| stable_id.is_none_or(|expected| *active == expected));
+        if !matches {
+            return false;
+        }
+        if let Some((_, cancel)) = self.active.take() {
+            cancel.cancel();
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4024,26 +3819,30 @@ impl Peer {
         // One process-wide payload budget is shared by queue/reassembly/repair/FEC.
         // Mesh-off peers keep the 8 MiB BDP queue default instead of stacking
         // independent 32/16/32 MiB tables.
-        let budget = Some(BufferBudget::process_wide());
+        let buffer_budget = BufferBudget::process_wide();
         let outbound = Arc::new(if let Some(per_peer) = mesh_pool_per_peer {
             OutboundQueue::with_max_bytes_and_budget(
                 counters.clone(),
                 DEFAULT_QUEUE_BYTES.min(per_peer).min(OUTBOUND_QUEUE_BYTES),
-                budget,
+                Some(buffer_budget.clone()),
             )
         } else {
             OutboundQueue::with_max_bytes_and_budget(
                 counters.clone(),
                 DEFAULT_QUEUE_BYTES,
-                budget,
+                Some(buffer_budget.clone()),
             )
         });
         let reassembly_buffer_limit = mesh_pool_per_peer
-            .map_or(DEFAULT_REASSEMBLY_BYTES, |limit| limit.min(DEFAULT_REASSEMBLY_BYTES));
-        let repair_buffer_limit =
-            mesh_pool_per_peer.map_or(DEFAULT_REPAIR_BYTES, |limit| limit.min(DEFAULT_REPAIR_BYTES));
-        let fec_buffer_limit = mesh_pool_per_peer
-            .map_or(DEFAULT_FEC_DECODE_BYTES, |limit| limit.min(DEFAULT_FEC_DECODE_BYTES));
+            .map_or(DEFAULT_REASSEMBLY_BYTES, |limit| {
+                limit.min(DEFAULT_REASSEMBLY_BYTES)
+            });
+        let repair_buffer_limit = mesh_pool_per_peer.map_or(DEFAULT_REPAIR_BYTES, |limit| {
+            limit.min(DEFAULT_REPAIR_BYTES)
+        });
+        let fec_buffer_limit = mesh_pool_per_peer.map_or(DEFAULT_FEC_DECODE_BYTES, |limit| {
+            limit.min(DEFAULT_FEC_DECODE_BYTES)
+        });
         Ok(Self {
             name: peer.name.clone(),
             endpoint_id: peer.endpoint_id,
@@ -4076,12 +3875,12 @@ impl Peer {
                 local_invite_id: crate::product::local_invite_id(&config.identity_file),
                 authority_invites: crate::product::authority_invites(&config.identity_file),
             },
-            negotiated_session: StdRwLock::new(None),
             inbound_packets: services.inbound_packets,
             capacity_events: services.capacity_events,
             connection: ArcSwapOption::from(None),
             connection_updates: tokio::sync::watch::channel(0).0,
             connection_update: StdMutex::new(()),
+            connection_tasks: StdMutex::new(ConnectionTaskGeneration::default()),
             dial_lock: Mutex::new(()),
             reconnect_needed: Notify::new(),
             shutdown_ready: Notify::new(),
@@ -4113,7 +3912,11 @@ impl Peer {
             ),
             private_link_exclusive: link.is_some(),
             next_packet_id: AtomicU64::new(1),
-            repair_cache: StdMutex::new(RepairCache::with_max_bytes(repair_buffer_limit)),
+            buffer_budget: buffer_budget.clone(),
+            repair_cache: StdMutex::new(RepairCache::with_max_bytes_and_budget(
+                repair_buffer_limit,
+                Some(buffer_budget),
+            )),
             reassembly_buffer_limit,
             repair_buffer_limit,
             outbound,
@@ -4260,7 +4063,6 @@ impl Peer {
                     let Some(job) = self
                         .encode_transmission(
                             first,
-                            &connection,
                             maximum,
                             queue_max_age,
                             &mut outbound,
@@ -4306,7 +4108,6 @@ impl Peer {
     async fn encode_transmission(
         &self,
         first: OutboundPacket,
-        connection: &Connection,
         maximum: usize,
         queue_max_age: Duration,
         outbound: &mut OutboundConsumer,
@@ -4317,10 +4118,18 @@ impl Peer {
         // underlay loss; it only consumes the QUIC congestion window and can
         // head-of-line-block newer systematic datagrams.
         // 4 = DERP custom transport, published by the telemetry task.
-        let selected_is_derp = self.counters.selected_path_transport.load(Ordering::Relaxed) == 4;
+        let selected_is_derp = self
+            .counters
+            .selected_path_transport
+            .load(Ordering::Relaxed)
+            == 4;
         let fec_active = fec_encoder.is_some()
             && !selected_is_derp
-            && (self.counters.selected_path_transport.load(Ordering::Relaxed) != 0
+            && (self
+                .counters
+                .selected_path_transport
+                .load(Ordering::Relaxed)
+                != 0
                 || self.derp_transport.is_none());
         if !fec_active && let Some(encoder) = fec_encoder.as_mut() {
             let unprotected = encoder.reset();
@@ -4342,8 +4151,9 @@ impl Peer {
         };
 
         let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        let mut first = first;
         let (frames, _stats) = match encode_packet_from_buf(
-            &first.data,
+            &mut first.data,
             inner_maximum,
             packet_id,
             first.delivery_tag,
@@ -4368,7 +4178,9 @@ impl Peer {
         let mut packet_bytes = packets[0].data.len() as u64;
         let mut wire_frames = frames;
         if wire_frames.len() == 1 && packets[0].data.len() <= SMALL_PACKET_LIMIT {
-            self.counters.aggregation_delay_micros.store(0, Ordering::Relaxed);
+            self.counters
+                .aggregation_delay_micros
+                .store(0, Ordering::Relaxed);
             let wire_budget = inner_maximum.saturating_sub(16 + wire_frames[0].len());
             let additional = outbound.try_pop_small_batch_class(
                 latency_sensitive,
@@ -4378,10 +4190,10 @@ impl Peer {
                 64,
                 queue_max_age,
             );
-            for packet in additional {
+            for mut packet in additional {
                 let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
                 let (frame, _) = encode_packet_from_buf(
-                    &packet.data,
+                    &mut packet.data,
                     inner_maximum,
                     packet_id,
                     packet.delivery_tag,
@@ -4440,11 +4252,18 @@ impl Peer {
         outbound: &mut OutboundConsumer,
     ) -> TransmissionOutcome {
         while let Some(datagram) = job.datagrams.pop_front() {
+            let recovery = datagram.recovery;
             let frame = datagram.bytes;
             if connection
                 .max_datagram_size()
                 .is_some_and(|maximum| frame.len() > maximum)
             {
+                if recovery {
+                    self.counters
+                        .fec_unprotected_shards
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 return TransmissionOutcome::Reframe;
             }
             self.counters.quic_send_buffer_used_bytes.store(
@@ -4454,6 +4273,12 @@ impl Peer {
             );
             if let Err(error) = connection.send_datagram_wait(frame).await {
                 if error == SendDatagramError::TooLarge {
+                    if recovery {
+                        self.counters
+                            .fec_unprotected_shards
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     return TransmissionOutcome::Reframe;
                 }
                 if should_log(&self.counters.send_errors) {
@@ -4464,9 +4289,21 @@ impl Peer {
                         "failed sending datagram"
                     );
                 }
+                // Systematic data in this job has already committed when only
+                // parity remains. Requeueing it would create a new packet id
+                // and deliver the same IP packet twice merely because optional
+                // recovery traffic hit a closing/congested connection.
+                if data_committed_before_recovery_failure(recovery, &job.datagrams) {
+                    let skipped = 1 + job.datagrams.len() as u64;
+                    self.counters
+                        .fec_unprotected_shards
+                        .fetch_add(skipped, Ordering::Relaxed);
+                    job.datagrams.clear();
+                    return TransmissionOutcome::Complete;
+                }
                 return TransmissionOutcome::Failed;
             }
-            if datagram.recovery {
+            if recovery {
                 self.counters
                     .fec_tx_recovery_shards
                     .fetch_add(1, Ordering::Relaxed);
@@ -4833,16 +4670,11 @@ impl Peer {
             connection.close(0_u8.into(), b"canonical connection already active");
             return Ok(());
         }
-        let old = self
-            .connection
-            .swap(Some(Arc::new(connection.clone())))
-            .map(|connection| connection.as_ref().clone());
-        self.connection_updates.send_modify(|epoch| *epoch += 1);
-        drop(transition);
-        *self
-            .negotiated_session
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(negotiated.clone());
+        let generation_cancel = self
+            .connection_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(connection.stable_id());
         self.counters
             .protocol_major
             .store(u64::from(crate::protocol::MAJOR), Ordering::Relaxed);
@@ -4860,7 +4692,20 @@ impl Peer {
             .repair_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            RepairCache::with_max_bytes(self.repair_buffer_limit);
+            RepairCache::with_max_bytes_and_budget(
+                self.repair_buffer_limit,
+                Some(self.buffer_budget.clone()),
+            );
+        let old = self
+            .connection
+            .swap(Some(Arc::new(connection.clone())))
+            .map(|connection| connection.as_ref().clone());
+        self.connection_updates.send_modify(|epoch| *epoch += 1);
+        self.counters.connected.store(true, Ordering::Relaxed);
+        self.counters
+            .connection_events
+            .fetch_add(1, Ordering::Relaxed);
+        drop(transition);
         if let Some(old) = old
             && old.stable_id() != connection.stable_id()
         {
@@ -4874,19 +4719,18 @@ impl Peer {
             link_id = negotiated.link_id.as_deref().unwrap_or("public"),
             "peer connection active"
         );
-        self.counters.connected.store(true, Ordering::Relaxed);
-        self.counters
-            .connection_events
-            .fetch_add(1, Ordering::Relaxed);
         if let Some(mesh_runtime) = self.mesh_runtime.clone() {
             let control_connection = connection.clone();
             let endpoint_id = self.endpoint_id;
+            let control_cancel = generation_cancel.clone();
             tokio::spawn(async move {
-                if let Err(error) = mesh_runtime
-                    .run_connection(control_connection, endpoint_id)
-                    .await
-                {
-                    debug!(peer = %endpoint_id, %error, "mesh control loop ended");
+                tokio::select! {
+                    _ = control_cancel.cancelled() => {}
+                    result = mesh_runtime.run_connection(control_connection, endpoint_id) => {
+                        if let Err(error) = result {
+                            debug!(peer = %endpoint_id, %error, "mesh control loop ended");
+                        }
+                    }
                 }
             });
         }
@@ -4900,19 +4744,26 @@ impl Peer {
         let receive_connection = connection.clone();
         let receive_activity = last_overlay_receive_millis.clone();
         let receive_confirmed = overlay_receive_confirmed.clone();
+        let receive_cancel = generation_cancel.clone();
         tokio::spawn(async move {
             let stable_id = receive_connection.stable_id();
-            let mut fec_decoder =
-                FecDecoder::with_max_buffered_bytes(peer.fec_decoder_ttl, peer.fec_buffer_limit)
-                    .expect("validated FEC decoder configuration");
-            let mut reassembler =
-                Reassembler::with_max_buffered_bytes(peer.reassembly_buffer_limit);
+            let mut fec_decoder = FecDecoder::with_max_buffered_bytes_and_budget(
+                peer.fec_decoder_ttl,
+                peer.fec_buffer_limit,
+                Some(peer.buffer_budget.clone()),
+            )
+            .expect("validated FEC decoder configuration");
+            let mut reassembler = Reassembler::with_max_buffered_bytes_and_budget(
+                peer.reassembly_buffer_limit,
+                Some(peer.buffer_budget.clone()),
+            );
             let mut repair_tick = tokio::time::interval(Duration::from_millis(10));
             repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut repair_budget = 64_usize;
             let mut repair_refill = Instant::now() + Duration::from_secs(1);
             loop {
                 tokio::select! {
+                    _ = receive_cancel.cancelled() => break,
                     result = receive_connection.read_datagram() => match result {
                     Ok(datagram) => {
                         let decoded = match fec_decoder.push(datagram) {
@@ -5078,10 +4929,18 @@ impl Peer {
         if self.candidate_exchange_enabled {
             let peer = self.clone();
             let candidate_connection = connection.clone();
+            let candidate_cancel = generation_cancel.clone();
             tokio::spawn(async move {
                 let stable_id = candidate_connection.stable_id();
                 let mut address_updates = peer.endpoint.watch_addr().stream();
-                while address_updates.next().await.is_some() {
+                loop {
+                    let update = tokio::select! {
+                        _ = candidate_cancel.cancelled() => break,
+                        update = address_updates.next() => update,
+                    };
+                    if update.is_none() {
+                        break;
+                    }
                     let is_current = !peer.shutting_down.load(Ordering::Acquire)
                         && peer
                             .current_connection()
@@ -5102,20 +4961,24 @@ impl Peer {
                     // candidate view; bounded retries cover DATAGRAM loss
                     // without falling back to periodic gossip.
                     for attempt in 0..3 {
-                        if candidate_connection
-                            .send_datagram_wait(datagram.clone())
-                            .await
-                            .is_ok()
-                        {
+                        let sent = tokio::select! {
+                            _ = candidate_cancel.cancelled() => return,
+                            result = candidate_connection.send_datagram_wait(datagram.clone()) => result.is_ok(),
+                        };
+                        if sent {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                        tokio::select! {
+                            _ = candidate_cancel.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))) => {}
+                        }
                     }
                 }
             });
         }
         let peer = self.clone();
         let heartbeat_connection = connection.clone();
+        let heartbeat_cancel = generation_cancel.clone();
         tokio::spawn(async move {
             let stable_id = heartbeat_connection.stable_id();
             let mut heartbeat = tokio::time::interval(OVERLAY_HEARTBEAT_INTERVAL);
@@ -5124,7 +4987,10 @@ impl Peer {
             let mut last_transport_receive = Instant::now();
             heartbeat.tick().await;
             loop {
-                heartbeat.tick().await;
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => break,
+                    _ = heartbeat.tick() => {}
+                }
                 let is_current = !peer.shutting_down.load(Ordering::Acquire)
                     && peer
                         .current_connection()
@@ -5199,6 +5065,7 @@ impl Peer {
             }
         });
         let peer = self.clone();
+        let telemetry_cancel = generation_cancel;
         tokio::spawn(async move {
             let stable_id = connection.stable_id();
             let mut paths = connection.paths_stream();
@@ -5207,6 +5074,7 @@ impl Peer {
             let mut frame_sizer = AdaptiveFrameSizer::new(peer.frame_size_ceiling);
             loop {
                 tokio::select! {
+                    _ = telemetry_cancel.cancelled() => break,
                     snapshot = paths.next() => {
                         let Some(paths) = snapshot else {
                             break;
@@ -5395,6 +5263,10 @@ impl Peer {
             .is_some_and(|current| current.stable_id() == stable_id)
         {
             self.connection.store(None);
+            self.connection_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(Some(stable_id));
             self.connection_updates.send_modify(|epoch| *epoch += 1);
             self.mark_disconnected();
             if !self.shutting_down.load(Ordering::Acquire) {
@@ -5463,6 +5335,10 @@ impl Peer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let connection = self.connection.swap(None);
+            self.connection_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(None);
             self.connection_updates.send_modify(|epoch| *epoch += 1);
             connection
         };
@@ -5508,10 +5384,6 @@ fn is_relay_transport(address: &TransportAddr) -> bool {
         TransportAddr::Custom(custom) => DerpAddr::from_custom(custom).is_ok(),
         _ => false,
     }
-}
-
-fn is_derp_transport(address: &TransportAddr) -> bool {
-    matches!(address, TransportAddr::Custom(custom) if DerpAddr::from_custom(custom).is_ok())
 }
 
 fn quic_path_idle_timeout(relay: &RelayConfig) -> Duration {
@@ -5803,6 +5675,44 @@ mod tests {
 
     fn endpoint(byte: u8) -> EndpointId {
         SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn parity_failure_never_requeues_already_committed_data() {
+        let recovery = || EncodedDatagram {
+            bytes: Bytes::from_static(b"recovery"),
+            recovery: true,
+        };
+        let systematic = EncodedDatagram {
+            bytes: Bytes::from_static(b"systematic"),
+            recovery: false,
+        };
+        assert!(data_committed_before_recovery_failure(
+            true,
+            &VecDeque::from([recovery(), recovery()])
+        ));
+        assert!(!data_committed_before_recovery_failure(
+            false,
+            &VecDeque::from([recovery()])
+        ));
+        assert!(!data_committed_before_recovery_failure(
+            true,
+            &VecDeque::from([recovery(), systematic])
+        ));
+    }
+
+    #[test]
+    fn connection_generation_replacement_retires_only_the_matching_tasks() {
+        let mut generation = ConnectionTaskGeneration::default();
+        let first = generation.replace(10);
+        assert!(!first.is_cancelled());
+        let second = generation.replace(11);
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(!generation.cancel(Some(10)));
+        assert!(!second.is_cancelled());
+        assert!(generation.cancel(Some(11)));
+        assert!(second.is_cancelled());
     }
 
     #[test]

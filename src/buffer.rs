@@ -10,6 +10,7 @@ use std::sync::{
 };
 
 use bytes::{Bytes, BytesMut};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 /// Combined process-wide cap for outbound queues, fragment reassembly,
 /// selective repair, and FEC decode. Not four independent 64 MiB pools.
@@ -32,6 +33,21 @@ pub struct BufferBudget {
     max: u64,
 }
 
+/// RAII reservation against a [`BufferBudget`]. Keeping the reservation beside
+/// the allocation makes cancellation, queue destruction and task abortion
+/// release accounting automatically.
+#[derive(Debug)]
+pub struct BufferPermit {
+    budget: Arc<BufferBudget>,
+    bytes: usize,
+}
+
+impl Drop for BufferPermit {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 impl BufferBudget {
     pub fn process_wide() -> Arc<Self> {
         static BUDGET: std::sync::OnceLock<Arc<BufferBudget>> = std::sync::OnceLock::new();
@@ -47,7 +63,7 @@ impl BufferBudget {
         })
     }
 
-    pub fn try_reserve(&self, bytes: usize) -> bool {
+    fn try_reserve(&self, bytes: usize) -> bool {
         if bytes == 0 {
             return true;
         }
@@ -69,12 +85,19 @@ impl BufferBudget {
         }
     }
 
-    pub fn release(&self, bytes: usize) {
+    pub fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BufferPermit> {
+        self.try_reserve(bytes).then(|| BufferPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
+    fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        self.used
-            .fetch_sub((bytes as u64).min(self.used.load(Ordering::Relaxed)), Ordering::AcqRel);
+        let previous = self.used.fetch_sub(bytes as u64, Ordering::AcqRel);
+        debug_assert!(previous >= bytes as u64, "buffer budget underflow");
     }
 
     pub fn used(&self) -> u64 {
@@ -86,43 +109,144 @@ impl BufferBudget {
     }
 }
 
+#[derive(Debug)]
+struct RecyclingBuffer {
+    buf: BytesMut,
+    recycler: Option<Sender<BytesMut>>,
+}
+
+impl RecyclingBuffer {
+    fn freeze(mut self) -> Bytes {
+        let owner = FrozenRecyclingBuffer {
+            buf: std::mem::take(&mut self.buf),
+            recycler: self.recycler.take(),
+        };
+        Bytes::from_owner(owner)
+    }
+}
+
+impl Drop for RecyclingBuffer {
+    fn drop(&mut self) {
+        if let Some(recycler) = self.recycler.take() {
+            let _ = recycler.send(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FrozenRecyclingBuffer {
+    buf: BytesMut,
+    recycler: Option<Sender<BytesMut>>,
+}
+
+impl AsRef<[u8]> for FrozenRecyclingBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for FrozenRecyclingBuffer {
+    fn drop(&mut self) {
+        if let Some(recycler) = self.recycler.take() {
+            let _ = recycler.send(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BufferStorage {
+    Frozen(Bytes),
+    Recycling(RecyclingBuffer),
+}
+
+impl BufferStorage {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Frozen(buf) => buf,
+            Self::Recycling(buf) => &buf.buf,
+        }
+    }
+}
+
 /// IP packet sitting in an allocation that may still have unused prefix bytes.
-#[derive(Debug, Clone)]
+/// TUN-owned allocations carry a recycler through every zero-copy `Bytes`
+/// slice and return to the queue-local slab after the final reference drops.
+#[derive(Debug)]
 pub struct DataplaneBuf {
-    buf: Bytes,
+    storage: BufferStorage,
     offset: usize,
+}
+
+impl Clone for DataplaneBuf {
+    fn clone(&self) -> Self {
+        match &self.storage {
+            BufferStorage::Frozen(buf) => Self {
+                storage: BufferStorage::Frozen(buf.clone()),
+                offset: self.offset,
+            },
+            // Cloning a live mutable TUN slot is exceptional. Keep the
+            // original recyclable and detach only the requested clone.
+            BufferStorage::Recycling(buf) => Self {
+                storage: BufferStorage::Frozen(Bytes::copy_from_slice(&buf.buf)),
+                offset: self.offset,
+            },
+        }
+    }
+}
+
+impl Default for DataplaneBuf {
+    fn default() -> Self {
+        Self::from_bytes(Bytes::new())
+    }
 }
 
 impl DataplaneBuf {
     pub fn from_bytes(buf: Bytes) -> Self {
-        Self { buf, offset: 0 }
+        Self {
+            storage: BufferStorage::Frozen(buf),
+            offset: 0,
+        }
     }
 
     pub fn from_vec(buf: Vec<u8>) -> Self {
         Self {
-            buf: Bytes::from(buf),
+            storage: BufferStorage::Frozen(Bytes::from(buf)),
             offset: 0,
         }
     }
 
     pub fn from_static(bytes: &'static [u8]) -> Self {
         Self {
-            buf: Bytes::from_static(bytes),
+            storage: BufferStorage::Frozen(Bytes::from_static(bytes)),
             offset: 0,
         }
     }
 
     pub fn from_pooled(buf: Bytes, offset: usize) -> Self {
         debug_assert!(offset <= buf.len());
-        Self { buf, offset }
+        Self {
+            storage: BufferStorage::Frozen(buf),
+            offset,
+        }
+    }
+
+    fn from_recycling(buf: BytesMut, offset: usize, recycler: Sender<BytesMut>) -> Self {
+        debug_assert!(offset <= buf.len());
+        Self {
+            storage: BufferStorage::Recycling(RecyclingBuffer {
+                buf,
+                recycler: Some(recycler),
+            }),
+            offset,
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.buf[self.offset..]
+        &self.storage.as_slice()[self.offset..]
     }
 
     pub fn len(&self) -> usize {
-        self.buf.len().saturating_sub(self.offset)
+        self.storage.as_slice().len().saturating_sub(self.offset)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,14 +257,6 @@ impl DataplaneBuf {
         self.offset
     }
 
-    pub fn into_payload_bytes(self) -> Bytes {
-        self.buf.slice(self.offset..)
-    }
-
-    pub fn payload_bytes(&self) -> Bytes {
-        self.buf.slice(self.offset..)
-    }
-
     pub fn can_prepend(&self, header_len: usize) -> bool {
         self.offset >= header_len
     }
@@ -149,43 +265,60 @@ impl DataplaneBuf {
     /// covering header+payload without copying the payload. Fails when the
     /// allocation is shared or the prefix is too small.
     pub fn try_prepend(self, header: &[u8]) -> Result<Bytes, Self> {
-        if header.is_empty() {
-            return Ok(self.buf.slice(self.offset..));
-        }
         if self.offset < header.len() {
             return Err(self);
         }
         let start = self.offset - header.len();
-        let mut unique = match self.buf.try_into_mut() {
-            Ok(buf) => buf,
-            Err(buf) => {
-                return Err(Self {
-                    buf,
-                    offset: self.offset,
-                });
+        match self.storage {
+            BufferStorage::Frozen(buf) => {
+                if header.is_empty() {
+                    return Ok(buf.slice(self.offset..));
+                }
+                let mut unique = match buf.try_into_mut() {
+                    Ok(buf) => buf,
+                    Err(buf) => {
+                        return Err(Self {
+                            storage: BufferStorage::Frozen(buf),
+                            offset: self.offset,
+                        });
+                    }
+                };
+                unique[start..self.offset].copy_from_slice(header);
+                Ok(unique.freeze().slice(start..))
             }
-        };
-        unique[start..self.offset].copy_from_slice(header);
-        Ok(unique.freeze().slice(start..))
+            BufferStorage::Recycling(mut buf) => {
+                buf.buf[start..self.offset].copy_from_slice(header);
+                Ok(buf.freeze().slice(start..))
+            }
+        }
     }
 
     pub fn try_map_payload<E>(
         &mut self,
         update: impl FnOnce(&mut [u8]) -> Result<(), E>,
     ) -> Result<(), E> {
-        let buf = std::mem::replace(&mut self.buf, Bytes::new());
-        match buf.try_into_mut() {
-            Ok(mut unique) => {
-                let result = update(&mut unique[self.offset..]);
-                self.buf = unique.freeze();
-                result
-            }
-            Err(buf) => {
-                let mut copy = buf[self.offset..].to_vec();
-                let result = update(&mut copy);
-                self.buf = Bytes::from(copy);
-                self.offset = 0;
-                result
+        match &mut self.storage {
+            BufferStorage::Recycling(buf) => update(&mut buf.buf[self.offset..]),
+            BufferStorage::Frozen(_) => {
+                let storage =
+                    std::mem::replace(&mut self.storage, BufferStorage::Frozen(Bytes::new()));
+                let BufferStorage::Frozen(buf) = storage else {
+                    unreachable!();
+                };
+                match buf.try_into_mut() {
+                    Ok(mut unique) => {
+                        let result = update(&mut unique[self.offset..]);
+                        self.storage = BufferStorage::Frozen(unique.freeze());
+                        result
+                    }
+                    Err(buf) => {
+                        let mut copy = BytesMut::from(&buf[self.offset..]);
+                        let result = update(&mut copy);
+                        self.storage = BufferStorage::Frozen(copy.freeze());
+                        self.offset = 0;
+                        result
+                    }
+                }
             }
         }
     }
@@ -220,8 +353,12 @@ impl From<Vec<u8>> for DataplaneBuf {
 /// Mixed-size TUN read slots: a few 64 KiB GSO holders and many 4 KiB slots.
 #[derive(Debug)]
 pub struct PacketSlotPool {
-    small: Vec<BytesMut>,
-    large: Vec<BytesMut>,
+    slots: Vec<BytesMut>,
+    free_small: Vec<BytesMut>,
+    free_large: Vec<BytesMut>,
+    recycle_tx: Sender<BytesMut>,
+    recycle_rx: Receiver<BytesMut>,
+    large_count: usize,
     headroom: usize,
     small_payload: usize,
     large_payload: usize,
@@ -229,17 +366,26 @@ pub struct PacketSlotPool {
 
 impl PacketSlotPool {
     pub fn new(batch: usize, headroom: usize) -> Self {
-        let large_count = batch.min(LARGE_SLOT_COUNT).max(1);
+        Self::with_small_payload(batch, headroom, SMALL_TUN_SLOT)
+    }
+
+    pub fn with_small_payload(batch: usize, headroom: usize, small_payload: usize) -> Self {
+        let large_count = batch.clamp(1, LARGE_SLOT_COUNT);
         let small_count = batch.saturating_sub(large_count);
+        let small_payload = small_payload.clamp(SMALL_TUN_SLOT, LARGE_TUN_SLOT);
+        let (recycle_tx, recycle_rx) = unbounded();
+        let mut slots = Vec::with_capacity(batch);
+        slots.extend((0..large_count).map(|_| BytesMut::zeroed(headroom + LARGE_TUN_SLOT)));
+        slots.extend((0..small_count).map(|_| BytesMut::zeroed(headroom + small_payload)));
         Self {
-            small: (0..small_count)
-                .map(|_| BytesMut::zeroed(headroom + SMALL_TUN_SLOT))
-                .collect(),
-            large: (0..large_count)
-                .map(|_| BytesMut::zeroed(headroom + LARGE_TUN_SLOT))
-                .collect(),
+            slots,
+            free_small: Vec::with_capacity(small_count),
+            free_large: Vec::with_capacity(large_count),
+            recycle_tx,
+            recycle_rx,
+            large_count,
             headroom,
-            small_payload: SMALL_TUN_SLOT,
+            small_payload,
             large_payload: LARGE_TUN_SLOT,
         }
     }
@@ -249,65 +395,81 @@ impl PacketSlotPool {
     }
 
     pub fn slot_count(&self) -> usize {
-        self.small.len() + self.large.len()
+        self.slots.len()
     }
 
     pub fn large_slot_count(&self) -> usize {
-        self.large.len()
+        self.large_count
     }
 
     pub fn small_slot_count(&self) -> usize {
-        self.small.len()
+        self.slots.len().saturating_sub(self.large_count)
     }
 
     pub fn slot_payload_capacity(&self, index: usize) -> usize {
-        if index < self.large.len() {
+        if index < self.large_count {
             self.large_payload
         } else {
             self.small_payload
         }
     }
 
-    /// Large slots first so a 64 KiB GSO_NONE packet always lands in bufs[0].
-    pub fn fill_batch<'a>(&'a mut self, dest: &mut Vec<&'a mut BytesMut>) {
-        dest.clear();
-        for slot in &mut self.large {
-            dest.push(slot);
-        }
-        for slot in &mut self.small {
-            dest.push(slot);
-        }
+    /// Large slots are first so a 64 KiB GSO_NONE packet always lands in slot 0.
+    pub fn slots_mut(&mut self) -> &mut [BytesMut] {
+        self.drain_recycled();
+        &mut self.slots
     }
 
     pub fn take(&mut self, index: usize, payload_len: usize) -> DataplaneBuf {
-        let slot = if index < self.large.len() {
-            &mut self.large[index]
+        self.drain_recycled();
+        let replacement_capacity = self.headroom + self.slot_payload_capacity(index);
+        let replacement = if index < self.large_count {
+            self.free_large.pop()
         } else {
-            &mut self.small[index - self.large.len()]
-        };
+            self.free_small.pop()
+        }
+        .map(|mut slot| {
+            slot.resize(replacement_capacity, 0);
+            slot
+        })
+        .unwrap_or_else(|| BytesMut::zeroed(replacement_capacity));
+        let slot = &mut self.slots[index];
         let total = self.headroom + payload_len;
         if slot.len() < total {
             slot.resize(total, 0);
         }
-        let mut taken = std::mem::replace(
-            slot,
-            BytesMut::zeroed(self.headroom + self.slot_payload_capacity(index)),
-        );
+        let mut taken = std::mem::replace(slot, replacement);
         taken.truncate(total);
-        DataplaneBuf::from_pooled(taken.freeze(), self.headroom)
+        DataplaneBuf::from_recycling(taken, self.headroom, self.recycle_tx.clone())
     }
 
     pub fn recycle_empty(&mut self, index: usize) {
+        self.drain_recycled();
         let cap = self.headroom + self.slot_payload_capacity(index);
-        let slot = if index < self.large.len() {
-            &mut self.large[index]
-        } else {
-            &mut self.small[index - self.large.len()]
-        };
+        let slot = &mut self.slots[index];
         if slot.capacity() < cap {
             *slot = BytesMut::zeroed(cap);
         } else {
             slot.resize(cap, 0);
+        }
+    }
+
+    fn drain_recycled(&mut self) {
+        while let Ok(mut slot) = self.recycle_rx.try_recv() {
+            let large = slot.capacity() >= self.headroom + self.large_payload;
+            if large {
+                if self.free_large.len() >= self.large_count {
+                    continue;
+                }
+                slot.resize(self.headroom + self.large_payload, 0);
+                self.free_large.push(slot);
+            } else {
+                if self.free_small.len() >= self.small_slot_count() {
+                    continue;
+                }
+                slot.resize(self.headroom + self.small_payload, 0);
+                self.free_small.push(slot);
+            }
         }
     }
 }
@@ -315,6 +477,7 @@ impl PacketSlotPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::encode_packet_from_buf;
 
     #[test]
     fn budget_is_shared_and_hard_capped() {
@@ -325,6 +488,15 @@ mod tests {
         budget.release(400);
         assert!(budget.try_reserve(400));
         assert_eq!(budget.used(), 1_000);
+    }
+
+    #[test]
+    fn permit_releases_budget_on_every_drop_path() {
+        let budget = BufferBudget::new(1_000);
+        let permit = budget.try_acquire(700).unwrap();
+        assert_eq!(budget.used(), 700);
+        drop(permit);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -354,10 +526,37 @@ mod tests {
         assert_eq!(pool.slot_count(), 128);
         assert_eq!(pool.large_slot_count(), LARGE_SLOT_COUNT);
         assert_eq!(pool.slot_payload_capacity(0), LARGE_TUN_SLOT);
-        assert_eq!(
-            pool.slot_payload_capacity(LARGE_SLOT_COUNT),
-            SMALL_TUN_SLOT
-        );
+        assert_eq!(pool.slot_payload_capacity(LARGE_SLOT_COUNT), SMALL_TUN_SLOT);
         assert!(pool.large_slot_count() * LARGE_TUN_SLOT < 128 * LARGE_TUN_SLOT);
+    }
+
+    #[test]
+    fn tun_slots_recycle_through_zero_copy_wire_frames() {
+        let mut pool = PacketSlotPool::new(32, OVERLAY_HEADER_HEADROOM);
+        let mut packet = pool.take(LARGE_SLOT_COUNT, 128);
+        let payload_pointer = packet.as_slice().as_ptr();
+        let (frames, stats) = encode_packet_from_buf(&mut packet, 1_200, 1, None).unwrap();
+        assert_eq!(stats.payload_copies, 0);
+        assert_eq!(frames[0][12 + 16..].as_ptr(), payload_pointer);
+
+        drop(frames);
+        pool.slots_mut();
+        assert!(
+            pool.free_small.is_empty(),
+            "packet still owns the slab slot"
+        );
+        drop(packet);
+        pool.slots_mut();
+        assert_eq!(pool.free_small.len(), 1);
+
+        // Repeated handoff alternates the two warmed allocations rather than
+        // allocating a fresh replacement for every packet.
+        let mut pointers = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let packet = pool.take(LARGE_SLOT_COUNT, 128);
+            pointers.insert(packet.as_slice().as_ptr());
+            drop(packet);
+        }
+        assert!(pointers.len() <= 2);
     }
 }

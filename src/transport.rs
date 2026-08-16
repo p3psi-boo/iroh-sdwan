@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tokio::sync::Notify;
 
-use crate::buffer::{BufferBudget, DataplaneBuf};
+use crate::buffer::{BufferBudget, BufferPermit, DataplaneBuf};
 use crate::delivery::DeliveryTag;
 use crate::observability::PeerCounters;
 use crate::protocol::envelope::{Envelope, MessageType};
@@ -27,12 +27,13 @@ const MAX_OUTBOUND_MAX_AGE: Duration = Duration::from_secs(2);
 const REPAIR_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const REPAIR_CACHE_TTL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OutboundPacket {
     pub data: DataplaneBuf,
     pub enqueued: Instant,
     pub latency_sensitive: bool,
     pub delivery_tag: Option<DeliveryTag>,
+    budget_permit: Option<BufferPermit>,
 }
 
 impl OutboundPacket {
@@ -42,6 +43,7 @@ impl OutboundPacket {
             enqueued: Instant::now(),
             latency_sensitive,
             delivery_tag: None,
+            budget_permit: None,
         }
     }
 
@@ -174,22 +176,25 @@ impl OutboundQueue {
         let latency_sensitive = packet.latency_sensitive;
         let mut packet = packet;
         loop {
-            if reserve(
+            if let Some(was_empty) = reserve(
                 &self.core.total,
                 packet_len,
                 OUTBOUND_QUEUE_PACKETS,
                 self.core.max_bytes,
             ) {
-                if let Some(budget) = &self.core.budget
-                    && !budget.try_reserve(packet_len)
+                if packet.budget_permit.is_none()
+                    && let Some(budget) = &self.core.budget
                 {
-                    release(&self.core.total, packet_len);
-                    self.core
-                        .counters
-                        .queue_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.core.mark_depth_dirty();
-                    return;
+                    let Some(permit) = budget.try_acquire(packet_len) else {
+                        release(&self.core.total, packet_len);
+                        self.core
+                            .counters
+                            .queue_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.core.mark_depth_dirty();
+                        return;
+                    };
+                    packet.budget_permit = Some(permit);
                 }
                 let class = if latency_sensitive {
                     &self.core.priority
@@ -206,14 +211,13 @@ impl OutboundQueue {
                     Ok(()) => {
                         self.core.record_push();
                         self.core.mark_depth_dirty();
-                        self.core.notify_if_first_application();
+                        if was_empty {
+                            self.core.ready.notify_one();
+                        }
                         return;
                     }
                     Err(TrySendError::Full(returned) | TrySendError::Disconnected(returned)) => {
                         release(&self.core.total, packet_len);
-                        if let Some(budget) = &self.core.budget {
-                            budget.release(packet_len);
-                        }
                         class.fetch_sub(packed(1, packet_len), Ordering::Relaxed);
                         packet = returned;
                     }
@@ -268,20 +272,23 @@ impl OutboundQueue {
     }
 
     pub fn push_control(&self, datagram: Bytes) -> bool {
-        if datagram.is_empty()
-            || !reserve(
-                &self.core.control,
-                datagram.len(),
-                CONTROL_QUEUE_PACKETS,
-                CONTROL_QUEUE_BYTES,
-            )
-        {
+        if datagram.is_empty() {
             return false;
         }
+        let Some(was_empty) = reserve(
+            &self.core.control,
+            datagram.len(),
+            CONTROL_QUEUE_PACKETS,
+            CONTROL_QUEUE_BYTES,
+        ) else {
+            return false;
+        };
         let len = datagram.len();
         match self.core.control_tx.try_send(datagram) {
             Ok(()) => {
-                self.core.notify_if_first_control();
+                if was_empty {
+                    self.core.ready.notify_one();
+                }
                 true
             }
             Err(_) => {
@@ -292,20 +299,23 @@ impl OutboundQueue {
     }
 
     pub fn push_probe(&self, datagram: Bytes) -> bool {
-        if datagram.is_empty()
-            || !reserve(
-                &self.core.probe,
-                datagram.len(),
-                CONTROL_QUEUE_PACKETS,
-                PROBE_QUEUE_BYTES,
-            )
-        {
+        if datagram.is_empty() {
             return false;
         }
+        let Some(was_empty) = reserve(
+            &self.core.probe,
+            datagram.len(),
+            CONTROL_QUEUE_PACKETS,
+            PROBE_QUEUE_BYTES,
+        ) else {
+            return false;
+        };
         let len = datagram.len();
         match self.core.probe_tx.try_send(datagram) {
             Ok(()) => {
-                self.core.notify_if_first_probe();
+                if was_empty {
+                    self.core.ready.notify_one();
+                }
                 true
             }
             Err(_) => {
@@ -337,27 +347,6 @@ impl OutboundQueue {
 }
 
 impl QueueCore {
-    fn notify_if_first_application(&self) {
-        let (packets, _) = unpack(self.total.load(Ordering::Relaxed));
-        if packets == 1 {
-            self.ready.notify_one();
-        }
-    }
-
-    fn notify_if_first_control(&self) {
-        let (packets, _) = unpack(self.control.load(Ordering::Relaxed));
-        if packets == 1 {
-            self.ready.notify_one();
-        }
-    }
-
-    fn notify_if_first_probe(&self) {
-        let (packets, _) = unpack(self.probe.load(Ordering::Relaxed));
-        if packets == 1 {
-            self.ready.notify_one();
-        }
-    }
-
     fn mark_depth_dirty(&self) {
         let (packets, bytes) = unpack(self.total.load(Ordering::Relaxed));
         self.counters
@@ -408,9 +397,6 @@ impl QueueCore {
     fn release_packet(&self, packet: &OutboundPacket, priority: bool) {
         let len = packet.data.len();
         release(&self.total, len);
-        if let Some(budget) = &self.budget {
-            budget.release(len);
-        }
         let class = if priority { &self.priority } else { &self.bulk };
         class.fetch_sub(packed(1, len), Ordering::Relaxed);
         self.mark_depth_dirty();
@@ -659,16 +645,19 @@ fn unpack(value: u64) -> (usize, usize) {
     )
 }
 
-fn reserve(state: &AtomicU64, bytes: usize, max_packets: usize, max_bytes: usize) -> bool {
+/// Reserve queue capacity and report whether this reservation performed the
+/// empty-to-nonempty transition. The transition is derived from the successful
+/// CAS, never from a racy load after publication.
+fn reserve(state: &AtomicU64, bytes: usize, max_packets: usize, max_bytes: usize) -> Option<bool> {
     let mut current = state.load(Ordering::Acquire);
     loop {
         let (packets, queued_bytes) = unpack(current);
         if packets >= max_packets || queued_bytes.saturating_add(bytes) > max_bytes {
-            return false;
+            return None;
         }
         let updated = packed(packets + 1, queued_bytes + bytes);
         match state.compare_exchange_weak(current, updated, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return true,
+            Ok(_) => return Some(packets == 0),
             Err(observed) => current = observed,
         }
     }
@@ -706,6 +695,7 @@ struct CachedPacket {
     created: Instant,
     frames: Vec<(u16, Bytes)>,
     bytes: usize,
+    _budget_permit: Option<BufferPermit>,
 }
 
 #[derive(Debug)]
@@ -714,6 +704,7 @@ pub struct RepairCache {
     order: VecDeque<u64>,
     bytes: usize,
     max_bytes: usize,
+    budget: Option<Arc<BufferBudget>>,
 }
 
 impl Default for RepairCache {
@@ -723,6 +714,7 @@ impl Default for RepairCache {
             order: VecDeque::new(),
             bytes: 0,
             max_bytes: REPAIR_CACHE_BYTES,
+            budget: None,
         }
     }
 }
@@ -735,12 +727,24 @@ impl RepairCache {
         }
     }
 
+    pub fn with_max_bytes_and_budget(max_bytes: usize, budget: Option<Arc<BufferBudget>>) -> Self {
+        Self {
+            max_bytes: max_bytes.max(u16::MAX as usize),
+            budget,
+            ..Self::default()
+        }
+    }
+
     pub fn insert(&mut self, packet_id: u64, frames: &[Bytes]) {
         if frames.len() < 2 {
             return;
         }
         self.expire();
         let bytes = frames.iter().map(Bytes::len).sum();
+        if self.packets.contains_key(&packet_id) {
+            self.remove_packet(packet_id);
+            self.order.retain(|id| *id != packet_id);
+        }
         while self.bytes.saturating_add(bytes) > self.max_bytes {
             let Some(oldest) = self.order.pop_front() else {
                 break;
@@ -750,6 +754,19 @@ impl RepairCache {
         if bytes > self.max_bytes {
             return;
         }
+        let budget_permit = if let Some(budget) = self.budget.clone() {
+            loop {
+                if let Some(permit) = budget.try_acquire(bytes) {
+                    break Some(permit);
+                }
+                let Some(oldest) = self.order.pop_front() else {
+                    return;
+                };
+                self.remove_packet(oldest);
+            }
+        } else {
+            None
+        };
         self.bytes += bytes;
         self.order.push_back(packet_id);
         self.packets.insert(
@@ -758,6 +775,7 @@ impl RepairCache {
                 created: Instant::now(),
                 frames: frames.iter().cloned().filter_map(frame_offset).collect(),
                 bytes,
+                _budget_permit: budget_permit,
             },
         );
     }
@@ -931,6 +949,42 @@ mod tests {
         assert_eq!(packet.data.as_slice()[0], 2);
     }
 
+    #[test]
+    fn dropping_a_queue_releases_queued_process_budget() {
+        let budget = BufferBudget::new(65_535);
+        let queue =
+            OutboundQueue::with_max_bytes_and_budget(counters(), 65_535, Some(budget.clone()));
+        let consumer = queue.take_consumer().unwrap();
+        queue.push(OutboundPacket::new(Bytes::from(vec![1; 4_096]), false));
+        assert_eq!(budget.used(), 4_096);
+        drop(queue);
+        drop(consumer);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_to_nonempty_transition_never_loses_a_wakeup() {
+        const ITERATIONS: usize = 10_000;
+        let queue = Arc::new(OutboundQueue::new(counters()));
+        let mut consumer = queue.take_consumer().unwrap();
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let worker = tokio::spawn(async move {
+            for _ in 0..ITERATIONS {
+                let packet = consumer.pop(Duration::from_secs(1)).await;
+                assert_eq!(packet.data.as_slice(), b"x");
+                ack_tx.send(()).await.unwrap();
+            }
+        });
+        for _ in 0..ITERATIONS {
+            queue.push(OutboundPacket::new(Bytes::from_static(b"x"), false));
+            tokio::time::timeout(Duration::from_secs(1), ack_rx.recv())
+                .await
+                .expect("consumer lost an empty-to-nonempty notification")
+                .expect("consumer stopped");
+        }
+        worker.await.unwrap();
+    }
+
     #[tokio::test]
     async fn bulk_admission_never_evicts_priority() {
         let counters = counters();
@@ -947,8 +1001,14 @@ mod tests {
         assert_eq!(counters.queue_packets.load(Ordering::Relaxed), 2);
         assert_eq!(counters.queue_bytes.load(Ordering::Relaxed), 65_000);
         assert_eq!(counters.queue_drops.load(Ordering::Relaxed), 1);
-        assert_eq!(consumer.pop(Duration::from_secs(1)).await.data.as_slice()[0], 1);
-        assert_eq!(consumer.pop(Duration::from_secs(1)).await.data.as_slice()[0], 2);
+        assert_eq!(
+            consumer.pop(Duration::from_secs(1)).await.data.as_slice()[0],
+            1
+        );
+        assert_eq!(
+            consumer.pop(Duration::from_secs(1)).await.data.as_slice()[0],
+            2
+        );
     }
 
     #[tokio::test]

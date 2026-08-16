@@ -21,10 +21,7 @@ const DEFAULT_MAX_PRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_LEASE: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_SWITCH_PENALTY: Duration = Duration::from_millis(25);
-// New flows can arrive at packet rate. Rebuilding the entire table for every
-// insertion makes admission O(active_flows), even while comfortably below the
-// hard limit. Expiry is housekeeping, so amortize it independently of packets.
-const PRUNE_INTERVAL: Duration = Duration::from_millis(250);
+const MAINTENANCE_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RouteId(pub u64);
@@ -84,6 +81,7 @@ struct FlowSlot {
     pressure: u64,
     updated_at: Instant,
     lease: Option<RouteLease>,
+    referenced: bool,
 }
 
 impl FlowSlot {
@@ -92,6 +90,7 @@ impl FlowSlot {
             pressure: 0,
             updated_at: now,
             lease: None,
+            referenced: true,
         }
     }
 
@@ -106,6 +105,7 @@ impl FlowSlot {
             .saturating_add(packet_len.saturating_sub(config.packet_allowance_bytes) as u64)
             .min(config.max_pressure_bytes);
         self.updated_at = now;
+        self.referenced = true;
     }
 }
 
@@ -140,7 +140,6 @@ pub struct FlowRouter {
     config: FlowRouterConfig,
     flows: FxHashMap<FlowKey, FlowSlot>,
     insertion_order: VecDeque<FlowKey>,
-    next_prune_at: Option<Instant>,
 }
 
 impl Default for FlowRouter {
@@ -171,7 +170,6 @@ impl FlowRouter {
             config,
             flows: FxHashMap::default(),
             insertion_order: VecDeque::new(),
-            next_prune_at: None,
         }
     }
 
@@ -287,27 +285,61 @@ impl FlowRouter {
         })
     }
 
-    fn prune(&mut self, now: Instant) {
-        let idle_ttl = self.config.idle_ttl;
-        self.flows.retain(|_, flow| {
-            now.checked_duration_since(flow.updated_at)
-                .unwrap_or(Duration::ZERO)
-                < idle_ttl
-        });
+    /// Perform bounded expiry work. The clock contains exactly one key per
+    /// allocated flow, so its memory remains bounded with the table even when
+    /// the workload continuously cycles through short-lived keys.
+    pub(crate) fn maintain(&mut self, now: Instant) {
+        self.maintain_with_budget(now, MAINTENANCE_BUDGET);
+    }
+
+    fn maintain_with_budget(&mut self, now: Instant, budget: usize) {
+        for _ in 0..budget.min(self.insertion_order.len()) {
+            let Some(key) = self.insertion_order.pop_front() else {
+                break;
+            };
+            let expired = self.flows.get(&key).is_some_and(|flow| {
+                now.checked_duration_since(flow.updated_at)
+                    .unwrap_or(Duration::ZERO)
+                    >= self.config.idle_ttl
+            });
+            if expired {
+                self.flows.remove(&key);
+            } else if self.flows.contains_key(&key) {
+                self.insertion_order.push_back(key);
+            }
+        }
     }
 
     fn make_room(&mut self, now: Instant) {
-        if self.next_prune_at.is_none_or(|deadline| deadline <= now) {
-            self.prune(now);
-            self.next_prune_at = now.checked_add(PRUNE_INTERVAL);
-        }
+        self.maintain_with_budget(now, MAINTENANCE_BUDGET);
         if self.flows.len() < self.config.max_flows {
             return;
         }
-        while let Some(oldest) = self.insertion_order.pop_front() {
-            if self.flows.remove(&oldest).is_some() {
+
+        // Bounded second-chance clock eviction avoids a full-table retain or
+        // oldest-entry scan on the packet path.
+        for _ in 0..MAINTENANCE_BUDGET.min(self.insertion_order.len()) {
+            let Some(key) = self.insertion_order.pop_front() else {
+                break;
+            };
+            let evict = self.flows.get_mut(&key).is_some_and(|flow| {
+                if flow.referenced {
+                    flow.referenced = false;
+                    false
+                } else {
+                    true
+                }
+            });
+            if evict {
+                self.flows.remove(&key);
                 return;
             }
+            if self.flows.contains_key(&key) {
+                self.insertion_order.push_back(key);
+            }
+        }
+        if let Some(victim) = self.insertion_order.pop_front() {
+            self.flows.remove(&victim);
         }
     }
 }
@@ -483,6 +515,28 @@ mod tests {
             router.select(key(port), 100, 0, &plans, now).unwrap();
         }
         assert_eq!(router.len(), 2);
+        assert_eq!(router.insertion_order.len(), router.len());
+    }
+
+    #[test]
+    fn clock_metadata_stays_bounded_and_expiry_is_incremental() {
+        let start = Instant::now();
+        let plans = [candidate(1, Duration::from_millis(10), 50_000_000)];
+        let mut router = FlowRouter::new(FlowRouterConfig {
+            max_flows: 128,
+            idle_ttl: Duration::from_millis(10),
+            ..FlowRouterConfig::default()
+        });
+        for index in 0..10_000 {
+            router
+                .select(indexed_key(index), 100, 0, &plans, start)
+                .unwrap();
+            assert!(router.insertion_order.len() <= 128);
+            assert_eq!(router.insertion_order.len(), router.len());
+        }
+        router.maintain_with_budget(start + Duration::from_secs(1), 128);
+        assert_eq!(router.len(), 0);
+        assert!(router.insertion_order.is_empty());
     }
 
     #[test]

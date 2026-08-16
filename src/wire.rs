@@ -1,19 +1,18 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::Range,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::buffer::DataplaneBuf;
+use crate::buffer::{BufferBudget, BufferPermit, DataplaneBuf};
 use crate::capacity_probe::{CapacityProbeMessage, decode_probe};
 use crate::delivery::{DELIVERY_TAG_WIRE_BYTES, DeliveryMessage, DeliveryTag, decode_delivery};
-use crate::protocol::envelope::{
-    self, Envelope, HEADER_LEN as ENVELOPE_HEADER_LEN, MessageType,
-};
+use crate::protocol::envelope::{self, Envelope, HEADER_LEN as ENVELOPE_HEADER_LEN, MessageType};
 
 const HEADER_LEN: usize = 16;
 pub const MAX_PACKET_FRAME_HEADER_LEN: usize =
@@ -105,20 +104,15 @@ pub fn encode_packet_tagged(
     packet_id: u64,
     delivery_tag: Option<DeliveryTag>,
 ) -> Result<Vec<Bytes>> {
-    encode_packet_from_buf(
-        &DataplaneBuf::from_bytes(Bytes::copy_from_slice(packet)),
-        maximum,
-        packet_id,
-        delivery_tag,
-    )
-    .map(|(frames, _)| frames)
+    let mut packet = DataplaneBuf::from_bytes(Bytes::copy_from_slice(packet));
+    encode_packet_from_buf(&mut packet, maximum, packet_id, delivery_tag).map(|(frames, _)| frames)
 }
 
 /// Encode an owned packet. A unique buffer with enough unused prefix is
 /// sealed in place for the single-datagram case (`payload_copies == 0`).
 /// Jumbo packets freeze the payload once and copy each fragment once.
 pub fn encode_packet_from_buf(
-    packet: &DataplaneBuf,
+    packet: &mut DataplaneBuf,
     maximum: usize,
     packet_id: u64,
     delivery_tag: Option<DeliveryTag>,
@@ -138,7 +132,12 @@ pub fn encode_packet_from_buf(
     let chunk_size = maximum - sealed_header_len;
     if packet.len() <= chunk_size {
         let header = fragment_header(packet_id, packet.len(), 0, packet.len(), delivery_tag);
-        let (frame, copies) = seal_fragment(packet.clone(), &header)?;
+        // Temporarily remove the only owner so Bytes::try_into_mut can patch
+        // the reserved prefix in place. Restore the logical payload as a slice
+        // of the sealed frame for retry/requeue ownership.
+        let owned = std::mem::take(packet);
+        let (frame, copies) = seal_fragment(owned, &header);
+        *packet = DataplaneBuf::from_bytes(frame.slice(sealed_header_len..));
         return Ok((
             vec![frame],
             EncodeStats {
@@ -148,7 +147,7 @@ pub fn encode_packet_from_buf(
         ));
     }
 
-    let payload = packet.payload_bytes();
+    let payload = packet.as_slice();
     let mut frames = Vec::with_capacity(payload.len().div_ceil(chunk_size));
     for (index, chunk) in payload.chunks(chunk_size).enumerate() {
         let offset = index * chunk_size;
@@ -164,11 +163,12 @@ pub fn encode_packet_from_buf(
         out.extend_from_slice(chunk);
         frames.push(out.freeze());
     }
+    let frame_count = frames.len() as u64;
     Ok((
         frames,
         EncodeStats {
-            payload_copies: frames.len() as u64,
-            frames: frames.len() as u64,
+            payload_copies: frame_count,
+            frames: frame_count,
         },
     ))
 }
@@ -180,7 +180,8 @@ fn fragment_header(
     chunk_len: usize,
     delivery_tag: Option<DeliveryTag>,
 ) -> Vec<u8> {
-    let mut header = Vec::with_capacity(HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES));
+    let mut header =
+        Vec::with_capacity(HEADER_LEN + delivery_tag.map_or(0, |_| DELIVERY_TAG_WIRE_BYTES));
     header.extend_from_slice(&packet_id.to_be_bytes());
     header.extend_from_slice(&(total_len as u16).to_be_bytes());
     header.extend_from_slice(&(offset as u16).to_be_bytes());
@@ -193,16 +194,21 @@ fn fragment_header(
     header
 }
 
-fn seal_fragment(packet: DataplaneBuf, fragment_header: &[u8]) -> Result<(Bytes, u64)> {
+fn seal_fragment(packet: DataplaneBuf, fragment_header: &[u8]) -> (Bytes, u64) {
     let needed = ENVELOPE_HEADER_LEN + fragment_header.len();
     if packet.can_prepend(needed) {
         let mut prefix = [0_u8; ENVELOPE_HEADER_LEN + HEADER_LEN + DELIVERY_TAG_WIRE_BYTES];
-        envelope::write_header_at(&mut prefix[..ENVELOPE_HEADER_LEN], MessageType::IpFragment, 0)?;
+        envelope::write_header_at(
+            &mut prefix[..ENVELOPE_HEADER_LEN],
+            MessageType::IpFragment,
+            0,
+        )
+        .expect("fixed-size envelope prefix always fits");
         prefix[ENVELOPE_HEADER_LEN..needed].copy_from_slice(fragment_header);
         match packet.try_prepend(&prefix[..needed]) {
-            Ok(frame) => return Ok((frame, 0)),
+            Ok(frame) => return (frame, 0),
             Err(packet) => {
-                return Ok((packet.copy_with_prefix(&prefix[..needed]), 1));
+                return (packet.copy_with_prefix(&prefix[..needed]), 1);
             }
         }
     }
@@ -215,7 +221,7 @@ fn seal_fragment(packet: DataplaneBuf, fragment_header: &[u8]) -> Result<(Bytes,
     );
     out.extend_from_slice(fragment_header);
     out.extend_from_slice(packet.as_slice());
-    Ok((out.freeze(), 1))
+    (out.freeze(), 1)
 }
 
 pub fn encode_batch(frames: &[Bytes], maximum: usize) -> Result<Bytes> {
@@ -403,7 +409,11 @@ struct Assembly {
     created: Instant,
     last_repair: Option<Instant>,
     repair_attempts: u8,
-    buffer: Vec<u8>,
+    /// Owns both the virtio prefix and the reassembled payload so completion
+    /// can hand the allocation to the tunnel without another packet-sized
+    /// copy.
+    buffer: BytesMut,
+    total_len: usize,
     /// Sorted, disjoint byte ranges already present in `buffer`. Fragment
     /// count is bounded by packet length / path MTU, so range merging avoids a
     /// second allocation proportional to every packet byte and replaces the
@@ -411,6 +421,7 @@ struct Assembly {
     received_ranges: Vec<Range<usize>>,
     received_count: usize,
     delivery_tag: Option<DeliveryTag>,
+    _budget_permit: Option<BufferPermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,20 +441,28 @@ impl Eq for ReassembledPacket {}
 #[derive(Debug)]
 pub struct Reassembler {
     assemblies: HashMap<u64, Assembly>,
+    /// Creation-ordered ids. Completed ids may remain as tombstones and are
+    /// discarded lazily, making expiry and eviction O(1) amortized.
+    order: VecDeque<(u64, Instant)>,
+    repair_clock: VecDeque<(u64, Instant)>,
     buffered_bytes: usize,
     max_buffered_bytes: usize,
     next_expiry: Instant,
     evictions: u64,
+    budget: Option<Arc<BufferBudget>>,
 }
 
 impl Default for Reassembler {
     fn default() -> Self {
         Self {
             assemblies: HashMap::new(),
+            order: VecDeque::new(),
+            repair_clock: VecDeque::new(),
             buffered_bytes: 0,
             max_buffered_bytes: MAX_BUFFERED_BYTES,
             next_expiry: Instant::now() + EXPIRY_INTERVAL,
             evictions: 0,
+            budget: None,
         }
     }
 }
@@ -452,6 +471,17 @@ impl Reassembler {
     pub fn with_max_buffered_bytes(max_buffered_bytes: usize) -> Self {
         Self {
             max_buffered_bytes: max_buffered_bytes.max(u16::MAX as usize),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_max_buffered_bytes_and_budget(
+        max_buffered_bytes: usize,
+        budget: Option<Arc<BufferBudget>>,
+    ) -> Self {
+        Self {
+            max_buffered_bytes: max_buffered_bytes.max(u16::MAX as usize),
+            budget,
             ..Self::default()
         }
     }
@@ -513,6 +543,8 @@ impl Reassembler {
             }));
         }
 
+        let mut budget_permit = None;
+        let mut assembly_created = None;
         if !self.assemblies.contains_key(&packet_id) {
             if self.assemblies.len() >= MAX_ASSEMBLIES
                 || self.buffered_bytes.saturating_add(total_len) > self.max_buffered_bytes
@@ -527,22 +559,40 @@ impl Reassembler {
                 self.buffered_bytes.saturating_add(total_len) <= self.max_buffered_bytes,
                 "incomplete overlay packets exceed memory limit"
             );
+            if let Some(budget) = self.budget.clone() {
+                loop {
+                    if let Some(permit) = budget.try_acquire(total_len) {
+                        budget_permit = Some(permit);
+                        break;
+                    }
+                    ensure!(
+                        self.evict_oldest(),
+                        "process payload budget exhausted by incomplete overlay packets"
+                    );
+                }
+            }
             self.buffered_bytes += total_len;
+            let created = Instant::now();
+            self.order.push_back((packet_id, created));
+            self.repair_clock.push_back((packet_id, created));
+            assembly_created = Some(created);
         }
         let assembly = self
             .assemblies
             .entry(packet_id)
             .or_insert_with(|| Assembly {
-                created: Instant::now(),
+                created: assembly_created.unwrap_or_else(Instant::now),
                 last_repair: None,
                 repair_attempts: 0,
-                buffer: vec![0; total_len],
+                buffer: BytesMut::zeroed(tun_rs::VIRTIO_NET_HDR_LEN + total_len),
+                total_len,
                 received_ranges: Vec::with_capacity(8),
                 received_count: 0,
                 delivery_tag,
+                _budget_permit: budget_permit,
             });
         ensure!(
-            assembly.buffer.len() == total_len,
+            assembly.total_len == total_len,
             "overlay packet length changed"
         );
         ensure!(
@@ -555,12 +605,11 @@ impl Reassembler {
         if assembly.received_count == total_len {
             let complete = self.assemblies.remove(&packet_id);
             if let Some(complete) = complete {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(complete.buffer.len());
-                let mut gathered = BytesMut::zeroed(tun_rs::VIRTIO_NET_HDR_LEN + complete.buffer.len());
-                gathered[tun_rs::VIRTIO_NET_HDR_LEN..].copy_from_slice(&complete.buffer);
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(complete.total_len);
+                self.compact_metadata_if_needed();
                 return Ok(Some(ReassembledPacket {
                     data: DataplaneBuf::from_pooled(
-                        gathered.freeze(),
+                        complete.buffer.freeze(),
                         tun_rs::VIRTIO_NET_HDR_LEN,
                     ),
                     delivery_tag: complete.delivery_tag,
@@ -572,32 +621,50 @@ impl Reassembler {
 
     pub fn repair_requests(&mut self, delay: Duration, limit: usize) -> Vec<RepairRequest> {
         self.expire(false);
+        if limit == 0 {
+            return Vec::new();
+        }
         let now = Instant::now();
-        self.assemblies
-            .iter_mut()
-            .filter_map(|(packet_id, assembly)| {
-                let missing_offsets = missing_offsets(assembly);
-                let due = now.duration_since(assembly.created) >= delay
-                    && assembly.repair_attempts < MAX_REPAIR_ATTEMPTS
-                    && assembly.received_count.saturating_mul(2) >= assembly.buffer.len()
-                    && !missing_offsets.is_empty()
-                    && missing_offsets.len() <= MAX_REPAIR_OFFSETS
-                    && assembly
-                        .last_repair
-                        .is_none_or(|last| now.duration_since(last) >= delay);
-                if due {
-                    assembly.last_repair = Some(now);
-                    assembly.repair_attempts += 1;
-                    Some(RepairRequest {
-                        packet_id: *packet_id,
-                        missing_offsets,
-                    })
-                } else {
-                    None
-                }
-            })
-            .take(limit)
-            .collect()
+        let checks = self
+            .repair_clock
+            .len()
+            .min(limit.saturating_mul(4).clamp(16, 256));
+        let mut requests = Vec::with_capacity(limit.min(16));
+        for _ in 0..checks {
+            let Some((packet_id, created)) = self.repair_clock.pop_front() else {
+                break;
+            };
+            let Some(assembly) = self.assemblies.get_mut(&packet_id) else {
+                continue;
+            };
+            if assembly.created != created {
+                continue;
+            }
+            self.repair_clock.push_back((packet_id, created));
+            let due = now.duration_since(assembly.created) >= delay
+                && assembly.repair_attempts < MAX_REPAIR_ATTEMPTS
+                && assembly.received_count.saturating_mul(2) >= assembly.total_len
+                && assembly
+                    .last_repair
+                    .is_none_or(|last| now.duration_since(last) >= delay);
+            if !due {
+                continue;
+            }
+            let missing_offsets = missing_offsets(assembly);
+            if missing_offsets.is_empty() || missing_offsets.len() > MAX_REPAIR_OFFSETS {
+                continue;
+            }
+            assembly.last_repair = Some(now);
+            assembly.repair_attempts += 1;
+            requests.push(RepairRequest {
+                packet_id,
+                missing_offsets,
+            });
+            if requests.len() == limit {
+                break;
+            }
+        }
+        requests
     }
 
     pub fn take_evictions(&mut self) -> u64 {
@@ -609,15 +676,25 @@ impl Reassembler {
         if !force && now < self.next_expiry {
             return;
         }
-        self.assemblies.retain(|_, assembly| {
-            if assembly.created.elapsed() < ASSEMBLY_TTL {
-                true
-            } else {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.buffer.len());
-                false
+        while let Some(&(packet_id, created)) = self.order.front() {
+            let Some(assembly) = self.assemblies.get(&packet_id) else {
+                self.order.pop_front();
+                continue;
+            };
+            if assembly.created != created {
+                self.order.pop_front();
+                continue;
             }
-        });
+            if now.duration_since(created) < ASSEMBLY_TTL {
+                break;
+            }
+            self.order.pop_front();
+            if let Some(assembly) = self.assemblies.remove(&packet_id) {
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.total_len);
+            }
+        }
         self.next_expiry = now + EXPIRY_INTERVAL;
+        self.compact_metadata_if_needed();
     }
 
     fn make_room(&mut self, incoming: usize) {
@@ -625,19 +702,44 @@ impl Reassembler {
         while self.assemblies.len() >= MAX_ASSEMBLIES
             || self.buffered_bytes.saturating_add(incoming) > self.max_buffered_bytes
         {
-            let Some(oldest) = self
-                .assemblies
-                .iter()
-                .min_by_key(|(_, assembly)| assembly.created)
-                .map(|(packet_id, _)| *packet_id)
-            else {
+            if !self.evict_oldest() {
                 break;
-            };
-            if let Some(assembly) = self.assemblies.remove(&oldest) {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.buffer.len());
-                self.evictions += 1;
             }
         }
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        while let Some((packet_id, created)) = self.order.pop_front() {
+            let is_current = self
+                .assemblies
+                .get(&packet_id)
+                .is_some_and(|assembly| assembly.created == created);
+            if !is_current {
+                continue;
+            }
+            if let Some(assembly) = self.assemblies.remove(&packet_id) {
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.total_len);
+                self.evictions += 1;
+                self.compact_metadata_if_needed();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn compact_metadata_if_needed(&mut self) {
+        let bound = self.assemblies.len().saturating_mul(4).max(64);
+        if self.order.len() <= bound && self.repair_clock.len() <= bound {
+            return;
+        }
+        let mut live = self
+            .assemblies
+            .iter()
+            .map(|(packet_id, assembly)| (*packet_id, assembly.created))
+            .collect::<Vec<_>>();
+        live.sort_unstable_by_key(|(_, created)| *created);
+        self.order = live.iter().copied().collect();
+        self.repair_clock = live.into_iter().collect();
     }
 }
 
@@ -650,7 +752,7 @@ fn missing_offsets(assembly: &Assembly) -> Vec<u16> {
         }
         covered_until = covered_until.max(range.end);
     }
-    if covered_until < assembly.buffer.len() {
+    if covered_until < assembly.total_len {
         missing.push(covered_until as u16);
     }
     missing
@@ -658,6 +760,7 @@ fn missing_offsets(assembly: &Assembly) -> Vec<u16> {
 
 fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Result<()> {
     let end = offset + data.len();
+    let payload_offset = tun_rs::VIRTIO_NET_HDR_LEN;
     let mut already_received = 0_usize;
     for range in &assembly.received_ranges {
         let overlap_start = offset.max(range.start);
@@ -668,7 +771,8 @@ fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Resul
         let incoming_start = overlap_start - offset;
         let incoming_end = overlap_end - offset;
         ensure!(
-            assembly.buffer[overlap_start..overlap_end] == data[incoming_start..incoming_end],
+            assembly.buffer[payload_offset + overlap_start..payload_offset + overlap_end]
+                == data[incoming_start..incoming_end],
             "conflicting duplicate overlay fragment"
         );
         already_received += overlap_end - overlap_start;
@@ -677,7 +781,7 @@ fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Resul
     if already_received == data.len() {
         return Ok(());
     }
-    assembly.buffer[offset..end].copy_from_slice(data);
+    assembly.buffer[payload_offset + offset..payload_offset + end].copy_from_slice(data);
     assembly.received_count = assembly
         .received_count
         .saturating_add(data.len().saturating_sub(already_received));
@@ -724,6 +828,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_reassembly_releases_process_budget_on_drop() {
+        let budget = BufferBudget::new(65_535);
+        let frames = encode_packet(&vec![7; 2_000], 600, 77).unwrap();
+        let mut reassembler =
+            Reassembler::with_max_buffered_bytes_and_budget(65_535, Some(budget.clone()));
+        assert!(
+            reassembler
+                .push_tagged(frames[0].clone())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.used(), 2_000);
+        drop(reassembler);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reassembly_clock_metadata_stays_bounded_behind_a_long_lived_packet() {
+        let mut reassembler = Reassembler::default();
+        let anchor = encode_packet(&vec![1; 2_000], 600, 1).unwrap();
+        reassembler.push_tagged(anchor[0].clone()).unwrap();
+        for packet_id in 2..=200 {
+            let frames = encode_packet(&vec![packet_id as u8; 1_000], 600, packet_id).unwrap();
+            for frame in frames {
+                reassembler.push_tagged(frame).unwrap();
+            }
+            let bound = reassembler.assemblies.len().saturating_mul(4).max(64);
+            assert!(reassembler.order.len() <= bound);
+            assert!(reassembler.repair_clock.len() <= bound);
+        }
+    }
+
+    #[test]
     fn unfragmented_packet_round_trips() {
         let packet = vec![7; 128];
         let frame = encode_packet(&packet, 1_200, 1).unwrap().remove(0);
@@ -745,7 +882,7 @@ mod tests {
         let mut reassembler = Reassembler::default();
         let mut complete = None;
         for frame in frames {
-            if let Some(value) = reassembler.push_tagged(&frame).unwrap() {
+            if let Some(value) = reassembler.push_tagged(frame).unwrap() {
                 complete = Some(value);
             }
         }

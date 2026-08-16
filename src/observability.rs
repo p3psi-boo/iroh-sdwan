@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -8,6 +9,20 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Prevent independently updated hot counters from bouncing the same cache
+/// line between FlowRouter worker cores.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub struct CachePaddedAtomicU64(AtomicU64);
+
+impl Deref for CachePaddedAtomicU64 {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
@@ -102,10 +117,10 @@ pub struct PeerCounters {
 
 #[derive(Debug, Default)]
 pub struct FlowRouterCounters {
-    pub active_flows: AtomicU64,
-    pub decisions: AtomicU64,
-    pub route_switches: AtomicU64,
-    pub no_route_drops: AtomicU64,
+    pub active_flows: CachePaddedAtomicU64,
+    pub decisions: CachePaddedAtomicU64,
+    pub route_switches: CachePaddedAtomicU64,
+    pub no_route_drops: CachePaddedAtomicU64,
 }
 
 impl PeerCounters {

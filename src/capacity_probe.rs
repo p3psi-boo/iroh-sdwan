@@ -5,6 +5,8 @@
 //! remaining overlay hop list for one short train.
 
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
@@ -26,6 +28,8 @@ pub const INITIAL_RETRY: Duration = Duration::from_secs(2);
 pub const MAX_RETRY: Duration = Duration::from_secs(5 * 60);
 pub const COLD_REPROBE: Duration = Duration::from_secs(1);
 pub const STABLE_REPROBE: Duration = Duration::from_secs(2 * 60);
+const BUSY_RETRY: Duration = Duration::from_millis(50);
+const MAX_CONCURRENT_PROBES: usize = 4;
 
 const TYPE_START: u8 = 1;
 const TYPE_READY: u8 = 2;
@@ -357,6 +361,7 @@ pub struct ProbeBookkeeping {
     pub failures_total: u64,
     pub bytes_total: u64,
     last_used: Instant,
+    deadline_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,7 +392,8 @@ pub struct ProbeRequest {
 #[derive(Debug)]
 pub struct ActiveProbeScheduler {
     routes: HashMap<RouteKey, ProbeBookkeeping>,
-    global_in_flight: Option<ProbeRequest>,
+    deadlines: BinaryHeap<Reverse<(Instant, u64, RouteKey)>>,
+    in_flight: HashMap<ProbeId, ProbeRequest>,
     next_probe_id: ProbeId,
     capacity: usize,
 }
@@ -402,7 +408,8 @@ impl ActiveProbeScheduler {
     pub fn new(capacity: usize) -> Self {
         Self {
             routes: HashMap::new(),
-            global_in_flight: None,
+            deadlines: BinaryHeap::new(),
+            in_flight: HashMap::new(),
             next_probe_id: 1,
             capacity: capacity.max(1),
         }
@@ -436,8 +443,10 @@ impl ActiveProbeScheduler {
                 failures_total: 0,
                 bytes_total: 0,
                 last_used: now,
+                deadline_generation: 0,
             },
         );
+        self.reschedule(route);
         true
     }
 
@@ -448,22 +457,47 @@ impl ActiveProbeScheduler {
         bulk_busy: bool,
         priority_busy: bool,
     ) -> Option<ProbeRequest> {
-        if self.global_in_flight.is_some() || bulk_busy || priority_busy {
+        if self.in_flight.len() >= MAX_CONCURRENT_PROBES || bulk_busy || priority_busy {
             return None;
         }
-        let route = self
-            .routes
-            .iter()
-            .filter(|(route, state)| {
-                state.in_flight.is_none()
-                    && state.next_due <= now
-                    && !first_hop_queue_busy(**route)
-                    && state
-                        .last_passive_sample
-                        .is_none_or(|sample| now.saturating_duration_since(sample) > FRESH_TTL)
-            })
-            .min_by_key(|(_, state)| state.next_due)
-            .map(|(route, _)| *route)?;
+        let route = loop {
+            let Reverse((due, generation, route)) = self.deadlines.pop()?;
+            let Some(state) = self.routes.get_mut(&route) else {
+                continue;
+            };
+            if state.deadline_generation != generation || state.next_due != due {
+                continue;
+            }
+            if due > now {
+                self.deadlines.push(Reverse((due, generation, route)));
+                return None;
+            }
+            if state.in_flight.is_some() {
+                continue;
+            }
+            if let Some(sample) = state.last_passive_sample
+                && now.saturating_duration_since(sample) <= FRESH_TTL
+            {
+                state.next_due = sample + FRESH_TTL + Duration::from_nanos(1);
+                self.reschedule(route);
+                continue;
+            }
+            if first_hop_queue_busy(route) {
+                state.next_due = now + BUSY_RETRY;
+                self.reschedule(route);
+                continue;
+            }
+            if self
+                .in_flight
+                .values()
+                .any(|active| active.route.first_hop == route.first_hop)
+            {
+                state.next_due = now + BUSY_RETRY;
+                self.reschedule(route);
+                continue;
+            }
+            break route;
+        };
         let probe_id = self.next_probe_id;
         self.next_probe_id = self.next_probe_id.wrapping_add(1).max(1);
         let request = ProbeRequest { route, probe_id };
@@ -471,19 +505,20 @@ impl ActiveProbeScheduler {
         state.in_flight = Some(probe_id);
         state.attempts_total = state.attempts_total.saturating_add(1);
         state.last_used = now;
-        self.global_in_flight = Some(request);
+        self.in_flight.insert(probe_id, request);
         Some(request)
     }
 
     pub fn active_succeeded(&mut self, request: ProbeRequest, now: Instant) -> bool {
-        if self.global_in_flight != Some(request) {
+        if self.in_flight.get(&request.probe_id) != Some(&request) {
             return false;
         }
         let Some(state) = self.routes.get_mut(&request.route) else {
-            self.global_in_flight = None;
+            self.in_flight.remove(&request.probe_id);
             return false;
         };
         if state.in_flight != Some(request.probe_id) {
+            self.in_flight.remove(&request.probe_id);
             return false;
         }
         state.in_flight = None;
@@ -496,18 +531,23 @@ impl ActiveProbeScheduler {
                 STABLE_REPROBE
             };
         state.last_used = now;
-        self.global_in_flight = None;
+        self.in_flight.remove(&request.probe_id);
+        self.reschedule(request.route);
         true
     }
 
     pub fn failed(&mut self, request: ProbeRequest, now: Instant) -> bool {
-        if self.global_in_flight != Some(request) {
+        if self.in_flight.get(&request.probe_id) != Some(&request) {
             return false;
         }
         let Some(state) = self.routes.get_mut(&request.route) else {
-            self.global_in_flight = None;
+            self.in_flight.remove(&request.probe_id);
             return false;
         };
+        if state.in_flight != Some(request.probe_id) {
+            self.in_flight.remove(&request.probe_id);
+            return false;
+        }
         state.in_flight = None;
         state.failure_count = state.failure_count.saturating_add(1);
         state.failures_total = state.failures_total.saturating_add(1);
@@ -515,7 +555,8 @@ impl ActiveProbeScheduler {
         let multiplier = 1_u32 << shift;
         state.next_due = now + INITIAL_RETRY.saturating_mul(multiplier).min(MAX_RETRY);
         state.last_used = now;
-        self.global_in_flight = None;
+        self.in_flight.remove(&request.probe_id);
+        self.reschedule(request.route);
         true
     }
 
@@ -528,6 +569,7 @@ impl ActiveProbeScheduler {
         state.last_passive_sample = Some(now);
         state.next_due = now + STABLE_REPROBE;
         state.last_used = now;
+        self.reschedule(route);
     }
 
     pub fn record_bytes(&mut self, request: ProbeRequest, bytes: u64) -> bool {
@@ -545,17 +587,19 @@ impl ActiveProbeScheduler {
         if !self.register(route, now) {
             return;
         }
-        if self
-            .global_in_flight
-            .is_some_and(|request| request.route == route)
+        if let Some(probe_id) = self
+            .in_flight
+            .iter()
+            .find_map(|(probe_id, request)| (request.route == route).then_some(*probe_id))
         {
-            self.global_in_flight = None;
+            self.in_flight.remove(&probe_id);
         }
         let state = self.routes.get_mut(&route).expect("registered route");
         state.in_flight = None;
         state.next_due = now;
         state.last_passive_sample = None;
         state.last_used = now;
+        self.reschedule(route);
     }
 
     pub fn bookkeeping(&self, route: &RouteKey) -> Option<&ProbeBookkeeping> {
@@ -581,7 +625,7 @@ impl ActiveProbeScheduler {
             })
             .collect::<HashMap<_, _>>();
         ProbeStatusSnapshot {
-            global_in_flight: self.global_in_flight.is_some(),
+            global_in_flight: !self.in_flight.is_empty(),
             attempts_total: self.routes.values().map(|state| state.attempts_total).sum(),
             failures_total: self.routes.values().map(|state| state.failures_total).sum(),
             bytes_total: self.routes.values().map(|state| state.bytes_total).sum(),
@@ -604,6 +648,26 @@ impl ActiveProbeScheduler {
             return true;
         }
         false
+    }
+
+    fn reschedule(&mut self, route: RouteKey) {
+        let Some(state) = self.routes.get_mut(&route) else {
+            return;
+        };
+        state.deadline_generation = state.deadline_generation.wrapping_add(1).max(1);
+        self.deadlines
+            .push(Reverse((state.next_due, state.deadline_generation, route)));
+        // Generational entries make updates O(log N). Compact stale entries
+        // before they can become an unbounded secondary table under repeated
+        // invalidation/passive observations.
+        if self.deadlines.len() > self.routes.len().saturating_mul(4).max(64) {
+            self.deadlines = self
+                .routes
+                .iter()
+                .filter(|(_, state)| state.in_flight.is_none())
+                .map(|(route, state)| Reverse((state.next_due, state.deadline_generation, *route)))
+                .collect();
+        }
     }
 }
 
@@ -923,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_is_globally_single_flight_and_skips_busy_routes() {
+    fn scheduler_runs_bounded_parallel_probes_and_skips_busy_routes() {
         let now = Instant::now();
         let route_a = RouteKey {
             destination: endpoint(4),
@@ -940,8 +1004,54 @@ mod tests {
             .next(now, |route| route == route_a, false, false)
             .unwrap();
         assert_eq!(request.route, route_b);
-        assert!(scheduler.next(now, |_| false, false, false).is_none());
+        let second = scheduler
+            .next(now + BUSY_RETRY, |_| false, false, false)
+            .unwrap();
+        assert_eq!(second.route, route_a);
         assert!(scheduler.active_succeeded(request, now));
+        assert!(scheduler.active_succeeded(second, now));
+    }
+
+    #[test]
+    fn scheduler_caps_parallelism_and_serializes_each_first_hop() {
+        let now = Instant::now();
+        let mut scheduler = ActiveProbeScheduler::new(8);
+        for index in 1..=6 {
+            scheduler.register(
+                RouteKey {
+                    destination: endpoint(index),
+                    first_hop: endpoint(index + 10),
+                },
+                now,
+            );
+        }
+        let requests = (0..MAX_CONCURRENT_PROBES)
+            .map(|_| scheduler.next(now, |_| false, false, false).unwrap())
+            .collect::<Vec<_>>();
+        assert!(scheduler.next(now, |_| false, false, false).is_none());
+        assert_eq!(scheduler.in_flight.len(), MAX_CONCURRENT_PROBES);
+        for request in requests {
+            assert!(scheduler.active_succeeded(request, now));
+        }
+
+        let shared_hop = endpoint(30);
+        let routes = [
+            RouteKey {
+                destination: endpoint(20),
+                first_hop: shared_hop,
+            },
+            RouteKey {
+                destination: endpoint(21),
+                first_hop: shared_hop,
+            },
+        ];
+        let mut scheduler = ActiveProbeScheduler::new(2);
+        for route in routes {
+            scheduler.register(route, now);
+        }
+        let first = scheduler.next(now, |_| false, false, false).unwrap();
+        assert!(scheduler.next(now, |_| false, false, false).is_none());
+        assert!(scheduler.active_succeeded(first, now));
     }
 
     #[test]
@@ -1108,9 +1218,11 @@ mod tests {
                 let index = (second as usize / 997) % routes.len();
                 scheduler.observe_passive(routes[index], now);
             }
-            if let Some(request) = scheduler.next(now, |_| false, false, false) {
+            for _ in 0..MAX_CONCURRENT_PROBES {
+                let Some(request) = scheduler.next(now, |_| false, false, false) else {
+                    break;
+                };
                 assert!(scheduler.record_bytes(request, TRAIN_BYTES));
-                assert!(scheduler.next(now, |_| false, false, false).is_none());
                 completed += 1;
                 if completed.is_multiple_of(17) {
                     assert!(scheduler.failed(request, now));
@@ -1127,7 +1239,10 @@ mod tests {
         assert!(snapshot.attempts_total > u64::from(ROUTES) * 100);
         assert_eq!(snapshot.failures_total, snapshot.attempts_total / 17);
         assert_eq!(snapshot.bytes_total, snapshot.attempts_total * TRAIN_BYTES);
-        assert!(snapshot.attempts_total <= SOAK_SECONDS + 1);
+        assert!(
+            snapshot.attempts_total
+                <= (SOAK_SECONDS + 1) * u64::try_from(MAX_CONCURRENT_PROBES).unwrap()
+        );
         assert!(snapshot.routes.values().all(|route| !route.in_flight));
     }
 }
