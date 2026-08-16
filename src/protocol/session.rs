@@ -29,6 +29,46 @@ pub struct LinkAuthentication {
     pub secret: [u8; 32],
 }
 
+/// Bounds advertised by one endpoint. In automatic mode these are ceilings,
+/// not a request to start at the maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCapabilities {
+    pub auto_tune: bool,
+    pub max_data_lanes: u8,
+    pub fec_supported: bool,
+    pub fec_initial: bool,
+    pub max_frame_size: u16,
+    pub send_buffer_bytes: u32,
+    pub receive_buffer_bytes: u32,
+    /// Zero means no explicit outer pacing ceiling.
+    pub max_pacing_mbps: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionalTransportProfile {
+    pub frame_size: u16,
+    pub data_lanes: u8,
+    pub fec_enabled: bool,
+    pub send_buffer_bytes: u32,
+    pub receive_buffer_bytes: u32,
+    /// Zero means no explicit outer pacing ceiling.
+    pub pacing_mbps: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportProfile {
+    /// Settings for traffic sent by this endpoint.
+    pub outbound: DirectionalTransportProfile,
+    /// Settings for traffic received by this endpoint.
+    pub inbound: DirectionalTransportProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct WireTransportProfile {
+    client_to_server: DirectionalTransportProfile,
+    server_to_client: DirectionalTransportProfile,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionPolicy {
     pub network_id: String,
@@ -37,6 +77,8 @@ pub struct SessionPolicy {
     pub max_datagram_size: u32,
     pub max_control_size: u32,
     pub features: Vec<FeatureOffer>,
+    pub transport: TransportCapabilities,
+    pub request_data_lane: bool,
     pub link: Option<LinkAuthentication>,
     /// Invite used to admit the local identity. Creator and legacy configurations omit it.
     pub local_invite_id: Option<String>,
@@ -52,6 +94,8 @@ pub struct NegotiatedSession {
     pub max_control_size: u32,
     pub features: Vec<NegotiatedFeature>,
     pub link_id: Option<String>,
+    pub transport: Option<TransportProfile>,
+    pub data_lane: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +109,10 @@ struct Hello {
     max_datagram_size: u32,
     max_control_size: u32,
     features: Vec<FeatureOffer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport: Option<TransportCapabilities>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    data_lane: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +133,10 @@ struct HelloAck {
     max_datagram_size: u32,
     max_control_size: u32,
     features: Vec<NegotiatedFeature>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport: Option<WireTransportProfile>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    data_lane: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,7 +193,7 @@ async fn client(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
     )
     .await?;
     send.finish().context("finishing v1 session stream")?;
-    Ok(session_from_ack(ack))
+    Ok(session_from_ack(ack, Side::Client))
 }
 
 async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<NegotiatedSession> {
@@ -166,6 +218,11 @@ async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
         max_datagram_size: policy.max_datagram_size.min(hello.max_datagram_size),
         max_control_size: policy.max_control_size.min(hello.max_control_size),
         features,
+        transport: hello.transport.map(|client| WireTransportProfile {
+            client_to_server: select_direction(client, policy.transport),
+            server_to_client: select_direction(policy.transport, client),
+        }),
+        data_lane: hello.data_lane,
         link_id: policy.link.as_ref().map(|link| link.link_id.clone()),
         invite_id: policy.local_invite_id.clone(),
         membership_proof: [0; 32],
@@ -183,7 +240,7 @@ async fn server(connection: &Connection, policy: &SessionPolicy) -> Result<Negot
         "v1 session transcript mismatch"
     );
     send.finish().context("finishing v1 session response")?;
-    Ok(session_from_ack(ack))
+    Ok(session_from_ack(ack, Side::Server))
 }
 
 fn make_hello(policy: &SessionPolicy, nonce: [u8; 32]) -> Hello {
@@ -197,6 +254,8 @@ fn make_hello(policy: &SessionPolicy, nonce: [u8; 32]) -> Hello {
         max_datagram_size: policy.max_datagram_size,
         max_control_size: policy.max_control_size,
         features: policy.features.clone(),
+        transport: Some(policy.transport),
+        data_lane: policy.request_data_lane,
         link_id: policy.link.as_ref().map(|link| link.link_id.clone()),
         invite_id: policy.local_invite_id.clone(),
         membership_proof: [0; 32],
@@ -232,6 +291,14 @@ fn validate_hello(policy: &SessionPolicy, hello: &Hello) -> Result<()> {
         "peer control limit is too small"
     );
     ensure!(
+        !hello.data_lane
+            || (hello
+                .transport
+                .is_some_and(|transport| transport.max_data_lanes > 1)
+                && policy.transport.max_data_lanes > 1),
+        "peer requested an unsupported parallel data lane"
+    );
+    ensure!(
         constant_time_eq(
             &hello.membership_proof,
             &hello_proof(&policy.network_id, hello)
@@ -255,6 +322,10 @@ fn validate_ack(policy: &SessionPolicy, hello: &Hello, ack: &HelloAck) -> Result
         "v1 acknowledgement identity mismatch"
     );
     ensure!(
+        ack.data_lane == hello.data_lane,
+        "peer did not acknowledge the requested connection role"
+    );
+    ensure!(
         ack.max_datagram_size <= policy.max_datagram_size
             && ack.max_datagram_size >= 256
             && ack.max_control_size <= policy.max_control_size
@@ -267,6 +338,9 @@ fn validate_ack(policy: &SessionPolicy, hello: &Hello, ack: &HelloAck) -> Result
     );
     validate_invite(policy, ack.invite_id.as_deref())?;
     validate_selection(&policy.features, &ack.features)?;
+    if let Some(profile) = ack.transport {
+        validate_transport_profile(policy.transport, profile)?;
+    }
     validate_link_ack(policy, ack)
 }
 
@@ -314,14 +388,87 @@ fn validate_link_ack(policy: &SessionPolicy, ack: &HelloAck) -> Result<()> {
     }
 }
 
-fn session_from_ack(ack: HelloAck) -> NegotiatedSession {
+fn session_from_ack(ack: HelloAck, side: Side) -> NegotiatedSession {
+    let transport = ack.transport.map(|profile| match side {
+        Side::Client => TransportProfile {
+            outbound: profile.client_to_server,
+            inbound: profile.server_to_client,
+        },
+        Side::Server => TransportProfile {
+            outbound: profile.server_to_client,
+            inbound: profile.client_to_server,
+        },
+    });
     NegotiatedSession {
         minor: ack.minor,
         max_datagram_size: ack.max_datagram_size,
         max_control_size: ack.max_control_size,
         features: ack.features,
         link_id: ack.link_id,
+        transport,
+        data_lane: ack.data_lane,
     }
+}
+
+fn select_direction(
+    sender: TransportCapabilities,
+    receiver: TransportCapabilities,
+) -> DirectionalTransportProfile {
+    let data_lanes = sender.max_data_lanes.min(receiver.max_data_lanes).max(1);
+    let pacing_mbps = match (sender.max_pacing_mbps, receiver.max_pacing_mbps) {
+        (0, value) | (value, 0) => value,
+        (left, right) => left.min(right),
+    };
+    DirectionalTransportProfile {
+        frame_size: sender.max_frame_size.min(receiver.max_frame_size).max(256),
+        data_lanes,
+        fec_enabled: sender.fec_supported
+            && receiver.fec_supported
+            && (sender.fec_initial || receiver.fec_initial),
+        send_buffer_bytes: sender.send_buffer_bytes,
+        receive_buffer_bytes: receiver.receive_buffer_bytes,
+        pacing_mbps,
+    }
+}
+
+fn validate_transport_profile(
+    local: TransportCapabilities,
+    profile: WireTransportProfile,
+) -> Result<()> {
+    let inbound = profile.server_to_client;
+    let outbound = profile.client_to_server;
+    ensure!(
+        outbound.frame_size <= local.max_frame_size
+            && inbound.frame_size <= local.max_frame_size
+            && outbound.frame_size >= 256
+            && inbound.frame_size >= 256,
+        "negotiated transport frame size exceeds local limits"
+    );
+    ensure!(
+        outbound.data_lanes >= 1
+            && inbound.data_lanes >= 1
+            && outbound.data_lanes <= local.max_data_lanes
+            && inbound.data_lanes <= local.max_data_lanes,
+        "negotiated transport lane count exceeds local limits"
+    );
+    ensure!(
+        (!outbound.fec_enabled && !inbound.fec_enabled) || local.fec_supported,
+        "peer enabled unsupported FEC"
+    );
+    ensure!(
+        outbound.send_buffer_bytes <= local.send_buffer_bytes
+            && inbound.receive_buffer_bytes <= local.receive_buffer_bytes,
+        "negotiated transport buffer exceeds local limits"
+    );
+    ensure!(
+        local.max_pacing_mbps == 0
+            || (outbound.pacing_mbps != 0
+                && outbound.pacing_mbps <= local.max_pacing_mbps
+                && inbound.pacing_mbps != 0
+                && inbound.pacing_mbps <= local.max_pacing_mbps),
+        "negotiated transport pacing exceeds local limits"
+    );
+    Ok(())
 }
 
 fn compatible_minor(
@@ -382,6 +529,8 @@ fn hello_unsigned(hello: &Hello) -> Vec<u8> {
         max_datagram_size: hello.max_datagram_size,
         max_control_size: hello.max_control_size,
         features: hello.features.clone(),
+        transport: None,
+        data_lane: false,
         link_id: hello.link_id.clone(),
         invite_id: hello.invite_id.clone(),
         membership_proof: [0; 32],
@@ -401,6 +550,8 @@ fn ack_unsigned(ack: &HelloAck) -> Vec<u8> {
         max_datagram_size: ack.max_datagram_size,
         max_control_size: ack.max_control_size,
         features: ack.features.clone(),
+        transport: None,
+        data_lane: false,
         link_id: ack.link_id.clone(),
         invite_id: ack.invite_id.clone(),
         membership_proof: [0; 32],
@@ -447,6 +598,10 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         .zip(right)
         .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
         == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 async fn write_record(send: &mut iroh::endpoint::SendStream, bytes: &[u8]) -> Result<()> {
@@ -527,6 +682,17 @@ mod tests {
             max_datagram_size: 1_400,
             max_control_size: 32 * 1024,
             features: feature::core_offers(true, true, true, false),
+            transport: TransportCapabilities {
+                auto_tune: true,
+                max_data_lanes: 4,
+                fec_supported: true,
+                fec_initial: false,
+                max_frame_size: 1_400,
+                send_buffer_bytes: 131_072,
+                receive_buffer_bytes: 8 * 1024 * 1024,
+                max_pacing_mbps: 0,
+            },
+            request_data_lane: false,
             link: None,
             local_invite_id: None,
             authority_invites: None,
@@ -607,6 +773,51 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(selected.contains(&feature::DATA_PLANE));
         assert!(!selected.contains(&feature::FEC));
+        client.close(0_u8.into(), b"done");
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn transport_profile_is_directional_and_starts_conservatively() {
+        let (client_endpoint, server_endpoint, client, server) = connections().await;
+        let mut client_policy = policy("network-a", client_endpoint.id(), server_endpoint.id());
+        let mut server_policy = policy("network-a", server_endpoint.id(), client_endpoint.id());
+        client_policy.transport.send_buffer_bytes = 64 * 1024;
+        client_policy.transport.receive_buffer_bytes = 4 * 1024 * 1024;
+        server_policy.transport.send_buffer_bytes = 256 * 1024;
+        server_policy.transport.receive_buffer_bytes = 16 * 1024 * 1024;
+
+        let (client_session, server_session) =
+            negotiate_pair(&client, &server, &client_policy, &server_policy).await;
+        let client_profile = client_session.unwrap().transport.unwrap();
+        let server_profile = server_session.unwrap().transport.unwrap();
+        assert_eq!(client_profile.outbound, server_profile.inbound);
+        assert_eq!(client_profile.inbound, server_profile.outbound);
+        assert_eq!(client_profile.outbound.data_lanes, 4);
+        assert!(!client_profile.outbound.fec_enabled);
+        assert_eq!(client_profile.outbound.send_buffer_bytes, 64 * 1024);
+        assert_eq!(
+            client_profile.outbound.receive_buffer_bytes,
+            16 * 1024 * 1024
+        );
+        assert_eq!(client_profile.inbound.send_buffer_bytes, 256 * 1024);
+        assert_eq!(client_profile.inbound.receive_buffer_bytes, 4 * 1024 * 1024);
+        client.close(0_u8.into(), b"done");
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_lane_role_is_explicitly_acknowledged() {
+        let (client_endpoint, server_endpoint, client, server) = connections().await;
+        let mut client_policy = policy("network-a", client_endpoint.id(), server_endpoint.id());
+        let server_policy = policy("network-a", server_endpoint.id(), client_endpoint.id());
+        client_policy.request_data_lane = true;
+        let (client_session, server_session) =
+            negotiate_pair(&client, &server, &client_policy, &server_policy).await;
+        assert!(client_session.unwrap().data_lane);
+        assert!(server_session.unwrap().data_lane);
         client.close(0_u8.into(), b"done");
         client_endpoint.close().await;
         server_endpoint.close().await;
@@ -753,6 +964,8 @@ mod tests {
             max_datagram_size: 0,
             max_control_size: 0,
             features: feature::negotiate(&policy.features, &hello.features).unwrap(),
+            transport: None,
+            data_lane: false,
             link_id: None,
             invite_id: None,
             membership_proof: [0; 32],

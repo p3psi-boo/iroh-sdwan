@@ -583,7 +583,7 @@ impl MeshRuntime {
         let now = SystemTime::now();
         let sequence_file = sequence_file_path(config);
         let sequence = reserve_sequence(&sequence_file, now)?;
-        let mut hidden_underlay_prefixes = config.forbidden_underlay_prefixes.clone();
+        let mut hidden_underlay_prefixes = config.excluded_underlay_prefixes.clone();
         hidden_underlay_prefixes.extend(config.all_overlay_prefixes());
         hidden_underlay_prefixes.extend(config.private_locator_prefixes());
         let local_presence = build_local_presence(
@@ -849,7 +849,7 @@ impl MeshRuntime {
             "bootstrap presence owner does not match QUIC identity"
         );
         ensure!(
-            self.forbidden_underlay_candidate(&message.presence)
+            self.excluded_underlay_candidate(&message.presence)
                 .is_none(),
             "bootstrap presence contains forbidden underlay candidate"
         );
@@ -1118,7 +1118,7 @@ impl MeshRuntime {
                         continue;
                     }
                     if let Some((address, prefix)) =
-                        self.forbidden_underlay_candidate(&message.presence)
+                        self.excluded_underlay_candidate(&message.presence)
                     {
                         warn!(endpoint_id = %remote_id, owner = %message.presence.body.owner, %address, %prefix, "discarding presence with forbidden underlay candidate");
                         continue;
@@ -1286,7 +1286,7 @@ impl MeshRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn forbidden_underlay_candidate(
+    fn excluded_underlay_candidate(
         &self,
         presence: &SignedPresence,
     ) -> Option<(SocketAddr, IpNet)> {
@@ -1878,12 +1878,13 @@ mod tests {
             network_id: "mesh-test-secret".into(),
             identity_file: "identity.key".into(),
             bind_addresses: Vec::new(),
-            forbidden_underlay_prefixes: Vec::new(),
+            excluded_underlay_prefixes: Vec::new(),
             discovery_enabled: true,
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
             udp_segmentation_offload: false,
+            quic_auto_tune: true,
             quic_send_buffer_bytes: crate::config::default_quic_send_buffer_bytes(),
             quic_receive_buffer_bytes: crate::config::default_quic_receive_buffer_bytes(),
             quic_data_lanes: crate::config::default_quic_data_lanes(),

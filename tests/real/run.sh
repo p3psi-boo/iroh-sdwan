@@ -31,7 +31,7 @@ health() {
     set -eu
     test \"\$(systemctl is-active ironet-trial.service)\" = active
     '$STATE_DIR/bin/ironet' health --config '$STATE_DIR/config.toml'
-    grep -q 'forbidden_underlay_prefixes = \\[\"200::/7\"\\]' '$STATE_DIR/config.toml'
+    grep -q 'excluded_underlay_prefixes = \\[\"200::/7\"\\]' '$STATE_DIR/config.toml'
     python3 - '$STATE_DIR/status.json' '$expected_peer' <<'PY'
 import json, sys
 status = json.load(open(sys.argv[1]))

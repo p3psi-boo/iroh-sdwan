@@ -75,7 +75,10 @@ use crate::{
     path_selection::WanPathSelector,
     protocol::{
         feature,
-        session::{LinkAuthentication, NegotiatedSession, SessionPolicy, negotiate_connection},
+        session::{
+            LinkAuthentication, NegotiatedSession, SessionPolicy, TransportCapabilities,
+            negotiate_connection,
+        },
     },
     system::{
         cleanup_node_interface, cleanup_routing, prepare_node_interface, prepare_routing,
@@ -1111,7 +1114,7 @@ async fn run_data_plane(
         let peers = peers.clone();
         let alpn = alpn.clone();
         let probe_alpn = probe_alpn.clone();
-        let forbidden_underlay_prefixes = Arc::new(underlay_exclusion_prefixes(config));
+        let excluded_underlay_prefixes = Arc::new(underlay_exclusion_prefixes(config));
         let dynamic_manager = dynamic_manager.clone();
         tasks.spawn(async move {
             accept_loop(
@@ -1119,7 +1122,7 @@ async fn run_data_plane(
                 peers,
                 alpn,
                 probe_alpn,
-                forbidden_underlay_prefixes,
+                excluded_underlay_prefixes,
                 dynamic_manager,
             )
             .await
@@ -2874,11 +2877,121 @@ fn build_derp_transport(config: &Config) -> Result<Option<Arc<DerpTransport>>> {
 
 fn underlay_exclusion_prefixes(config: &Config) -> Vec<IpNet> {
     config
-        .forbidden_underlay_prefixes
+        .excluded_underlay_prefixes
         .iter()
         .copied()
         .chain(config.all_overlay_prefixes())
         .collect()
+}
+
+fn transport_capabilities(config: &Config) -> TransportCapabilities {
+    TransportCapabilities {
+        auto_tune: config.quic_auto_tune,
+        max_data_lanes: config.quic_data_lanes.min(8) as u8,
+        fec_supported: config.fec.enabled || config.quic_auto_tune,
+        fec_initial: config.fec.enabled,
+        max_frame_size: config.max_frame_size,
+        send_buffer_bytes: config.quic_send_buffer_bytes.min(u32::MAX as usize) as u32,
+        receive_buffer_bytes: config.quic_receive_buffer_bytes.min(u32::MAX as usize) as u32,
+        max_pacing_mbps: config.quic_passthrough_pacing_mbps.unwrap_or(0),
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveFecController {
+    impaired_intervals: u8,
+    healthy_intervals: u8,
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveLaneController {
+    high_rate_intervals: u8,
+    low_rate_intervals: u8,
+    evaluation_intervals: u8,
+    cooldown_intervals: u8,
+    activation_rate_bps: u64,
+}
+
+impl AdaptiveLaneController {
+    fn update(&mut self, active: bool, rate_bps: u64, loss_ppm: u32) -> bool {
+        const ENABLE_RATE_BPS: u64 = 1_200_000_000;
+        const DISABLE_RATE_BPS: u64 = 250_000_000;
+        const MAX_ENABLE_LOSS_PPM: u32 = 5_000;
+        if active {
+            self.high_rate_intervals = 0;
+            self.evaluation_intervals = self.evaluation_intervals.saturating_add(1);
+            if loss_ppm > 10_000
+                || (self.evaluation_intervals >= 8
+                    && rate_bps < self.activation_rate_bps.saturating_mul(98) / 100)
+            {
+                self.cooldown_intervals = 60;
+                self.evaluation_intervals = 0;
+                return false;
+            }
+            if rate_bps < DISABLE_RATE_BPS {
+                self.low_rate_intervals = self.low_rate_intervals.saturating_add(1);
+            } else {
+                self.low_rate_intervals = 0;
+            }
+            self.low_rate_intervals < 30
+        } else {
+            self.low_rate_intervals = 0;
+            self.evaluation_intervals = 0;
+            if self.cooldown_intervals > 0 {
+                self.cooldown_intervals -= 1;
+                self.high_rate_intervals = 0;
+                return false;
+            }
+            if rate_bps >= ENABLE_RATE_BPS && loss_ppm <= MAX_ENABLE_LOSS_PPM {
+                self.high_rate_intervals = self.high_rate_intervals.saturating_add(1);
+            } else {
+                self.high_rate_intervals = 0;
+            }
+            if self.high_rate_intervals >= 5 {
+                self.activation_rate_bps = rate_bps;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+impl AdaptiveFecController {
+    fn update(&mut self, active: bool, loss_ppm: u32, sample_packets: u64, rate_bps: u64) -> bool {
+        const MIN_SAMPLE_PACKETS: u64 = 1_000;
+        const MAX_AUTO_FEC_RATE_BPS: u64 = 50_000_000;
+        const ENABLE_LOSS_PPM: u32 = 20_000;
+        const DISABLE_LOSS_PPM: u32 = 1_000;
+        const ENABLE_INTERVALS: u8 = 3;
+        const DISABLE_INTERVALS: u8 = 20;
+
+        if rate_bps > MAX_AUTO_FEC_RATE_BPS {
+            self.impaired_intervals = 0;
+            self.healthy_intervals = 0;
+            return false;
+        }
+        if sample_packets < MIN_SAMPLE_PACKETS {
+            return active;
+        }
+        if active {
+            self.impaired_intervals = 0;
+            if loss_ppm <= DISABLE_LOSS_PPM {
+                self.healthy_intervals = self.healthy_intervals.saturating_add(1);
+            } else {
+                self.healthy_intervals = 0;
+            }
+            self.healthy_intervals < DISABLE_INTERVALS
+        } else {
+            self.healthy_intervals = 0;
+            if loss_ppm >= ENABLE_LOSS_PPM {
+                self.impaired_intervals = self.impaired_intervals.saturating_add(1);
+            } else {
+                self.impaired_intervals = 0;
+            }
+            self.impaired_intervals >= ENABLE_INTERVALS
+        }
+    }
 }
 
 fn underlay_publish_exclusion_prefixes(config: &Config) -> Vec<IpNet> {
@@ -3583,10 +3696,12 @@ impl DynamicMeshManager {
                 max_control_size: 32 * 1024,
                 features: feature::core_offers(
                     self.config.routing.transit_enabled,
-                    self.config.fec.enabled,
+                    self.config.fec.enabled || self.config.quic_auto_tune,
                     self.config.mesh.enabled,
                     false,
                 ),
+                transport: transport_capabilities(&self.config),
+                request_data_lane: false,
                 link: None,
                 local_invite_id: crate::product::local_invite_id(&self.config.identity_file),
                 authority_invites: crate::product::authority_invites(&self.config.identity_file),
@@ -3856,7 +3971,7 @@ struct Peer {
     enforce_overlay_prefixes: bool,
     transit_enabled: bool,
     allowed_source_prefixes: Arc<IpPrefixSet>,
-    forbidden_underlay_prefixes: Arc<Vec<IpNet>>,
+    excluded_underlay_prefixes: Arc<Vec<IpNet>>,
     allowed_local_underlay_prefixes: Arc<Vec<IpNet>>,
     allowed_remote_underlay_prefixes: Arc<Vec<IpNet>>,
     private_remote_addresses: Arc<Vec<std::net::SocketAddr>>,
@@ -3872,15 +3987,22 @@ struct Peer {
     path_epoch: AtomicU64,
     selected_path_fingerprint: StdRwLock<String>,
     frame_size_ceiling: usize,
+    auto_tune: bool,
+    negotiated_frame_size_ceiling: AtomicU64,
     quic_send_buffer_bytes: usize,
-    secondary_data_lanes: usize,
+    max_secondary_data_lanes: usize,
+    desired_secondary_data_lanes: AtomicU64,
+    negotiated_secondary_data_lanes: AtomicU64,
     effective_frame_size: AtomicU64,
     /// Taken once by `queue_to_network`; encoder mutation is single-writer.
     fec_encoder: StdMutex<Option<FecEncoder>>,
     fec_reset_epoch: AtomicU64,
     fec_decoder_ttl: Duration,
     fec_buffer_limit: usize,
-    fec_enabled: bool,
+    fec_available: bool,
+    fec_forced: bool,
+    fec_negotiated: AtomicBool,
+    fec_active: AtomicBool,
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
     nat64_prefix: Arc<StdRwLock<Option<Nat64Prefix>>>,
@@ -3955,7 +4077,7 @@ impl Peer {
     }
 
     fn connection_for_lane_hash(&self, primary: &Connection, lane_hash: u64) -> Connection {
-        if self.fec_enabled {
+        if self.fec_active.load(Ordering::Relaxed) {
             return primary.clone();
         }
         let lanes = self.data_lanes.load();
@@ -3969,6 +4091,31 @@ impl Peer {
 
     fn data_lane_count(&self) -> usize {
         self.data_lanes.load().len()
+    }
+
+    fn selected_transport_fingerprint(connection: &Connection) -> Option<String> {
+        connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| format!("{:?}", path.remote_addr()))
+    }
+
+    fn retire_data_lanes(&self, reason: &'static [u8]) {
+        let _transition = self
+            .connection_update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lanes = self.data_lanes.swap(Arc::new(Vec::new()));
+        if lanes.is_empty() {
+            return;
+        }
+        self.connection_updates.send_modify(|epoch| *epoch += 1);
+        for lane in lanes.iter() {
+            lane.cancel.cancel();
+            lane.connection.close(0_u8.into(), reason);
+        }
+        self.reconnect_needed.notify_one();
     }
 
     fn create(
@@ -4050,9 +4197,8 @@ impl Peer {
         ));
         let frame_size_ceiling = usize::from(config.max_frame_size);
         let effective_frame_size = frame_size_ceiling.min(1_200);
-        let fec_encoder = config
-            .fec
-            .enabled
+        let fec_available = config.fec.enabled || config.quic_auto_tune;
+        let fec_encoder = fec_available
             .then(|| {
                 FecEncoder::new(
                     usize::from(config.fec.data_shards),
@@ -4114,10 +4260,12 @@ impl Peer {
                 max_control_size: 32 * 1024,
                 features: feature::core_offers(
                     config.routing.transit_enabled,
-                    config.fec.enabled,
+                    config.fec.enabled || config.quic_auto_tune,
                     config.mesh.enabled && link.is_none(),
                     link.is_some(),
                 ),
+                transport: transport_capabilities(config),
+                request_data_lane: false,
                 link: link.map(|link| {
                     let decoded = hex::decode(&link.auth_key).expect("validated pairwise auth key");
                     let mut secret = [0_u8; 32];
@@ -4156,7 +4304,7 @@ impl Peer {
             allowed_source_prefixes: Arc::new(IpPrefixSet::from_prefixes(
                 peer.allowed_source_prefixes.iter().copied(),
             )),
-            forbidden_underlay_prefixes: Arc::new(underlay_exclusion_prefixes(config)),
+            excluded_underlay_prefixes: Arc::new(underlay_exclusion_prefixes(config)),
             allowed_local_underlay_prefixes: Arc::new(
                 link.map_or_else(Vec::new, |link| link.allowed_local_prefixes.clone()),
             ),
@@ -4181,14 +4329,25 @@ impl Peer {
             path_epoch: AtomicU64::new(0),
             selected_path_fingerprint: StdRwLock::new(String::new()),
             frame_size_ceiling,
+            auto_tune: config.quic_auto_tune,
+            negotiated_frame_size_ceiling: AtomicU64::new(frame_size_ceiling as u64),
             quic_send_buffer_bytes: config.quic_send_buffer_bytes,
-            secondary_data_lanes: config.quic_data_lanes.saturating_sub(1),
+            max_secondary_data_lanes: config.quic_data_lanes.saturating_sub(1),
+            desired_secondary_data_lanes: AtomicU64::new(if config.quic_auto_tune {
+                0
+            } else {
+                config.quic_data_lanes.saturating_sub(1) as u64
+            }),
+            negotiated_secondary_data_lanes: AtomicU64::new(0),
             effective_frame_size: AtomicU64::new(effective_frame_size as u64),
             fec_encoder: StdMutex::new(fec_encoder),
             fec_reset_epoch: AtomicU64::new(0),
             fec_decoder_ttl: Duration::from_millis(config.fec.decoder_ttl_millis),
             fec_buffer_limit,
-            fec_enabled: config.fec.enabled,
+            fec_available,
+            fec_forced: config.fec.enabled,
+            fec_negotiated: AtomicBool::new(false),
+            fec_active: AtomicBool::new(false),
             derp_transport: services.derp_transport.cloned(),
             mesh_runtime: services.mesh_runtime,
             nat64_prefix: services.nat64_prefix,
@@ -4317,7 +4476,7 @@ impl Peer {
                     };
                     let automatic = self.effective_frame_size.load(Ordering::Relaxed) as usize;
                     let maximum = path_maximum
-                        .min(self.frame_size_ceiling)
+                        .min(self.negotiated_frame_size_ceiling.load(Ordering::Relaxed) as usize)
                         .min(automatic.max(256));
                     let Some(job) = self
                         .encode_transmission(
@@ -4390,7 +4549,8 @@ impl Peer {
             .selected_path_transport
             .load(Ordering::Relaxed)
             == 4;
-        let fec_active = fec_encoder.is_some()
+        let fec_active = self.fec_active.load(Ordering::Relaxed)
+            && fec_encoder.is_some()
             && !selected_is_derp
             && (self
                 .counters
@@ -4671,7 +4831,9 @@ impl Peer {
     }
 
     async fn ensure_data_lanes(self: &Arc<Self>) -> Result<()> {
-        if self.fec_enabled || self.secondary_data_lanes == 0 {
+        let desired_secondary_data_lanes =
+            self.desired_secondary_data_lanes.load(Ordering::Relaxed) as usize;
+        if self.fec_active.load(Ordering::Relaxed) || desired_secondary_data_lanes == 0 {
             return Ok(());
         }
         let Some(primary) = self.current_connection() else {
@@ -4683,13 +4845,19 @@ impl Peer {
         if primary.side() != Side::Client {
             return Ok(());
         }
-        while self.data_lane_count() < self.secondary_data_lanes {
+        while self.data_lane_count() < desired_secondary_data_lanes {
             let endpoint_addr = self.dial_addr().await;
             let connection = self
                 .connect_best_available(endpoint_addr)
                 .await
                 .with_context(|| format!("failed opening data lane for {}", self.name))?;
-            self.install_connection(connection).await?;
+            let mut lane_policy = self.session_policy.clone();
+            lane_policy.request_data_lane = true;
+            let negotiated = negotiate_connection(&connection, &lane_policy)
+                .await
+                .with_context(|| format!("failed negotiating data lane for {}", self.name))?;
+            self.install_connection_with_session(connection, Some(negotiated))
+                .await?;
         }
         Ok(())
     }
@@ -4753,7 +4921,7 @@ impl Peer {
                     .into_addrs()
                     .map(|address| address.into_addr())
                     .filter(|address| {
-                        dial_address_allowed(address, &self.forbidden_underlay_prefixes)
+                        dial_address_allowed(address, &self.excluded_underlay_prefixes)
                     }),
             );
         }
@@ -4773,7 +4941,7 @@ impl Peer {
                             .addrs
                             .into_iter()
                             .filter(|address| {
-                                dial_address_allowed(address, &self.forbidden_underlay_prefixes)
+                                dial_address_allowed(address, &self.excluded_underlay_prefixes)
                             }),
                     );
                     if endpoint_addr.ip_addrs().next().is_some()
@@ -4795,7 +4963,7 @@ impl Peer {
                 .filter(|address| {
                     dial_address_allowed(
                         &TransportAddr::Ip(*address),
-                        &self.forbidden_underlay_prefixes,
+                        &self.excluded_underlay_prefixes,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4828,7 +4996,7 @@ impl Peer {
             .filter(|address| {
                 publishable_address(
                     &TransportAddr::Ip(*address),
-                    &self.forbidden_underlay_prefixes,
+                    &self.excluded_underlay_prefixes,
                 )
             })
             .take(32)
@@ -4843,8 +5011,8 @@ impl Peer {
         let mut added_addresses = Vec::new();
         for address in addresses {
             let transport = TransportAddr::Ip(address);
-            if publishable_address(&transport, &self.forbidden_underlay_prefixes)
-                && dial_address_allowed(&transport, &self.forbidden_underlay_prefixes)
+            if publishable_address(&transport, &self.excluded_underlay_prefixes)
+                && dial_address_allowed(&transport, &self.excluded_underlay_prefixes)
                 && discovered.insert(address)
             {
                 added_addresses.push(address);
@@ -4933,7 +5101,7 @@ impl Peer {
             );
         }
         if let Some((address, prefix)) =
-            forbidden_selected_path(&connection, &self.forbidden_underlay_prefixes)
+            excluded_selected_path(&connection, &self.excluded_underlay_prefixes)
         {
             connection.close(2_u8.into(), b"forbidden underlay path");
             bail!(
@@ -4967,14 +5135,53 @@ impl Peer {
                 }
             },
         };
-        if !self.fec_enabled
-            && self.data_lane_count() < self.secondary_data_lanes
-            && self
-                .current_connection()
-                .is_some_and(|current| current.side() == connection.side())
-        {
+        if negotiated.data_lane {
+            ensure!(
+                !self.fec_active.load(Ordering::Relaxed),
+                "parallel data lane is disabled while FEC is active"
+            );
             return self.install_data_lane(connection, negotiated).await;
         }
+        let fec_negotiated = negotiated
+            .features
+            .iter()
+            .any(|selected| selected.id == feature::FEC);
+        self.fec_negotiated.store(fec_negotiated, Ordering::Relaxed);
+        let negotiated_lanes = negotiated
+            .transport
+            .map_or(1, |profile| profile.outbound.data_lanes)
+            .max(1);
+        let configured_lanes = self.max_secondary_data_lanes as u64 + 1;
+        self.negotiated_secondary_data_lanes.store(
+            configured_lanes
+                .min(u64::from(negotiated_lanes))
+                .saturating_sub(1),
+            Ordering::Relaxed,
+        );
+        if !self.auto_tune {
+            self.desired_secondary_data_lanes.store(
+                configured_lanes
+                    .min(u64::from(negotiated_lanes))
+                    .saturating_sub(1),
+                Ordering::Relaxed,
+            );
+        }
+        self.fec_active.store(
+            fec_negotiated
+                && (self.fec_forced
+                    || negotiated
+                        .transport
+                        .is_some_and(|profile| profile.outbound.fec_enabled)),
+            Ordering::Relaxed,
+        );
+        self.negotiated_frame_size_ceiling.store(
+            negotiated
+                .transport
+                .map_or(self.frame_size_ceiling as u64, |profile| {
+                    u64::from(profile.outbound.frame_size)
+                }),
+            Ordering::Relaxed,
+        );
         let transition = self
             .connection_update
             .lock()
@@ -5395,7 +5602,13 @@ impl Peer {
             let mut paths = connection.paths_stream();
             let mut telemetry = tokio::time::interval(Duration::from_secs(1));
             telemetry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut frame_sizer = AdaptiveFrameSizer::new(peer.frame_size_ceiling);
+            let mut frame_sizer = AdaptiveFrameSizer::new(
+                peer.negotiated_frame_size_ceiling.load(Ordering::Relaxed) as usize,
+            );
+            let mut fec_controller = AdaptiveFecController::default();
+            let mut lane_controller = AdaptiveLaneController::default();
+            let mut previous_tx_datagrams = 0_u64;
+            let mut previous_tx_bytes = peer.counters.tx_bytes.load(Ordering::Relaxed);
             loop {
                 tokio::select! {
                     _ = telemetry_cancel.cancelled() => break,
@@ -5438,6 +5651,7 @@ impl Peer {
                                 peer.path_epoch.fetch_add(1, Ordering::Relaxed);
                             }
                             if changed && previous != 0 {
+                                peer.retire_data_lanes(b"primary path changed");
                                 peer.counters.path_switches.fetch_add(1, Ordering::Relaxed);
                                 info!(
                                     peer = %peer.name,
@@ -5454,7 +5668,7 @@ impl Peer {
                                 forbidden_transport_path(
                                     path.remote_addr(),
                                     path.local_addr(),
-                                    &peer.forbidden_underlay_prefixes,
+                                    &peer.excluded_underlay_prefixes,
                                 )
                             });
                         if let Some((address, prefix)) = forbidden {
@@ -5495,6 +5709,11 @@ impl Peer {
                         peer.counters
                             .path_tx_datagrams
                             .store(stats.udp_tx.datagrams, Ordering::Relaxed);
+                        let tx_delta = stats
+                            .udp_tx
+                            .datagrams
+                            .saturating_sub(previous_tx_datagrams);
+                        previous_tx_datagrams = stats.udp_tx.datagrams;
                         peer.counters.path_lost_packets.store(stats.lost_packets, Ordering::Relaxed);
                         let metrics = peer.link_estimator
                             .write()
@@ -5511,9 +5730,72 @@ impl Peer {
                         peer.counters
                             .path_loss_ppm
                             .store(u64::from(metrics.loss_ppm), Ordering::Relaxed);
+                        let tx_bytes = peer.counters.tx_bytes.load(Ordering::Relaxed);
+                        let rate_bps = tx_bytes
+                            .saturating_sub(previous_tx_bytes)
+                            .saturating_mul(8);
+                        previous_tx_bytes = tx_bytes;
+                        if peer.fec_available
+                            && !peer.fec_forced
+                            && peer.fec_negotiated.load(Ordering::Relaxed)
+                        {
+                            let previous = peer.fec_active.load(Ordering::Relaxed);
+                            let current = fec_controller.update(
+                                previous,
+                                metrics.loss_ppm,
+                                tx_delta,
+                                rate_bps,
+                            );
+                            if current != previous {
+                                peer.fec_active.store(current, Ordering::Relaxed);
+                                peer.fec_reset_epoch.fetch_add(1, Ordering::Release);
+                                if current {
+                                    peer.desired_secondary_data_lanes
+                                        .store(0, Ordering::Relaxed);
+                                    peer.retire_data_lanes(b"adaptive FEC enabled");
+                                }
+                                info!(
+                                    peer = %peer.name,
+                                    enabled = current,
+                                    loss_ppm = metrics.loss_ppm,
+                                    "adapted path FEC"
+                                );
+                            }
+                        }
+                        if peer.auto_tune && peer.max_secondary_data_lanes > 0 {
+                            let active = peer
+                                .desired_secondary_data_lanes
+                                .load(Ordering::Relaxed)
+                                > 0;
+                            let allowed = peer
+                                .negotiated_secondary_data_lanes
+                                .load(Ordering::Relaxed)
+                                > 0
+                                && !peer.fec_active.load(Ordering::Relaxed);
+                            let current = allowed
+                                && lane_controller.update(active, rate_bps, metrics.loss_ppm);
+                            if current != active {
+                                peer.desired_secondary_data_lanes
+                                    .store(u64::from(current), Ordering::Relaxed);
+                                if current {
+                                    peer.reconnect_needed.notify_one();
+                                } else {
+                                    peer.retire_data_lanes(b"adaptive lane retired");
+                                }
+                                info!(
+                                    peer = %peer.name,
+                                    enabled = current,
+                                    rate_bps,
+                                    loss_ppm = metrics.loss_ppm,
+                                    "adapted parallel data lane"
+                                );
+                            }
+                        }
                         let path_limit = connection
                             .max_datagram_size()
-                            .unwrap_or(peer.frame_size_ceiling);
+                            .unwrap_or_else(|| {
+                                peer.negotiated_frame_size_ceiling.load(Ordering::Relaxed) as usize
+                            });
                         let previous = frame_sizer.current();
                         let current = frame_sizer.update(path_limit);
                         peer.effective_frame_size.store(current as u64, Ordering::Relaxed);
@@ -5538,6 +5820,15 @@ impl Peer {
             "peer {} data lane has no DATAGRAM support",
             self.name
         );
+        let primary = self
+            .current_connection()
+            .context("parallel lane arrived without a primary connection")?;
+        ensure!(
+            Self::selected_transport_fingerprint(&primary).is_some()
+                && Self::selected_transport_fingerprint(&primary)
+                    == Self::selected_transport_fingerprint(&connection),
+            "parallel lane selected a different underlay path than the primary"
+        );
         let cancel = CancellationToken::new();
         {
             let _transition = self
@@ -5545,7 +5836,8 @@ impl Peer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut lanes = self.data_lanes.load().as_ref().clone();
-            if lanes.len() >= self.secondary_data_lanes {
+            if lanes.len() >= self.negotiated_secondary_data_lanes.load(Ordering::Relaxed) as usize
+            {
                 connection.close(0_u8.into(), b"parallel lane set complete");
                 return Ok(());
             }
@@ -6019,13 +6311,13 @@ async fn accept_loop(
     peers: Arc<RwLock<HashMap<EndpointId, Arc<Peer>>>>,
     expected_alpn: Arc<Vec<u8>>,
     probe_alpn: Arc<Vec<u8>>,
-    forbidden_underlay_prefixes: Arc<Vec<IpNet>>,
+    excluded_underlay_prefixes: Arc<Vec<IpNet>>,
     dynamic_manager: Option<Arc<DynamicMeshManager>>,
 ) -> Result<()> {
     let admissions = Arc::new(Semaphore::new(UNKNOWN_ADMISSION_CONCURRENCY));
     while let Some(incoming) = endpoint.accept().await {
         if let Some((address, prefix)) =
-            forbidden_incoming_path(&incoming, &forbidden_underlay_prefixes)
+            excluded_incoming_path(&incoming, &excluded_underlay_prefixes)
         {
             warn!(%address, %prefix, "ignoring incoming connection on forbidden underlay path");
             incoming.ignore();
@@ -6104,7 +6396,7 @@ async fn accept_loop(
     Err(anyhow!("iroh endpoint accept loop stopped"))
 }
 
-fn forbidden_incoming_path(
+fn excluded_incoming_path(
     incoming: &iroh::endpoint::Incoming,
     prefixes: &[IpNet],
 ) -> Option<(std::net::IpAddr, IpNet)> {
@@ -6121,7 +6413,7 @@ fn forbidden_incoming_path(
     None
 }
 
-fn forbidden_selected_path(
+fn excluded_selected_path(
     connection: &Connection,
     prefixes: &[IpNet],
 ) -> Option<(std::net::IpAddr, IpNet)> {
@@ -6220,6 +6512,37 @@ mod tests {
 
     fn endpoint(byte: u8) -> EndpointId {
         SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn adaptive_fec_uses_sustained_loss_and_long_healthy_hysteresis() {
+        let mut controller = AdaptiveFecController::default();
+        assert!(!controller.update(false, 30_000, 999, 10_000_000));
+        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
+        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
+        assert!(controller.update(false, 30_000, 10_000, 10_000_000));
+        assert!(!controller.update(true, 30_000, 10_000, 100_000_000));
+        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
+        assert!(!controller.update(false, 30_000, 10_000, 10_000_000));
+        assert!(controller.update(false, 30_000, 10_000, 10_000_000));
+        for _ in 0..19 {
+            assert!(controller.update(true, 500, 10_000, 10_000_000));
+        }
+        assert!(!controller.update(true, 500, 10_000, 10_000_000));
+    }
+
+    #[test]
+    fn adaptive_lane_requires_sustained_rate_and_rolls_back_regression() {
+        let mut controller = AdaptiveLaneController::default();
+        for _ in 0..4 {
+            assert!(!controller.update(false, 1_500_000_000, 1_000));
+        }
+        assert!(controller.update(false, 1_500_000_000, 1_000));
+        for _ in 0..7 {
+            assert!(controller.update(true, 700_000_000, 0));
+        }
+        assert!(!controller.update(true, 700_000_000, 0));
+        assert!(!controller.update(false, 900_000_000, 0));
     }
 
     #[test]

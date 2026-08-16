@@ -20,8 +20,12 @@ pub struct Config {
     pub bind_addresses: Vec<SocketAddr>,
     /// IP prefixes that direct underlay paths must not use. Both the local and
     /// remote address of an IP path are covered.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_underlay_prefixes: Vec<IpNet>,
+    #[serde(
+        default,
+        alias = "forbidden_underlay_prefixes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub excluded_underlay_prefixes: Vec<IpNet>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub discovery_enabled: bool,
     /// Local data-plane attachment. `none` turns the process into a pure
@@ -42,6 +46,10 @@ pub struct Config {
     /// Keep disabled unless the host UDP stack and network interface support it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub udp_segmentation_offload: bool,
+    /// Let peers negotiate conservative initial transport settings and adapt
+    /// them from live path telemetry. Explicit values remain hard ceilings.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub quic_auto_tune: bool,
     /// Bounded userspace QUIC DATAGRAM send queue per connection. Larger
     /// values reduce producer/driver wakeups on fast paths at the cost of a
     /// larger non-preemptible burst.
@@ -761,7 +769,7 @@ impl Config {
             );
             for address in &peer.direct_addresses {
                 ensure!(address.port() != 0, "peer {} has port zero", peer.name);
-                if let Some(prefix) = self.forbidden_underlay_prefix(address.ip()) {
+                if let Some(prefix) = self.excluded_underlay_prefix(address.ip()) {
                     bail!(
                         "peer {} direct address {address} is inside forbidden underlay prefix {prefix}",
                         peer.name
@@ -899,10 +907,10 @@ impl Config {
 
     fn validate_bind_addresses(&self) -> Result<()> {
         let mut forbidden_prefixes = HashSet::new();
-        for prefix in &self.forbidden_underlay_prefixes {
+        for prefix in &self.excluded_underlay_prefixes {
             ensure!(
                 forbidden_prefixes.insert(*prefix),
-                "duplicate forbidden_underlay_prefixes entry {prefix}"
+                "duplicate excluded_underlay_prefixes entry {prefix}"
             );
         }
 
@@ -914,7 +922,7 @@ impl Config {
                 "only one bind_addresses entry is allowed per address family"
             );
             if !address.ip().is_unspecified()
-                && let Some(prefix) = self.forbidden_underlay_prefix(address.ip())
+                && let Some(prefix) = self.excluded_underlay_prefix(address.ip())
             {
                 bail!("bind address {address} is inside forbidden underlay prefix {prefix}");
             }
@@ -1169,8 +1177,8 @@ impl Config {
         Ok(())
     }
 
-    pub fn forbidden_underlay_prefix(&self, address: IpAddr) -> Option<IpNet> {
-        self.forbidden_underlay_prefixes
+    pub fn excluded_underlay_prefix(&self, address: IpAddr) -> Option<IpNet> {
+        self.excluded_underlay_prefixes
             .iter()
             .copied()
             .find(|prefix| prefix.contains(&address))
@@ -1337,7 +1345,7 @@ fn is_default_quic_receive_buffer_bytes(value: &usize) -> bool {
 }
 
 pub const fn default_quic_data_lanes() -> usize {
-    1
+    2
 }
 
 fn is_default_quic_data_lanes(value: &usize) -> bool {
@@ -1557,12 +1565,13 @@ mod tests {
             network_id: "example".into(),
             identity_file: "identity.key".into(),
             bind_addresses: Vec::new(),
-            forbidden_underlay_prefixes: Vec::new(),
+            excluded_underlay_prefixes: Vec::new(),
             discovery_enabled: true,
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
             udp_segmentation_offload: false,
+            quic_auto_tune: true,
             quic_send_buffer_bytes: default_quic_send_buffer_bytes(),
             quic_receive_buffer_bytes: default_quic_receive_buffer_bytes(),
             quic_data_lanes: default_quic_data_lanes(),
@@ -2031,9 +2040,9 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_underlay_prefix_rejects_bind_and_peer_addresses() {
+    fn excluded_underlay_prefix_rejects_bind_and_peer_addresses() {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.forbidden_underlay_prefixes = vec!["200::/7".parse().unwrap()];
+        config.excluded_underlay_prefixes = vec!["200::/7".parse().unwrap()];
         config.bind_addresses = vec!["[200:1234::1]:4000".parse().unwrap()];
         assert!(
             config
@@ -2060,22 +2069,38 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_underlay_prefix_matches_both_address_families() {
+    fn excluded_underlay_prefix_matches_both_address_families() {
         let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.forbidden_underlay_prefixes =
+        config.excluded_underlay_prefixes =
             vec!["100.64.0.0/10".parse().unwrap(), "200::/7".parse().unwrap()];
         assert_eq!(
-            config.forbidden_underlay_prefix("100.96.0.1".parse().unwrap()),
+            config.excluded_underlay_prefix("100.96.0.1".parse().unwrap()),
             Some("100.64.0.0/10".parse().unwrap())
         );
         assert_eq!(
-            config.forbidden_underlay_prefix("203:abcd::1".parse().unwrap()),
+            config.excluded_underlay_prefix("203:abcd::1".parse().unwrap()),
             Some("200::/7".parse().unwrap())
         );
         assert_eq!(
-            config.forbidden_underlay_prefix("203.0.113.1".parse().unwrap()),
+            config.excluded_underlay_prefix("203.0.113.1".parse().unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn legacy_forbidden_underlay_prefixes_loads_but_serializes_canonically() {
+        let source = format!(
+            "forbidden_underlay_prefixes = [\"100.64.0.0/10\"]\n{}",
+            include_str!("../config/example.toml")
+        );
+        let config: Config = toml::from_str(&source).unwrap();
+        assert_eq!(
+            config.excluded_underlay_prefixes,
+            vec!["100.64.0.0/10".parse().unwrap()]
+        );
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert!(encoded.contains("excluded_underlay_prefixes"));
+        assert!(!encoded.contains("forbidden_underlay_prefixes"));
     }
 
     #[test]

@@ -1918,8 +1918,8 @@ async fn inspect(config_path: &Path) -> Result<()> {
             );
         }
     }
-    for prefix in &config.forbidden_underlay_prefixes {
-        println!("forbidden_underlay_prefix: {prefix}");
+    for prefix in &config.excluded_underlay_prefixes {
+        println!("excluded_underlay_prefix: {prefix}");
     }
     for address in &config.node_addresses {
         println!("node_address: {address}");
