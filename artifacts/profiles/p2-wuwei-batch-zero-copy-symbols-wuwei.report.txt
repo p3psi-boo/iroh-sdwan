@@ -1,0 +1,4318 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 359  of event 'task-clock'
+# Event count (approx.): 3626262590
+#
+# Overhead  Command          Shared Object                            Symbol                                                                                                                                      
+# ........  ...............  .......................................  ............................................................................................................................................
+#
+     6.69%  tokio-rt-worker  ironetd                                  [.] memcpy
+            |          
+             --1.11%--memcpy
+                       |          
+                       |--0.28%--noq::endpoint::RecvState::poll_socket
+                       |          <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+                       |          <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       |          <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       |          tokio::runtime::task::raw::poll
+                       |          tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       |          tokio::runtime::scheduler::multi_thread::worker::run
+                       |          tokio::runtime::task::raw::poll
+                       |          std::sys::backtrace::__rust_begin_short_backtrace
+                       |          
+                       |--0.28%--ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       |          tokio::runtime::task::raw::poll
+                       |          tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       |          tokio::runtime::scheduler::multi_thread::worker::run
+                       |          tokio::runtime::task::raw::poll
+                       |          std::sys::backtrace::__rust_begin_short_backtrace
+                       |          core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       |          std::sys::thread::unix::Thread::new::thread_start
+                       |          start
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          
+                       |--0.28%--ironet::runtime::inbound_to_router_shard::{{closure}}
+                       |          ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+                       |          tokio::runtime::task::raw::poll
+                       |          tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       |          tokio::runtime::scheduler::multi_thread::worker::run
+                       |          tokio::runtime::task::raw::poll
+                       |          std::sys::backtrace::__rust_begin_short_backtrace
+                       |          core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       |          std::sys::thread::unix::Thread::new::thread_start
+                       |          start
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          __clone
+                       |          
+                        --0.28%--<alloc::string::String as core::fmt::Write>::write_str
+                                  core::fmt::write
+                                  alloc::fmt::format::format_inner
+                                  ironet::observability::render_prometheus
+                                  ironet::observability::write_status_files::{{closure}}
+                                  ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+                                  tokio::runtime::task::raw::poll
+                                  tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                                  tokio::runtime::scheduler::multi_thread::worker::run
+                                  tokio::runtime::task::raw::poll
+                                  std::sys::backtrace::__rust_begin_short_backtrace
+                                  core::ops::function::FnOnce::call_once{{vtable.shim}}
+                                  std::sys::thread::unix::Thread::new::thread_start
+                                  start
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+                                  __clone
+
+     6.41%  tokio-rt-worker  ironetd                                  [.] ring_core_0_17_14__chacha20_poly1305_open_avx2
+            |          
+             --0.28%--ring_core_0_17_14__chacha20_poly1305_open_avx2
+                       ring::aead::algorithm::chacha20_poly1305_open
+                       <rustls::crypto::ring::quic::PacketKey as rustls::quic::PacketKey>::decrypt_in_place_for_path
+                       noq_proto::crypto::rustls::<impl noq_proto::crypto::PacketKey for alloc::boxed::Box<dyn rustls::quic::PacketKey>>::decrypt
+                       noq_proto::connection::Connection::handle_packet
+                       noq_proto::connection::Connection::handle_decode
+                       noq_proto::connection::Connection::handle_event
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+
+     2.23%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9691bc1b
+            |
+            ---0xffffffff9691bc1b
+               0xffffffff9691bf08
+               |          
+               |--1.39%--0xffffffff9769dd57
+               |          0xffffffff96601566
+               |          |          
+               |          |--0.84%--0xffffffff9695fd1f
+               |          |          0xffffffff976a7e01
+               |          |          0xffffffff976a8d57
+               |          |          0xffffffff976b04f8
+               |          |          0xffffffff96d691a0
+               |          |          0xffffffff96d691fe
+               |          |          0xffffffff96d6a8d0
+               |          |          0xffffffff9769a914
+               |          |          0xffffffff96600130
+               |          |          
+               |          |--0.28%--0xffffffff96ce1e47
+               |          |          0xffffffff973dcb80
+               |          |          0xffffffff973dcd6e
+               |          |          0xffffffff973dd863
+               |          |          0xffffffff975bf707
+               |          |          0xffffffff9758892c
+               |          |          0xffffffff973bfb19
+               |          |          0xffffffff973bfd15
+               |          |          0xffffffff973c0a40
+               |          |          0xffffffff973c0ba9
+               |          |          0xffffffff973c3dc4
+               |          |          0xffffffff9769a914
+               |          |          0xffffffff96600130
+               |          |          
+               |           --0.28%--0xffffffff96a32a4f
+               |                     0xffffffff9769a914
+               |                     0xffffffff96600130
+               |          
+                --0.84%--0xffffffff9769dd18
+                          0xffffffff96601566
+
+     2.23%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f5ffe4
+            |
+            ---0xffffffff96f5ffe4
+               |          
+               |--1.67%--0xffffffff973dcd6e
+               |          0xffffffff973dd863
+               |          0xffffffff975bf707
+               |          0xffffffff9758892c
+               |          0xffffffff973bfb19
+               |          0xffffffff973bfd15
+               |          0xffffffff973c0a40
+               |          0xffffffff973c0ba9
+               |          0xffffffff973c3dc4
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          |          
+               |           --0.28%--sccp
+               |                     recvmmsg
+               |                     noq_udp::imp::UdpSocketState::recv
+               |          
+               |--0.28%--0xffffffff975bf972
+               |          0xffffffff9758892c
+               |          0xffffffff973bfb19
+               |          0xffffffff973bfd15
+               |          0xffffffff973c0a40
+               |          0xffffffff973c0ba9
+               |          0xffffffff973c3dc4
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+                --0.28%--0xffffffff973dcc37
+                          0xffffffff973dd863
+                          0xffffffff975bf707
+                          0xffffffff9758892c
+                          0xffffffff973bfb19
+                          0xffffffff973bfd15
+                          0xffffffff973c0a40
+                          0xffffffff973c0ba9
+                          0xffffffff973c3dc4
+                          0xffffffff9769a914
+                          0xffffffff96600130
+
+     2.23%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff976b194d
+            |
+            ---0xffffffff976b194d
+               |          
+               |--0.56%--0xffffffff976b04eb
+               |          0xffffffff96d691a0
+               |          0xffffffff96d691fe
+               |          0xffffffff96d6a8d0
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+               |--0.28%--0xffffffff973c6532
+               |          0xffffffff974ec946
+               |          0xffffffff974ed2c2
+               |          0xffffffff974ffdd4
+               |          0xffffffff97502166
+               |          0xffffffff974c385c
+               |          0xffffffff974c3a35
+               |          0xffffffff973fa2f5
+               |          0xffffffff973fa417
+               |          0xffffffffc2089c6f
+               |          0xffffffffc208a387
+               |          0xffffffff96cef340
+               |          0xffffffff96cef743
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+               |--0.28%--0xffffffff97218780
+               |          0xffffffff97214961
+               |          0xffffffff97214f2d
+               |          0xffffffff97215dab
+               |          0xffffffff969fb311
+               |          0xffffffffc098ce65
+               |          0xffffffffc098e3d5
+               |          0xffffffff973f7113
+               |          0xffffffff97472299
+               |          0xffffffff973f8016
+               |          0xffffffff9758fa4c
+               |          0xffffffff9758fcd2
+               |          0xffffffff97591640
+               |          0xffffffff975bf0d8
+               |          0xffffffff975c1202
+               |          0xffffffff973c01ed
+               |          0xffffffff973c0959
+               |          0xffffffff973c334a
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+               |--0.28%--0xffffffff96c57dd5
+               |          0xffffffff96c5a421
+               |          0xffffffff96c5b28b
+               |          0xffffffff96c5d4d3
+               |          0xffffffff973d0796
+               |          0xffffffff973d6c38
+               |          0xffffffff973c7122
+               |          0xffffffff9758df51
+               |          0xffffffff97591829
+               |          0xffffffff975c11d3
+               |          0xffffffff973c01ed
+               |          0xffffffff973c0959
+               |          0xffffffff973c334a
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+               |--0.28%--0xffffffff96bbff6b
+               |          0xffffffff96bc08b8
+               |          0xffffffff96bc0dec
+               |          0xffffffff96c63024
+               |          0xffffffff96c63de4
+               |          0xffffffff96c649cd
+               |          0xffffffff96c6684d
+               |          0xffffffff96c668fb
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          
+               |--0.28%--0xffffffff96bbfdd5
+               |          0xffffffff96bbff75
+               |          0xffffffff96bc0955
+               |          0xffffffff96bc0dec
+               |          0xffffffff96c63024
+               |          0xffffffff96c63de4
+               |          0xffffffff96c649cd
+               |          0xffffffff96c6684d
+               |          0xffffffff96c668fb
+               |          0xffffffff9769a914
+               |          0xffffffff96600130
+               |          __madvise
+               |          __libc_free
+               |          ironet::runtime::inbound_to_router_shard::{{closure}}
+               |          ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+               |          tokio::runtime::task::raw::poll
+               |          tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               |          tokio::runtime::scheduler::multi_thread::worker::run
+               |          tokio::runtime::task::raw::poll
+               |          std::sys::backtrace::__rust_begin_short_backtrace
+               |          core::ops::function::FnOnce::call_once{{vtable.shim}}
+               |          std::sys::thread::unix::Thread::new::thread_start
+               |          start
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          __clone
+               |          
+                --0.28%--0xffffffff9696a05d
+                          0xffffffff9696a5b7
+                          0xffffffff96a3627a
+                          0xffffffff96a328af
+                          0xffffffff96a32a5d
+                          0xffffffff9769a914
+                          0xffffffff96600130
+                          syscall
+                          <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                          <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                          <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                          tokio::runtime::task::raw::poll
+                          tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                          tokio::runtime::scheduler::multi_thread::worker::run
+                          tokio::runtime::task::raw::poll
+                          std::sys::backtrace::__rust_begin_short_backtrace
+                          core::ops::function::FnOnce::call_once{{vtable.shim}}
+                          std::sys::thread::unix::Thread::new::thread_start
+                          start
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+                          __clone
+
+     1.95%  tokio-rt-worker  ironetd                                  [.] __libc_malloc_impl
+     1.67%  tokio-rt-worker  ironetd                                  [.] enframe
+            |          
+             --0.28%--enframe
+                       __libc_realloc
+                       alloc::raw_vec::finish_grow
+                       alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+                       <alloc::string::String as core::fmt::Write>::write_str
+                       <&T as core::fmt::LowerHex>::fmt
+                       core::fmt::write
+                       <core::net::ip_addr::Ipv6Addr as core::fmt::Display>::fmt
+                       core::fmt::write
+                       <core::net::socket_addr::SocketAddrV6 as core::fmt::Display>::fmt
+                       core::fmt::builders::DebugStruct::field
+                       <&T as core::fmt::Debug>::fmt
+                       core::fmt::write
+                       alloc::fmt::format::format_inner
+                       <tracing_subscriber::fmt::format::json::JsonVisitor as tracing_core::field::Visit>::record_debug
+                       tracing_core::span::Attributes::record
+                       <tracing_subscriber::fmt::Subscriber<N,E,F,W> as tracing_core::subscriber::Subscriber>::new_span
+                       tracing::span::Span::make_with
+                       tracing::span::Span::new
+                       iroh::socket::transports::TransportsSender::poll_send
+                       <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+
+     1.67%  tokio-rt-worker  ironetd                                  [.] get_meta
+            |          
+             --0.28%--get_meta
+                       __libc_free
+                       <tracing_subscriber::fmt::format::json::JsonVisitor as tracing_subscriber::field::VisitOutput<core::result::Result<(),core::fmt::Error>>>::finish
+                       <tracing_subscriber::fmt::Subscriber<N,E,F,W> as tracing_core::subscriber::Subscriber>::new_span
+                       tracing::span::Span::make_with
+                       tracing::span::Span::new
+                       iroh::socket::transports::TransportsSender::poll_send
+                       <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+
+     1.67%  tokio-rt-worker  ironetd                                  [.] noq::endpoint::RecvState::poll_socket
+     1.39%  tokio-rt-worker  ironetd                                  [.] sccp
+     1.11%  tokio-rt-worker  ironetd                                  [.] <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+     1.11%  tokio-rt-worker  ironetd                                  [.] ring_core_0_17_14__ChaCha20_ctr32_nohw
+     0.84%  tokio-rt-worker  bpf_prog_6144bc3db46d80b4_sd_fw_egress   [k] bpf_prog_6144bc3db46d80b4_sd_fw_egress
+            |          
+            |--0.28%--bpf_prog_6144bc3db46d80b4_sd_fw_egress
+            |          
+            |--0.28%--bpf_prog_6144bc3db46d80b4_sd_fw_egress
+            |          0xffffffff96b6fad1
+            |          0xffffffff96b729cf
+            |          0xffffffff9758f939
+            |          0xffffffff9758fcd2
+            |          0xffffffff97591640
+            |          0xffffffff975bf0d8
+            |          0xffffffff975c1202
+            |          0xffffffff973c01ed
+            |          0xffffffff973c0959
+            |          0xffffffff973c334a
+            |          0xffffffff9769a914
+            |          0xffffffff96600130
+            |          
+             --0.28%--bpf_prog_6144bc3db46d80b4_sd_fw_egress
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] <iroh::socket::transports::Transport as noq::runtime::AsyncUdpSocket>::poll_recv
+     0.84%  tokio-rt-worker  ironetd                                  [.] <tokio::time::sleep::Sleep as core::future::future::Future>::poll
+     0.84%  tokio-rt-worker  ironetd                                  [.] __libc_free
+            |          
+             --0.28%--__libc_free
+                       bytes::bytes_mut::shared_v_drop
+                       core::ptr::drop_in_place<alloc::vec::Vec<core::option::Option<bytes::bytes::Bytes>>>
+                       core::ptr::drop_in_place<ironet::fec::DecodeBlock>
+                       ironet::fec::FecDecoder::expire
+                       ironet::fec::FecDecoder::push
+                       ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] __libc_realloc
+            |          
+             --0.28%--__libc_realloc
+                       alloc::raw_vec::finish_grow
+                       alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+                       <alloc::string::String as core::fmt::Write>::write_str
+                       core::fmt::builders::DebugStruct::field
+                       <&T as core::fmt::Debug>::fmt
+                       core::fmt::write
+                       alloc::fmt::format::format_inner
+                       <tracing_subscriber::fmt::format::json::JsonVisitor as tracing_core::field::Visit>::record_debug
+                       tracing_core::span::Attributes::record
+                       <tracing_subscriber::fmt::Subscriber<N,E,F,W> as tracing_core::subscriber::Subscriber>::new_span
+                       tracing::span::Span::make_with
+                       tracing::span::Span::new
+                       iroh::socket::transports::TransportsSender::poll_send
+                       <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] alloc_slot
+            |          
+             --0.28%--alloc_slot
+                       __libc_malloc_impl
+                       __libc_realloc
+                       alloc::raw_vec::finish_grow
+                       alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+                       ironet::observability::render_prometheus
+                       ironet::observability::write_status_files::{{closure}}
+                       ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] ironet::fec::FecDecoder::push
+            |          
+             --0.28%--ironet::fec::FecDecoder::push
+                       ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+            |          
+             --0.56%--ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] ironet::wire::Reassembler::push_tagged
+            |          
+             --0.28%--ironet::wire::Reassembler::push_tagged
+                       ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::handle_packet
+            |          
+             --0.28%--noq_proto::connection::Connection::handle_packet
+                       noq_proto::connection::Connection::handle_decode
+                       noq_proto::connection::Connection::handle_event
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::process_payload
+            |          
+             --0.28%--noq_proto::connection::Connection::process_payload
+                       noq_proto::connection::Connection::process_decrypted_packet
+                       noq_proto::connection::Connection::handle_packet
+                       noq_proto::connection::Connection::handle_decode
+                       noq_proto::connection::Connection::handle_event
+
+     0.84%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::packet_builder::PacketBuilder::finish_and_track
+     0.84%  tokio-rt-worker  ironetd                                  [.] std::sys::sync::mutex::futex::Mutex::lock_contended
+     0.84%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+     0.84%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::scheduler::multi_thread::worker::run
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968624d4
+            |
+            ---0xffffffff968624d4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968f4a67
+            |
+            ---0xffffffff968f4a67
+               0xffffffff976a114a
+               0xffffffff966012a6
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a0e014
+            |
+            ---0xffffffff96a0e014
+               0xffffffff96d6a958
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c08617
+            |
+            ---0xffffffff96c08617
+               0xffffffff96c65486
+               0xffffffff96c239ed
+               0xffffffff96c2407e
+               0xffffffff96c2475f
+               0xffffffff96c630bf
+               0xffffffff96c63de4
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9744c972
+            |
+            ---0xffffffff9744c972
+               0xffffffff975ec245
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.56%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9769a8e6
+            |
+            ---0xffffffff9769a8e6
+               0xffffffff96600130
+
+     0.56%  tokio-rt-worker  [vdso]                                   [.] 0x0000000000000bd6
+     0.56%  tokio-rt-worker  ironetd                                  [.] <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+            |          
+             --0.28%--<iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] bytes::bytes_mut::shared_v_drop
+     0.56%  tokio-rt-worker  ironetd                                  [.] core::hash::BuildHasher::hash_one
+            |          
+             --0.28%--core::hash::BuildHasher::hash_one
+                       ironet::wire::Reassembler::repair_requests
+                       ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+                       tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] netwatch::udp::SocketState::try_get_connected
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::handle_decode
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::handle_event
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::path_data
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::poll_transmit
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::populate_packet
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::endpoint::Endpoint::handle
+            |          
+             --0.28%--noq_proto::endpoint::Endpoint::handle
+                       noq::endpoint::RecvState::poll_socket
+                       <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] noq_proto::packet::PartialDecode::finish
+     0.56%  tokio-rt-worker  ironetd                                  [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
+            |          
+             --0.28%--ring_core_0_17_14__chacha20_poly1305_seal_avx2
+                       ring::aead::algorithm::chacha20_poly1305_seal
+                       <rustls::crypto::ring::quic::PacketKey as rustls::quic::PacketKey>::encrypt_in_place_for_path
+                       noq_proto::crypto::rustls::<impl noq_proto::crypto::PacketKey for alloc::boxed::Box<dyn rustls::quic::PacketKey>>::encrypt
+                       noq_proto::connection::packet_builder::PacketBuilder::finish
+                       noq_proto::connection::packet_builder::PacketBuilder::finish_and_track
+                       noq_proto::connection::Connection::poll_transmit_path_space
+                       noq_proto::connection::Connection::poll_transmit
+                       <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] size_to_class
+     0.56%  tokio-rt-worker  ironetd                                  [.] std::io::error::Error::kind
+            |          
+             --0.28%--std::io::error::Error::kind
+                       netwatch::udp::UdpSocket::poll_recv_noq
+                       iroh::socket::transports::ip::IpTransport::poll_recv
+                       <iroh::socket::transports::Transport as noq::runtime::AsyncUdpSocket>::poll_recv
+                       noq::endpoint::RecvState::poll_socket
+                       <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+                       <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+                       <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+                       tokio::runtime::task::raw::poll
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::io::registration::Registration::poll_ready
+     0.56%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+     0.56%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::task::raw::poll
+     0.56%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::task::raw::poll
+            |          
+             --0.28%--tokio::runtime::task::raw::poll
+                       tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+                       tokio::runtime::scheduler::multi_thread::worker::run
+                       tokio::runtime::task::raw::poll
+                       std::sys::backtrace::__rust_begin_short_backtrace
+                       core::ops::function::FnOnce::call_once{{vtable.shim}}
+                       std::sys::thread::unix::Thread::new::thread_start
+                       start
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+                       __clone
+
+     0.56%  tokio-rt-worker  ironetd                                  [.] tokio::sync::notify::NotifyGuard::notify_waiters
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96704104
+            |
+            ---0xffffffff96704104
+               0xffffffff96704110
+               0xffffffff975bf644
+               0xffffffff9758892c
+               0xffffffff973bfdff
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9670410b
+            |
+            ---0xffffffff9670410b
+               0xffffffff975ec22f
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968624d0
+            |
+            ---0xffffffff968624d0
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               epoll_pwait
+               tokio::runtime::io::driver::Driver::turn
+               tokio::runtime::time::Driver::park_thread_timeout
+               tokio::runtime::time::Driver::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96862643
+            |
+            ---0xffffffff96862643
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968626ec
+            |
+            ---0xffffffff968626ec
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968628ae
+            |
+            ---0xffffffff968628ae
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96862db7
+            |
+            ---0xffffffff96862db7
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff968f82b0
+            |
+            ---0xffffffff968f82b0
+               0xffffffff96ce1e66
+               0xffffffff973dcb80
+               0xffffffff973dcd6e
+               0xffffffff973dd863
+               0xffffffff975bf707
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96928e47
+            |
+            ---0xffffffff96928e47
+               0xffffffff96d6a8bc
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               epoll_pwait
+               tokio::runtime::io::driver::Driver::turn
+               tokio::runtime::time::Driver::park_thread_timeout
+               tokio::runtime::time::Driver::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::Context::park_internal
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a01dc4
+            |
+            ---0xffffffff96a01dc4
+               0xffffffff9769abae
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a01e10
+            |
+            ---0xffffffff96a01e10
+               0xffffffff9769abae
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a134f4
+            |
+            ---0xffffffff96a134f4
+               0xffffffff976b04d8
+               0xffffffff96d691a0
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a14674
+            |
+            ---0xffffffff96a14674
+               0xffffffff976b04eb
+               0xffffffff96d691a0
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a302c2
+            |
+            ---0xffffffff96a302c2
+               0xffffffff96a30f57
+               0xffffffff96a3617e
+               0xffffffff96a328af
+               0xffffffff96a32a5d
+               0xffffffff9769a914
+               0xffffffff96600130
+               syscall
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a37de7
+            |
+            ---0xffffffff96a37de7
+               0xffffffff96a382b4
+               0xffffffff968f981a
+               0xffffffff96c1c3bd
+               0xffffffff96c1ca85
+               0xffffffff96c6686f
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a7e157
+            |
+            ---0xffffffff96a7e157
+               0xffffffff96a01e0d
+               0xffffffff9769abae
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96a7f3e1
+            |
+            ---0xffffffff96a7f3e1
+               0xffffffff96a01e0d
+               0xffffffff9769abae
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96b48e26
+            |
+            ---0xffffffff96b48e26
+               bpf_trampoline_6442544952
+               0xffffffff973faa89
+               0xffffffffc098d9c3
+               0xffffffff973fac81
+               0xffffffff973fb3f0
+               0xffffffff9691bc76
+               0xffffffff9691bf08
+               0xffffffff9769dd18
+               0xffffffff96601566
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96b8aaf5
+            |
+            ---0xffffffff96b8aaf5
+               0xffffffff96b83b21
+               0xffffffff96b83f03
+               0xffffffff96b97200
+               0xffffffff96c3850c
+               0xffffffff96c1a0eb
+               0xffffffff96be0e93
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c084f0
+            |
+            ---0xffffffff96c084f0
+               0xffffffff96c0860e
+               0xffffffff96c65486
+               0xffffffff96c239ed
+               0xffffffff96c2407e
+               0xffffffff96c2475f
+               0xffffffff96c630bf
+               0xffffffff96c63de4
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c08513
+            |
+            ---0xffffffff96c08513
+               0xffffffff96c0860e
+               0xffffffff96c65486
+               0xffffffff96c239ed
+               0xffffffff96c2407e
+               0xffffffff96c2475f
+               0xffffffff96c630bf
+               0xffffffff96c63de4
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c0a755
+            |
+            ---0xffffffff96c0a755
+               0xffffffff96c14546
+               0xffffffff96c14b37
+               0xffffffff968f4bba
+               0xffffffff976a114a
+               0xffffffff966012a6
+               alloc_slot
+               __libc_malloc_impl
+               noq::endpoint::RecvState::poll_socket
+               <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c11f80
+            |
+            ---0xffffffff96c11f80
+               0xffffffff96c14562
+               0xffffffff96c14b37
+               0xffffffff968f4bba
+               0xffffffff976a114a
+               0xffffffff966012a6
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c13df1
+            |
+            ---0xffffffff96c13df1
+               0xffffffff96c14b37
+               0xffffffff968f4bba
+               0xffffffff976a114a
+               0xffffffff966012a6
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c23cc2
+            |
+            ---0xffffffff96c23cc2
+               0xffffffff96c2407e
+               0xffffffff96c2475f
+               0xffffffff96c630bf
+               0xffffffff96c63de4
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+               __madvise
+               __libc_free
+               bytes::bytes_mut::shared_v_drop
+               core::ptr::drop_in_place<alloc::vec::Vec<core::option::Option<bytes::bytes::Bytes>>>
+               core::ptr::drop_in_place<ironet::fec::DecodeBlock>
+               ironet::fec::FecDecoder::push
+               ironet::runtime::Peer::install_connection_with_session::{{closure}}::{{closure}}
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c37292
+            |
+            ---0xffffffff96c37292
+               0xffffffff96c3921e
+               0xffffffff96c39390
+               0xffffffff96c3b37d
+               0xffffffff96c1af3b
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c3dcd5
+            |
+            ---0xffffffff96c3dcd5
+               0xffffffff96c459ac
+               0xffffffff96c476c4
+               0xffffffff96c83b06
+               0xffffffff96c8670e
+               0xffffffff96c05746
+               0xffffffff96c11b18
+               0xffffffff96c14562
+               0xffffffff96c14b37
+               0xffffffff968f4bba
+               0xffffffff976a114a
+               0xffffffff966012a6
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c3de12
+            |
+            ---0xffffffff96c3de12
+               0xffffffff96c459ac
+               0xffffffff96c476c4
+               0xffffffff96c83b06
+               0xffffffff96c83c50
+               0xffffffff973d6cd4
+               0xffffffff973c7122
+               0xffffffffc2089639
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c562ac
+            |
+            ---0xffffffff96c562ac
+               0xffffffff96c5c6c3
+               0xffffffff96c0458f
+               0xffffffff96c36ecf
+               0xffffffff96c3722d
+               0xffffffff96c3921e
+               0xffffffff96c39390
+               0xffffffff96c3b37d
+               0xffffffff96c1af3b
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c56ec4
+            |
+            ---0xffffffff96c56ec4
+               0xffffffff973c557d
+               0xffffffff973c014a
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               sendmsg
+               noq_udp::imp::UdpSocketState::send
+               netwatch::udp::UdpSender::poll_send
+               iroh::socket::transports::ip::IpSender::poll_send
+               iroh::socket::transports::TransportsSender::poll_send
+               <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96c667cb
+            |
+            ---0xffffffff96c667cb
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96cb7036
+            |
+            ---0xffffffff96cb7036
+               0xffffffff96cbc0fc
+               0xffffffff973ca386
+               0xffffffff9750f7a0
+               0xffffffff975106a1
+               0xffffffff975bf644
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96ce1d8d
+            |
+            ---0xffffffff96ce1d8d
+               0xffffffff96ce1e24
+               0xffffffff973c0019
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d1e334
+            |
+            ---0xffffffff96d1e334
+               0xffffffff973c0b2c
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d1e3a3
+            |
+            ---0xffffffff96d1e3a3
+               0xffffffff96d68d1e
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d1e3c5
+            |
+            ---0xffffffff96d1e3c5
+               0xffffffff96d68d1e
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d6a844
+            |
+            ---0xffffffff96d6a844
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d71fc4
+            |
+            ---0xffffffff96d71fc4
+               0xffffffff96c63dc2
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96d71fff
+            |
+            ---0xffffffff96d71fff
+               0xffffffff96c63dc2
+               0xffffffff96c649cd
+               0xffffffff96c6684d
+               0xffffffff96c668fb
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f5df56
+            |
+            ---0xffffffff96f5df56
+               0xffffffff96f6293f
+               0xffffffff96f629cb
+               0xffffffff973c0827
+               0xffffffff973c0942
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               sendmsg
+               noq_udp::imp::UdpSocketState::send
+               netwatch::udp::UdpSender::poll_send
+               iroh::socket::transports::ip::IpSender::poll_send
+               iroh::socket::transports::TransportsSender::poll_send
+               <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f5f824
+            |
+            ---0xffffffff96f5f824
+               0xffffffff973ddd83
+               0xffffffffc208991c
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f5ff87
+            |
+            ---0xffffffff96f5ff87
+               0xffffffff973dcd6e
+               0xffffffff973dd863
+               0xffffffff975bf707
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f62928
+            |
+            ---0xffffffff96f62928
+               0xffffffff96f629cb
+               0xffffffff973c0827
+               0xffffffff973c0a23
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               recvmmsg
+               noq_udp::imp::UdpSocketState::recv
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f67a40
+            |
+            ---0xffffffff96f67a40
+               0xffffffff973be716
+               0xffffffff973bfd3b
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff96f67a44
+            |
+            ---0xffffffff96f67a44
+               0xffffffff973be716
+               0xffffffff973bfd3b
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               recvmmsg
+               noq_udp::imp::UdpSocketState::recv
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff971f77ba
+            |
+            ---0xffffffff971f77ba
+               0xffffffff972102c4
+               0xffffffff9721043f
+               0xffffffff97214f54
+               0xffffffff97215dab
+               0xffffffff969fb311
+               0xffffffffc098ce65
+               0xffffffffc098e3d5
+               0xffffffff973f7113
+               0xffffffff97472299
+               0xffffffff973f8016
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973be6fe
+            |
+            ---0xffffffff973be6fe
+               0xffffffff973bfd3b
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               recvmmsg
+               noq_udp::imp::UdpSocketState::recv
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973bf154
+            |
+            ---0xffffffff973bf154
+               0xffffffff96d67ffa
+               0xffffffff96d682e6
+               0xffffffff96d68e78
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973bfae5
+            |
+            ---0xffffffff973bfae5
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973c0a25
+            |
+            ---0xffffffff973c0a25
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973c0cb3
+            |
+            ---0xffffffff973c0cb3
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973c64f0
+            |
+            ---0xffffffff973c64f0
+               0xffffffff974ec946
+               0xffffffff974ed2c2
+               0xffffffff974ffdd4
+               0xffffffff97502166
+               0xffffffff974c385c
+               0xffffffff974c3a35
+               0xffffffff973fa2f5
+               0xffffffff973fa417
+               0xffffffffc2089c6f
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973d0efb
+            |
+            ---0xffffffff973d0efb
+               0xffffffff9743c0b0
+               0xffffffff975ddf64
+               0xffffffff975fe8d1
+               0xffffffff9743cba9
+               0xffffffff9743d307
+               0xffffffffc098d795
+               0xffffffff973fac81
+               0xffffffff973fb3f0
+               0xffffffff9691bc76
+               0xffffffff9691bf08
+               0xffffffff9769dd18
+               0xffffffff96601566
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973dcd91
+            |
+            ---0xffffffff973dcd91
+               0xffffffff973dd863
+               0xffffffff975bf707
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff973f7245
+            |
+            ---0xffffffff973f7245
+               0xffffffff97472299
+               0xffffffff973f8016
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               sendmsg
+               noq_udp::imp::UdpSocketState::send
+               netwatch::udp::UdpSender::poll_send
+               iroh::socket::transports::ip::IpSender::poll_send
+               iroh::socket::transports::TransportsSender::poll_send
+               <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9740acd5
+            |
+            ---0xffffffff9740acd5
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9744c934
+            |
+            ---0xffffffff9744c934
+               0xffffffff975ec245
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               sendmsg
+               noq_udp::imp::UdpSocketState::send
+               netwatch::udp::UdpSender::poll_send
+               iroh::socket::transports::ip::IpSender::poll_send
+               iroh::socket::transports::TransportsSender::poll_send
+               <iroh::socket::transports::Sender as noq::runtime::UdpSender>::poll_send
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97510489
+            |
+            ---0xffffffff97510489
+               0xffffffff975bf644
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9751058e
+            |
+            ---0xffffffff9751058e
+               0xffffffff975bf644
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9756b7cf
+            |
+            ---0xffffffff9756b7cf
+               0xffffffff9756c7f1
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9757c974
+            |
+            ---0xffffffff9757c974
+               0xffffffff973f6e7f
+               0xffffffff974723c8
+               0xffffffff973f8016
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97588845
+            |
+            ---0xffffffff97588845
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               recvmmsg
+               noq_udp::imp::UdpSocketState::recv
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9758d1c9
+            |
+            ---0xffffffff9758d1c9
+               0xffffffff97591829
+               0xffffffff975c11d3
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9758f912
+            |
+            ---0xffffffff9758f912
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97595822
+            |
+            ---0xffffffff97595822
+               0xffffffff97595911
+               0xffffffff975d9fb6
+               0xffffffff975c0c9f
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975ab08b
+            |
+            ---0xffffffff975ab08b
+               0xffffffff975ac55d
+               0xffffffff975ebe5d
+               0xffffffff9744cae0
+               0xffffffff975ec245
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975abcc1
+            |
+            ---0xffffffff975abcc1
+               0xffffffff975ac589
+               0xffffffff975ebe5d
+               0xffffffff9744cae0
+               0xffffffff975ec245
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975bea65
+            |
+            ---0xffffffff975bea65
+               0xffffffff975bebba
+               0xffffffff975c2109
+               0xffffffff975c2476
+               0xffffffff97516428
+               0xffffffff9743c568
+               0xffffffff9743c757
+               0xffffffff973faae5
+               0xffffffffc098d9c3
+               0xffffffff973fac81
+               0xffffffff973fb3f0
+               0xffffffff9691bc76
+               0xffffffff9691bf08
+               0xffffffff976a0863
+               0xffffffff9660160a
+               0xffffffff9758fcc2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975bf100
+            |
+            ---0xffffffff975bf100
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975bf1c5
+            |
+            ---0xffffffff975bf1c5
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975c0ca6
+            |
+            ---0xffffffff975c0ca6
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975c0eb6
+            |
+            ---0xffffffff975c0eb6
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975db2d1
+            |
+            ---0xffffffff975db2d1
+               0xffffffff975bfa72
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff975ebd44
+            |
+            ---0xffffffff975ebd44
+               0xffffffff9744cae0
+               0xffffffff975ec245
+               0xffffffff975a4282
+               0xffffffff9758b7af
+               0xffffffff9758bda4
+               0xffffffff9758bf12
+               0xffffffff975c0e91
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97674204
+            |
+            ---0xffffffff97674204
+               0xffffffff96c03789
+               0xffffffff968f4b79
+               0xffffffff976a114a
+               0xffffffff966012a6
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9768924d
+            |
+            ---0xffffffff9768924d
+               0xffffffff96b97165
+               0xffffffff96c3850c
+               0xffffffff96c1a0eb
+               0xffffffff96be0e93
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97695b9b
+            |
+            ---0xffffffff97695b9b
+               0xffffffff973d1016
+               0xffffffff973d125d
+               0xffffffffc20738f9
+               0xffffffffc206d478
+               0xffffffff974b6fc7
+               0xffffffff974c413a
+               0xffffffff973fa2f5
+               0xffffffff973fa417
+               0xffffffffc2089c6f
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97695ce4
+            |
+            ---0xffffffff97695ce4
+               0xffffffff975bf32a
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff97698db5
+            |
+            ---0xffffffff97698db5
+               0xffffffff96d682f8
+               0xffffffff96d68e78
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff9769abb1
+            |
+            ---0xffffffff9769abb1
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff976a2adf
+            |
+            ---0xffffffff976a2adf
+               0xffffffff96c5e0a1
+               0xffffffff973d0490
+               0xffffffff973d06b9
+               0xffffffff973d6c38
+               0xffffffff973c7122
+               0xffffffffc2089639
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff976b04dc
+            |
+            ---0xffffffff976b04dc
+               0xffffffff96d691a0
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff976b1f6b
+            |
+            ---0xffffffff976b1f6b
+               0xffffffff9747226b
+               0xffffffff973f8016
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [kernel.kallsyms]                        [k] 0xffffffff976b20b5
+            |
+            ---0xffffffff976b20b5
+               0xffffffff96d690a8
+               0xffffffff96d691fe
+               0xffffffff96d6a8d0
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [nf_conntrack]                           [k] 0x00000000000005db
+            |
+            ---0xffffffffc20695db
+               0xffffffffc206d258
+               0xffffffff974b6fc7
+               0xffffffff975fd812
+               0xffffffff975fd9d0
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [nf_conntrack]                           [k] 0x0000000000003b2d
+            |
+            ---0xffffffffc206cb2d
+               0xffffffffc206d26d
+               0xffffffff974b6fc7
+               0xffffffff974c413a
+               0xffffffff973fa2f5
+               0xffffffff973fa417
+               0xffffffffc2089c6f
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+               sccp
+               write
+               ironet::runtime::inbound_to_router_shard::{{closure}}
+               ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  [nf_conntrack]                           [k] 0x000000000000467c
+            |
+            ---0xffffffffc206d67c
+               0xffffffff974b6fc7
+               0xffffffff975fd812
+               0xffffffff975fd9d0
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [nf_nat]                                 [k] 0x000000000000323d
+            |
+            ---0xffffffffc209723d
+               0xffffffff974b6fc7
+               0xffffffff9759260b
+               0xffffffff97592b16
+               0xffffffff97592d4b
+               0xffffffff973fa1a0
+               0xffffffff973fa847
+               0xffffffff973fab02
+               0xffffffffc098d9c3
+               0xffffffff973fac81
+               0xffffffff973fb3f0
+               0xffffffff9691bc76
+               0xffffffff9691bf08
+               0xffffffff976a082e
+               0xffffffff9660160a
+
+     0.28%  tokio-rt-worker  [r8169]                                  [k] 0x00000000000028b8
+            |
+            ---0xffffffffc098e8b8
+               0xffffffff973f7113
+               0xffffffff97472299
+               0xffffffff973f8016
+               0xffffffff9758fa4c
+               0xffffffff9758fcd2
+               0xffffffff97591640
+               0xffffffff975bf0d8
+               0xffffffff975c1202
+               0xffffffff973c01ed
+               0xffffffff973c0959
+               0xffffffff973c334a
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [tun]                                    [k] 0x0000000000007ab5
+            |
+            ---0xffffffffc2089ab5
+               0xffffffffc208a387
+               0xffffffff96cef340
+               0xffffffff96cef743
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  [vdso]                                   [.] 0x0000000000000bdc
+     0.28%  tokio-rt-worker  bpf_prog_6144bc3db46d80b4_sd_fw_ingress  [k] bpf_prog_6144bc3db46d80b4_sd_fw_ingress
+            |
+            ---bpf_prog_6144bc3db46d80b4_sd_fw_ingress
+               0xffffffff96b6fad1
+               0xffffffff96b72889
+               0xffffffff97429d37
+               0xffffffff975bff05
+               0xffffffff975c060e
+               0xffffffff9759212f
+               0xffffffff975924b0
+               0xffffffff975925a2
+               0xffffffff97592b16
+               0xffffffff97592d4b
+               0xffffffff973fa1a0
+               0xffffffff973fa847
+               0xffffffff973fab02
+               0xffffffffc098d9c3
+               0xffffffff973fac81
+               0xffffffff973fb3f0
+               0xffffffff9691bc76
+               0xffffffff9691bf08
+               0xffffffff976a0863
+               0xffffffff9660160a
+               0xffffffff96ce1e47
+               0xffffffff973dcb80
+               0xffffffff973dcd6e
+               0xffffffff973dd863
+               0xffffffff975bf707
+               0xffffffff9758892c
+               0xffffffff973bfb19
+               0xffffffff973bfd15
+               0xffffffff973c0a40
+               0xffffffff973c0ba9
+               0xffffffff973c3dc4
+               0xffffffff9769a914
+               0xffffffff96600130
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] <alloc::string::String as core::fmt::Write>::write_char
+     0.28%  tokio-rt-worker  ironetd                                  [.] <alloc::string::String as core::fmt::Write>::write_str
+     0.28%  tokio-rt-worker  ironetd                                  [.] <core::net::ip_addr::Ipv6Addr as core::fmt::Display>::fmt
+     0.28%  tokio-rt-worker  ironetd                                  [.] <noq::connection::ReadDatagram as core::future::future::Future>::poll
+     0.28%  tokio-rt-worker  ironetd                                  [.] <noq_proto::frame::Iter as core::iter::traits::iterator::Iterator>::next
+     0.28%  tokio-rt-worker  ironetd                                  [.] <noq_proto::varint::VarInt as noq_proto::coding::Decodable>::decode
+     0.28%  tokio-rt-worker  ironetd                                  [.] <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+     0.28%  tokio-rt-worker  ironetd                                  [.] <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+            |
+            ---<tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] <tracing_subscriber::fmt::format::Writer as core::fmt::Write>::write_str
+     0.28%  tokio-rt-worker  ironetd                                  [.] <tracing_subscriber::registry::sharded::Registry as tracing_core::subscriber::Subscriber>::enter
+     0.28%  tokio-rt-worker  ironetd                                  [.] <tracing_subscriber::registry::sharded::Registry as tracing_core::subscriber::Subscriber>::exit
+     0.28%  tokio-rt-worker  ironetd                                  [.] __clock_gettime
+     0.28%  tokio-rt-worker  ironetd                                  [.] arc_swap::debt::Debt::pay_all::{{closure}}
+     0.28%  tokio-rt-worker  ironetd                                  [.] bytes::bytes_mut::BytesMut::freeze
+     0.28%  tokio-rt-worker  ironetd                                  [.] core::fmt::Formatter::pad_integral
+     0.28%  tokio-rt-worker  ironetd                                  [.] core::fmt::builders::DebugStruct::field
+     0.28%  tokio-rt-worker  ironetd                                  [.] core::ptr::drop_in_place<alloc::vec::drain::Drain<ironet::runtime::InboundPacket>>
+     0.28%  tokio-rt-worker  ironetd                                  [.] crossbeam_channel::channel::Sender<T>::try_send
+            |
+            ---crossbeam_channel::channel::Sender<T>::try_send
+               ironet::transport::OutboundQueue::push
+               ironet::runtime::run_flow_router::{{closure}}
+               ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] futures_util::future::future::FutureExt::now_or_never
+     0.28%  tokio-rt-worker  ironetd                                  [.] hashbrown::map::HashMap<K,V,S,A>::insert
+     0.28%  tokio-rt-worker  ironetd                                  [.] hashbrown::map::HashMap<K,V,S,A>::remove
+     0.28%  tokio-rt-worker  ironetd                                  [.] hashbrown::raw::RawTable<T,A>::reserve_rehash
+     0.28%  tokio-rt-worker  ironetd                                  [.] iroh::socket::transports::ip::IpSender::poll_send
+     0.28%  tokio-rt-worker  ironetd                                  [.] iroh::socket::transports::ip::IpTransport::poll_recv
+     0.28%  tokio-rt-worker  ironetd                                  [.] ironet::mesh::MeshRuntime::routing_policy_snapshot
+     0.28%  tokio-rt-worker  ironetd                                  [.] ironet::runtime::DeliveryFastPath::source_liveness
+     0.28%  tokio-rt-worker  ironetd                                  [.] ironet::runtime::dispatch::InboundDispatcher::send_batch_with_scratch::{{closure}}
+     0.28%  tokio-rt-worker  ironetd                                  [.] ironet::runtime::inbound_to_router_shard::{{closure}}
+     0.28%  tokio-rt-worker  ironetd                                  [.] memmove
+     0.28%  tokio-rt-worker  ironetd                                  [.] memset
+     0.28%  tokio-rt-worker  ironetd                                  [.] netwatch::udp::UdpSocket::poll_recv_noq
+     0.28%  tokio-rt-worker  ironetd                                  [.] nontrivial_free
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq::runtime::Runtime::now
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::on_packet_authenticated
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::poll
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::poll_timeout
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::poll_transmit_path_space
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::process_decrypted_packet
+            |
+            ---noq_proto::connection::Connection::process_decrypted_packet
+               noq_proto::connection::Connection::handle_packet
+               noq_proto::connection::Connection::handle_decode
+               noq_proto::connection::Connection::handle_event
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::pto
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::connection::Connection::reset_idle_timeout
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::crypto::rustls::<impl noq_proto::crypto::HeaderKey for alloc::boxed::Box<dyn rustls::quic::HeaderProtectionKey>>::sample_size
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::frame::EncodableFrame::encode_inner
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::packet::PartialDecode::new
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_proto::range_set::array_range_set::ArrayRangeSet<_,T>::insert
+     0.28%  tokio-rt-worker  ironetd                                  [.] noq_udp::imp::UdpSocketState::send
+     0.28%  tokio-rt-worker  ironetd                                  [.] reed_solomon_simd::engine::engine_avx2::Avx2::fft_private_avx2
+     0.28%  tokio-rt-worker  ironetd                                  [.] reed_solomon_simd::engine::engine_avx2::Avx2::ifft_private_avx2
+            |
+            ---reed_solomon_simd::engine::engine_avx2::Avx2::ifft_private_avx2
+               reed_solomon_simd::reed_solomon::ReedSolomonDecoder::decode
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] reed_solomon_simd::engine::tables::initialize_mul128
+     0.28%  tokio-rt-worker  ironetd                                  [.] ring_core_0_17_14__chacha20_poly1305_open_sse41
+            |
+            ---ring_core_0_17_14__chacha20_poly1305_open_sse41
+               ring::aead::algorithm::chacha20_poly1305_open
+               <rustls::crypto::ring::quic::PacketKey as rustls::quic::PacketKey>::decrypt_in_place_for_path
+               noq_proto::crypto::rustls::<impl noq_proto::crypto::PacketKey for alloc::boxed::Box<dyn rustls::quic::PacketKey>>::decrypt
+               noq_proto::connection::Connection::handle_packet
+               noq_proto::connection::Connection::handle_decode
+               noq_proto::connection::Connection::handle_event
+               <noq::connection::ConnectionDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] std::io::Write::write_all
+     0.28%  tokio-rt-worker  ironetd                                  [.] std::io::error::Error::kind
+     0.28%  tokio-rt-worker  ironetd                                  [.] subtle::black_box
+            |
+            ---subtle::black_box
+               <[T] as subtle::ConstantTimeEq>::ct_eq
+               ironet::runtime::DeliveryFastPath::next_source_tag
+               ironet::runtime::run_flow_router::{{closure}}
+               ironet::runtime::run_data_plane::{{closure}}::{{closure}}
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::scheduler::multi_thread::park::Unparker::unpark
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::scheduler::multi_thread::worker::<impl tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::task::raw::poll
+            |
+            ---tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::task::raw::schedule
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::time::<impl tokio::runtime::time::handle::Handle>::reregister
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::runtime::time::wheel::Wheel::next_expiration
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::sync::mpsc::list::Rx<T>::pop
+            |
+            ---tokio::sync::mpsc::list::Rx<T>::pop
+               <noq::endpoint::EndpointDriver as core::future::future::Future>::poll
+               <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+               <tokio_util::task::task_tracker::TrackedFuture<F> as core::future::future::Future>::poll
+               tokio::runtime::task::raw::poll
+               tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+               tokio::runtime::scheduler::multi_thread::worker::run
+               tokio::runtime::task::raw::poll
+               std::sys::backtrace::__rust_begin_short_backtrace
+               core::ops::function::FnOnce::call_once{{vtable.shim}}
+               std::sys::thread::unix::Thread::new::thread_start
+               start
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+               __clone
+
+     0.28%  tokio-rt-worker  ironetd                                  [.] tokio::sync::notify::NotifiedProject::drop_notified
+     0.28%  tokio-rt-worker  ironetd                                  [.] tracing_subscriber::filter::env::EnvFilter::cares_about_span
+
+
+#
+# (Tip: To show inline functions in call traces add --inline to perf report)
+#

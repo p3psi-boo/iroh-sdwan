@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use ipnet::IpNet;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
@@ -110,7 +110,7 @@ use prefix::{IpPrefixSet, PrefixOwnerTable};
 // Keep noq's non-preemptible FIFO smaller than a short interactive burst.
 // Parallel data lanes provide aggregate batching without hiding a large burst
 // behind one connection's congestion window.
-const SMALL_PACKET_LIMIT: usize = 512;
+const MIN_AGGREGATION_PACKET_LIMIT: usize = 512;
 const OVERLAY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 // Retire a silent direct path quickly enough to use an already-open relay
 // backup, but leave enough startup time for discovery to establish that
@@ -138,6 +138,9 @@ const FLOW_DISPATCH_QUEUE: usize = 64;
 const CAPACITY_EVENT_QUEUE: usize = 4_096;
 const ROUTE_SNAPSHOT_REFRESH: Duration = Duration::from_millis(100);
 const INBOUND_ROUTER_BATCH: usize = 128;
+// Once one QUIC datagram wakes a lane, drain the already-buffered burst in the
+// same task turn. This amortizes select/poller and downstream queue wakeups.
+const QUIC_RECEIVE_BURST: usize = 64;
 const LATENCY_PRESSURE_LIMIT: u64 = 64 * 1024;
 // A merely connected owner must not suppress every transit path. Above these
 // thresholds the direct adjacency remains a candidate, but FlowRouter is also
@@ -3088,17 +3091,25 @@ fn adaptive_fec_profile(sample: FecNetworkSample) -> AdaptiveFecProfile {
         _ => 16,
     };
 
-    // Carry enough parity for the expected losses plus one safety shard.  The
-    // 1.8 multiplier absorbs short random bursts without jumping straight to
-    // 100% redundancy on ordinary WAN loss.
+    // Size parity from live residual QUIC loss and burstiness instead of a
+    // fixed 1.8x multiplier. Quiet paths use 1.2x expected loss; visibly bursty
+    // or heavily impaired paths use 1.4x. A safety shard is added only after
+    // loss reaches 3%, avoiding permanent two-shard overhead on light loss.
+    let burst_scale = if sample.loss_ppm >= 100_000 || jitter_millis.saturating_mul(4) >= rtt_millis
+    {
+        14_000_u64
+    } else {
+        12_000_u64
+    };
     let expected = u64::from(data_shards)
         .saturating_mul(u64::from(sample.loss_ppm))
-        .saturating_mul(18);
+        .saturating_mul(burst_scale);
+    let safety = u64::from(sample.loss_ppm >= 30_000);
     let recovery_shards = expected
-        .saturating_add(9_999_999)
-        .checked_div(10_000_000)
+        .saturating_add(9_999_999_999)
+        .checked_div(10_000_000_000)
         .unwrap_or(0)
-        .saturating_add(1)
+        .saturating_add(safety)
         .clamp(1, u64::from(data_shards)) as u8;
 
     let fill_millis = u64::from(data_shards)
@@ -4844,14 +4855,22 @@ impl Peer {
         let mut packet_count = 1_u64;
         let mut packet_bytes = packets[0].data.len() as u64;
         let mut wire_frames = frames;
-        if wire_frames.len() == 1 && packets[0].data.len() <= SMALL_PACKET_LIMIT {
+        // Aggregate before QUIC encryption so one AEAD operation protects
+        // multiple inner packets. Adapt the admission size to the negotiated
+        // frame ceiling while guaranteeing room for at least two candidates.
+        let aggregation_packet_limit = inner_maximum
+            .saturating_sub(16 + 2 * MAX_PACKET_FRAME_HEADER_LEN)
+            .checked_div(2)
+            .unwrap_or(0)
+            .max(MIN_AGGREGATION_PACKET_LIMIT);
+        if wire_frames.len() == 1 && packets[0].data.len() <= aggregation_packet_limit {
             self.counters
                 .aggregation_delay_micros
                 .store(0, Ordering::Relaxed);
             let wire_budget = inner_maximum.saturating_sub(16 + wire_frames[0].len());
             let additional = outbound.try_pop_small_batch_class(
                 latency_sensitive,
-                SMALL_PACKET_LIMIT,
+                aggregation_packet_limit,
                 wire_budget,
                 2 + MAX_PACKET_FRAME_HEADER_LEN,
                 64,
@@ -5533,11 +5552,31 @@ impl Peer {
             repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut repair_budget = 64_usize;
             let mut repair_refill = Instant::now() + Duration::from_secs(1);
+            let mut receive_burst = Vec::with_capacity(QUIC_RECEIVE_BURST);
+            let mut inbound_batch = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+            let mut inbound_by_shard = (0..peer.inbound_packets.shard_count())
+                .map(|_| Vec::with_capacity(INBOUND_ROUTER_BATCH))
+                .collect::<Vec<_>>();
             loop {
                 tokio::select! {
                     _ = receive_cancel.cancelled() => break,
                     result = receive_connection.read_datagram() => match result {
                     Ok(datagram) => {
+                        receive_burst.clear();
+                        receive_burst.push(datagram);
+                        let mut receive_ended = false;
+                        while receive_burst.len() < QUIC_RECEIVE_BURST {
+                            match receive_connection.read_datagram().now_or_never() {
+                                Some(Ok(datagram)) => receive_burst.push(datagram),
+                                Some(Err(error)) => {
+                                    debug!(peer = %peer.name, %error, "peer receive loop ended while draining burst");
+                                    receive_ended = true;
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                        for datagram in receive_burst.drain(..) {
                         let decoded = match fec_decoder.push(datagram) {
                             Ok(decoded) => decoded,
                             Err(error) => {
@@ -5589,13 +5628,11 @@ impl Peer {
                                             continue;
                                         }
                                     };
-                                    if let Err(error) = peer
-                                        .deliver_packet(packet.data, packet.delivery_tag)
+                                    if let Some(packet) = peer
+                                        .prepare_inbound_packet(packet.data, packet.delivery_tag)
                                         .await
                                     {
-                                        warn!(peer = %peer.name, %error, "failed delivering peer packet");
-                                        receive_connection.close(3_u8.into(), b"TUN write failed");
-                                        break;
+                                        inbound_batch.push(packet);
                                     }
                                 }
                             }
@@ -5651,6 +5688,19 @@ impl Peer {
                                 }
                             }
                             }
+                        }
+                        }
+                        if let Err(error) = peer
+                            .inbound_packets
+                            .send_batch_with_scratch(&mut inbound_batch, &mut inbound_by_shard)
+                            .await
+                        {
+                            warn!(peer = %peer.name, %error, "failed delivering peer packet burst");
+                            receive_connection.close(3_u8.into(), b"TUN write failed");
+                            break;
+                        }
+                        if receive_ended {
+                            break;
                         }
                     }
                     Err(error) => {
@@ -6177,6 +6227,11 @@ impl Peer {
             repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut repair_budget = 64_usize;
             let mut repair_refill = Instant::now() + Duration::from_secs(1);
+            let mut receive_burst = Vec::with_capacity(QUIC_RECEIVE_BURST);
+            let mut inbound_batch = Vec::with_capacity(INBOUND_ROUTER_BATCH);
+            let mut inbound_by_shard = (0..peer.inbound_packets.shard_count())
+                .map(|_| Vec::with_capacity(INBOUND_ROUTER_BATCH))
+                .collect::<Vec<_>>();
             loop {
                 let datagram = tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -6221,81 +6276,108 @@ impl Peer {
                         }
                     }
                 };
-                let decoded = match decoder.push(datagram) {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        if should_log(&peer.counters.frame_drops) {
-                            warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane datagram");
+                receive_burst.clear();
+                receive_burst.push(datagram);
+                let mut receive_ended = false;
+                while receive_burst.len() < QUIC_RECEIVE_BURST {
+                    match connection.read_datagram().now_or_never() {
+                        Some(Ok(datagram)) => receive_burst.push(datagram),
+                        Some(Err(error)) => {
+                            debug!(peer = %peer.name, stable_id, %error, "parallel data lane ended while draining burst");
+                            receive_ended = true;
+                            break;
                         }
-                        continue;
+                        None => break,
                     }
-                };
-                peer.counters
-                    .fec_rx_recovery_shards
-                    .fetch_add(decoded.recovery_shards, Ordering::Relaxed);
-                peer.counters
-                    .fec_recovered_shards
-                    .fetch_add(decoded.recovered_shards, Ordering::Relaxed);
-                for overlay_datagram in decoded.frames {
-                    let wire = match decode_datagram(overlay_datagram) {
-                        Ok(wire) => wire,
+                }
+                for datagram in receive_burst.drain(..) {
+                    let decoded = match decoder.push(datagram) {
+                        Ok(decoded) => decoded,
                         Err(error) => {
                             if should_log(&peer.counters.frame_drops) {
-                                warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane frame");
+                                warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane datagram");
                             }
                             continue;
                         }
                     };
-                    match wire {
-                        WireDatagram::Frames(frames) => {
-                            peer.counters
-                                .rx_fragments
-                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
-                            for frame in frames {
-                                let result = reassembler.push_tagged(frame);
+                    peer.counters
+                        .fec_rx_recovery_shards
+                        .fetch_add(decoded.recovery_shards, Ordering::Relaxed);
+                    peer.counters
+                        .fec_recovered_shards
+                        .fetch_add(decoded.recovered_shards, Ordering::Relaxed);
+                    for overlay_datagram in decoded.frames {
+                        let wire = match decode_datagram(overlay_datagram) {
+                            Ok(wire) => wire,
+                            Err(error) => {
+                                if should_log(&peer.counters.frame_drops) {
+                                    warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane frame");
+                                }
+                                continue;
+                            }
+                        };
+                        match wire {
+                            WireDatagram::Frames(frames) => {
                                 peer.counters
-                                    .reassembly_evictions
-                                    .fetch_add(reassembler.take_evictions(), Ordering::Relaxed);
-                                let packet = match result {
-                                    Ok(Some(packet)) => packet,
-                                    Ok(None) => continue,
-                                    Err(error) => {
-                                        if should_log(&peer.counters.frame_drops) {
-                                            warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane overlay frame");
-                                        }
-                                        continue;
-                                    }
-                                };
-                                if let Err(error) =
-                                    peer.deliver_packet(packet.data, packet.delivery_tag).await
-                                {
-                                    warn!(peer = %peer.name, stable_id, %error, "failed delivering data-lane packet");
-                                    connection.close(3_u8.into(), b"TUN write failed");
-                                    break;
-                                }
-                            }
-                        }
-                        WireDatagram::RepairRequest(request) => {
-                            let frames = peer
-                                .repair_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .get(&request);
-                            if let Some(frames) = frames {
+                                    .rx_fragments
+                                    .fetch_add(frames.len() as u64, Ordering::Relaxed);
                                 for frame in frames {
-                                    if connection.send_datagram_wait(frame).await.is_err() {
-                                        break;
-                                    }
+                                    let result = reassembler.push_tagged(frame);
                                     peer.counters
-                                        .repair_fragments_sent
-                                        .fetch_add(1, Ordering::Relaxed);
+                                        .reassembly_evictions
+                                        .fetch_add(reassembler.take_evictions(), Ordering::Relaxed);
+                                    let packet = match result {
+                                        Ok(Some(packet)) => packet,
+                                        Ok(None) => continue,
+                                        Err(error) => {
+                                            if should_log(&peer.counters.frame_drops) {
+                                                warn!(peer = %peer.name, stable_id, %error, "dropping invalid data-lane overlay frame");
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    if let Some(packet) = peer
+                                        .prepare_inbound_packet(packet.data, packet.delivery_tag)
+                                        .await
+                                    {
+                                        inbound_batch.push(packet);
+                                    }
                                 }
                             }
-                        }
-                        _ => {
-                            debug!(peer = %peer.name, stable_id, "ignoring control datagram on data-only lane");
+                            WireDatagram::RepairRequest(request) => {
+                                let frames = peer
+                                    .repair_cache
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get(&request);
+                                if let Some(frames) = frames {
+                                    for frame in frames {
+                                        if connection.send_datagram_wait(frame).await.is_err() {
+                                            break;
+                                        }
+                                        peer.counters
+                                            .repair_fragments_sent
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            _ => {
+                                debug!(peer = %peer.name, stable_id, "ignoring control datagram on data-only lane");
+                            }
                         }
                     }
+                }
+                if let Err(error) = peer
+                    .inbound_packets
+                    .send_batch_with_scratch(&mut inbound_batch, &mut inbound_by_shard)
+                    .await
+                {
+                    warn!(peer = %peer.name, stable_id, %error, "failed delivering data-lane packet burst");
+                    connection.close(3_u8.into(), b"TUN write failed");
+                    break;
+                }
+                if receive_ended {
+                    break;
                 }
             }
             peer.clear_any_connection(stable_id).await;
@@ -6303,11 +6385,11 @@ impl Peer {
         Ok(())
     }
 
-    async fn deliver_packet(
+    async fn prepare_inbound_packet(
         &self,
         packet: DataplaneBuf,
         delivery_tag: Option<DeliveryTag>,
-    ) -> Result<()> {
+    ) -> Option<InboundPacket> {
         let packet_info = match inspect_ip_packet(packet.as_slice()) {
             Ok(info) => info,
             Err(error) => {
@@ -6319,12 +6401,12 @@ impl Peer {
                         "dropping invalid peer datagram"
                     );
                 }
-                return Ok(());
+                return None;
             }
         };
         if let Some(responder) = &self.trace_responder {
             match responder.handle_packet(packet.as_slice()).await {
-                Ok(true) => return Ok(()),
+                Ok(true) => return None,
                 Ok(false) => {}
                 Err(error) => {
                     if should_log(&self.counters.trace_errors) {
@@ -6335,20 +6417,16 @@ impl Peer {
                             "failed handling trace probe"
                         );
                     }
-                    return Ok(());
+                    return None;
                 }
             }
         }
-        self.inbound_packets
-            .send(InboundPacket {
-                peer_id: self.endpoint_id,
-                packet,
-                packet_info,
-                delivery_tag,
-            })
-            .await
-            .context("inbound FlowRouter queue closed")?;
-        Ok(())
+        Some(InboundPacket {
+            peer_id: self.endpoint_id,
+            packet,
+            packet_info,
+            delivery_tag,
+        })
     }
 
     async fn clear_connection(&self, stable_id: usize) {
@@ -6865,6 +6943,19 @@ mod tests {
         assert_eq!(fast.data_shards, 16);
         assert_eq!(fast.recovery_shards, 2);
         assert_eq!(fast.block_timeout_millis, 60);
+
+        let impaired_wan = adaptive_fec_profile(FecNetworkSample {
+            loss_ppm: 152_000,
+            rtt: Duration::from_millis(7),
+            jitter: Duration::from_millis(4),
+            packets: 13_000,
+            rate_bps: 70_000_000,
+        });
+        assert_eq!(impaired_wan.data_shards, 16);
+        // Five shards cover 15.2% bursty loss without the old 6-7 shard
+        // fixed-margin tax observed on the p2 -> wuwei-ws acceptance path.
+        assert_eq!(impaired_wan.recovery_shards, 5);
+        assert_eq!(impaired_wan.block_timeout_millis, 15);
     }
 
     #[test]

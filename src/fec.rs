@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::buffer::{BufferBudget, BufferPermit};
@@ -45,7 +45,7 @@ struct EncodeBlock {
     id: u64,
     created: Instant,
     shard_bytes: usize,
-    originals: Vec<Vec<u8>>,
+    originals: Vec<Bytes>,
 }
 
 /// A systematic application-layer encoder.
@@ -124,23 +124,19 @@ impl FecEncoder {
 
         let block = self.block.as_mut().expect("block was initialized");
         let index = block.originals.len();
-        let mut original = Vec::with_capacity(shard_bytes);
-        original.extend_from_slice(&(frame.len() as u16).to_be_bytes());
-        original.extend_from_slice(&frame);
+        let (wire, original) = encode_original_shard(
+            block.id,
+            index,
+            self.data_shards,
+            self.recovery_shards,
+            shard_bytes,
+            frame,
+        )?;
         batch.overhead_bytes += WIRE_OVERHEAD as u64;
         batch.datagrams.push(EncodedDatagram {
-            bytes: encode_envelope(
-                block.id,
-                KIND_ORIGINAL,
-                index,
-                self.data_shards,
-                self.recovery_shards,
-                shard_bytes,
-                &original,
-            )?,
+            bytes: wire,
             recovery: false,
         });
-        original.resize(shard_bytes, 0);
         block.originals.push(original);
 
         if block.originals.len() == self.data_shards {
@@ -232,8 +228,8 @@ struct DecodeBlock {
     data_shards: usize,
     recovery_shards: usize,
     shard_bytes: usize,
-    originals: Vec<Option<Vec<u8>>>,
-    recoveries: Vec<Option<Vec<u8>>>,
+    originals: Vec<Option<Bytes>>,
+    recoveries: Vec<Option<Bytes>>,
     delivered: Vec<bool>,
     _budget_permits: Vec<BufferPermit>,
 }
@@ -243,9 +239,9 @@ impl DecodeBlock {
         self.originals
             .iter()
             .chain(&self.recoveries)
-            .filter_map(Option::as_ref)
-            .map(Vec::len)
-            .sum()
+            .filter(|shard| shard.is_some())
+            .count()
+            .saturating_mul(self.shard_bytes)
     }
 
     fn parameters_match(&self, envelope: &Envelope) -> bool {
@@ -402,15 +398,17 @@ impl FecDecoder {
             .expect("FEC block was initialized");
         match envelope.kind {
             KIND_ORIGINAL => {
-                let original = expand_original(&envelope.payload, envelope.shard_bytes)?;
                 if let Some(existing) = &block.originals[envelope.index] {
                     ensure!(
-                        existing == &original,
+                        existing == &envelope.payload,
                         "conflicting duplicate FEC original shard"
                     );
                 } else {
-                    self.buffered_bytes += original.len();
-                    block.originals[envelope.index] = Some(original);
+                    self.buffered_bytes += envelope.shard_bytes;
+                    // Keep a slice of the received datagram. Routine delivery
+                    // therefore does not copy or pad an original shard; only
+                    // a block that actually loses data pays expansion cost.
+                    block.originals[envelope.index] = Some(envelope.payload.clone());
                     if let Some(permit) = budget_permit {
                         block._budget_permits.push(permit);
                     }
@@ -423,15 +421,14 @@ impl FecDecoder {
                 }
             }
             KIND_RECOVERY => {
-                let recovery = envelope.payload.to_vec();
                 if let Some(existing) = &block.recoveries[envelope.index] {
                     ensure!(
-                        existing == &recovery,
+                        existing == &envelope.payload,
                         "conflicting duplicate FEC recovery shard"
                     );
                 } else {
-                    self.buffered_bytes += recovery.len();
-                    block.recoveries[envelope.index] = Some(recovery);
+                    self.buffered_bytes += envelope.shard_bytes;
+                    block.recoveries[envelope.index] = Some(envelope.payload.clone());
                     if let Some(permit) = budget_permit {
                         block._budget_permits.push(permit);
                     }
@@ -463,7 +460,19 @@ impl FecDecoder {
                     self.codec.as_mut().expect("decoder was stored")
                 }
             };
-            for (index, original) in block.originals.iter().enumerate() {
+            // Systematic originals stay compact and share the QUIC receive
+            // buffer. Expand them only when parity reconstruction is needed.
+            let expanded_originals = block
+                .originals
+                .iter()
+                .map(|original| {
+                    original
+                        .as_ref()
+                        .map(|original| expand_original(original, block.shard_bytes))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (index, original) in expanded_originals.iter().enumerate() {
                 if let Some(original) = original {
                     decoder
                         .add_original_shard(index, original)
@@ -733,6 +742,40 @@ fn encode_envelope(
     shard_bytes: usize,
     payload: &[u8],
 ) -> Result<Bytes> {
+    validate_envelope_fields(
+        block_id,
+        index,
+        data_shards,
+        recovery_shards,
+        shard_bytes,
+        payload.len(),
+    )?;
+    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+    frame.resize(HEADER_LEN, 0);
+    write_fec_header(
+        &mut frame,
+        FecHeaderFields {
+            block_id,
+            kind,
+            index,
+            data_shards,
+            recovery_shards,
+            shard_bytes,
+            payload_len: payload.len(),
+        },
+    );
+    frame.extend_from_slice(payload);
+    envelope::encode_parts(MessageType::FecShard, 0, &[], &frame)
+}
+
+fn validate_envelope_fields(
+    block_id: u64,
+    index: usize,
+    data_shards: usize,
+    recovery_shards: usize,
+    shard_bytes: usize,
+    payload_len: usize,
+) -> Result<()> {
     ensure!(block_id != 0, "invalid zero FEC block ID");
     ensure!(
         index <= u8::MAX as usize,
@@ -751,19 +794,79 @@ fn encode_envelope(
         "FEC shard size exceeds wire maximum"
     );
     ensure!(
-        payload.len() <= u16::MAX as usize,
+        payload_len <= u16::MAX as usize,
         "FEC payload exceeds wire maximum"
     );
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.extend_from_slice(&block_id.to_be_bytes());
-    frame.push(kind);
-    frame.push(index as u8);
-    frame.push(data_shards as u8);
-    frame.push(recovery_shards as u8);
-    frame.extend_from_slice(&(shard_bytes as u16).to_be_bytes());
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    frame.extend_from_slice(payload);
-    envelope::encode_parts(MessageType::FecShard, 0, &[], &frame)
+    Ok(())
+}
+
+struct FecHeaderFields {
+    block_id: u64,
+    kind: u8,
+    index: usize,
+    data_shards: usize,
+    recovery_shards: usize,
+    shard_bytes: usize,
+    payload_len: usize,
+}
+
+fn write_fec_header(dest: &mut [u8], fields: FecHeaderFields) {
+    debug_assert!(dest.len() >= HEADER_LEN);
+    dest[..8].copy_from_slice(&fields.block_id.to_be_bytes());
+    dest[8] = fields.kind;
+    dest[9] = fields.index as u8;
+    dest[10] = fields.data_shards as u8;
+    dest[11] = fields.recovery_shards as u8;
+    dest[12..14].copy_from_slice(&(fields.shard_bytes as u16).to_be_bytes());
+    dest[14..16].copy_from_slice(&(fields.payload_len as u16).to_be_bytes());
+}
+
+/// Build the systematic wire datagram and the padded Reed-Solomon shard from
+/// one shared allocation. The inner frame is copied exactly once.
+fn encode_original_shard(
+    block_id: u64,
+    index: usize,
+    data_shards: usize,
+    recovery_shards: usize,
+    shard_bytes: usize,
+    frame: Bytes,
+) -> Result<(Bytes, Bytes)> {
+    validate_envelope_fields(
+        block_id,
+        index,
+        data_shards,
+        recovery_shards,
+        shard_bytes,
+        LENGTH_PREFIX_LEN + frame.len(),
+    )?;
+    ensure!(
+        LENGTH_PREFIX_LEN + frame.len() <= shard_bytes,
+        "FEC original exceeds shard size"
+    );
+    let payload_start = V1_HEADER_LEN + HEADER_LEN;
+    let wire_len = payload_start + LENGTH_PREFIX_LEN + frame.len();
+    let mut backing = BytesMut::zeroed(payload_start + shard_bytes);
+    envelope::write_header_at(&mut backing[..V1_HEADER_LEN], MessageType::FecShard, 0)?;
+    write_fec_header(
+        &mut backing[V1_HEADER_LEN..payload_start],
+        FecHeaderFields {
+            block_id,
+            kind: KIND_ORIGINAL,
+            index,
+            data_shards,
+            recovery_shards,
+            shard_bytes,
+            payload_len: LENGTH_PREFIX_LEN + frame.len(),
+        },
+    );
+    backing[payload_start..payload_start + LENGTH_PREFIX_LEN]
+        .copy_from_slice(&(frame.len() as u16).to_be_bytes());
+    backing[payload_start + LENGTH_PREFIX_LEN..wire_len].copy_from_slice(&frame);
+    let backing = backing.freeze();
+    Ok((
+        backing.slice(..wire_len),
+        backing.slice(payload_start..payload_start + shard_bytes),
+    ))
 }
 
 fn expand_original(payload: &[u8], shard_bytes: usize) -> Result<Vec<u8>> {

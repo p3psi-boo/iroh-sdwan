@@ -59,3 +59,40 @@ overlay/underlay 效率为 **63.0%**。该时段 QUIC 短时丢包峰值从 6.05
 - `p2-p6-auto-controller-symbols-p6.svg`：内核 wakeup spin unlock 5.53%，ChaCha open SSE4.1 4.67%，`memcpy` 3.69%，virtio `iowrite16` 3.32%。
 
 应用层没有出现状态机或互斥锁主热点；下一阶段的性能优先级是加密批处理/减少复制、降低接收端 wakeup 频率，以及在保持恢复率的前提下继续收紧 FEC parity。
+
+## p2 → wuwei-ws 批处理、零复制与低冗余 FEC 验收
+
+测试日期：2026-08-17 UTC。发送端为 p2，接收端为 wuwei-ws；underlay 与
+overlay 均使用 4 条 TCP 流、30 秒。状态快照确认 overlay 的 QUIC underlay 为
+`[2408:8207:18d3:2890:6bf2:7c7c:82bb:227a]:4000`，transport 为 `direct`，没有
+使用 `200::/7` Yggdrasil 地址。
+
+| 路径 | 接收吞吐 | TCP retransmits | 说明 |
+| --- | ---: | ---: | --- |
+| 运营商 IPv6 underlay | 101.9 Mbit/s | 7,991 | `p2-wuwei-batch-zero-copy-underlay.json` |
+| ironet overlay（生产二进制） | 67.5 Mbit/s | 1,519 | `p2-wuwei-batch-zero-copy-overlay.json` |
+| ironet overlay（带符号 profile） | 66.5 Mbit/s | 1,533 | `p2-wuwei-batch-zero-copy-symbols-overlay.json` |
+
+生产二进制的 overlay/underlay 效率为 **66.2%**。该轮不是健康链路：p2 的
+QUIC 发送计数在测试区间增加 391,623 个 datagram，其中 71,885 个被标记丢失；
+结束时 loss EWMA 为 15.26%、RTT 7.01 ms、jitter 4.10 ms。自动 FEC 收敛到
+`16+5@15ms`；旧的 1.8 倍固定余量在相同损失附近会选择 6–7 个恢复分片。
+`16/21` 的编码有效载荷上限对应约 77.6 Mbit/s，实测达到该上限的约 87%。
+
+本轮实现同时验证了：
+
+- 小包按实时 frame ceiling 在 QUIC 加密前聚合，一个 AEAD packet 可承载多个内层包；
+- FEC systematic wire frame 与 Reed-Solomon 原始 shard 共享同一 `Bytes` backing，发送端只复制一次；
+- 接收端保存 QUIC datagram slice，正常 systematic delivery 不扩容、不补零；只有实际恢复丢失块时才构造 padded shard；
+- 每次 QUIC 唤醒最多同步排空 64 个已缓冲 datagram，并按 flow owner 使用 `reserve_many` 合并 ingress 通知；
+- FEC 冗余使用 1.2–1.4 倍实时预期损失，并只在 loss ≥ 3% 时增加 safety shard。
+
+双端 profile 均使用 `perf record -e task-clock -F 99 --call-graph dwarf,8192`，
+lost samples 为 0：
+
+- `p2-wuwei-batch-zero-copy-symbols-p2.svg`：ChaCha20-Poly1305 AVX2 seal 9.00%，`memcpy` 5.83%，QUIC `populate_packet` 1.06%；
+- `p2-wuwei-batch-zero-copy-symbols-wuwei.svg`：`memcpy` 6.69%，ChaCha20-Poly1305 AVX2 open 6.41%，`RecvState::poll_socket` 1.67%；
+- 接收端旧 profile 中 5.53% 的 wakeup spin unlock 已不再是主要热点；调用栈中没有 routine `expand_original`，按需补零路径只在真实 FEC 恢复时执行。
+
+因此当前主要剩余成本已经收敛到 QUIC 每包 AEAD、内核 UDP/TUN copy 与通用
+`memcpy`，而不是应用状态机、锁或逐 datagram 接收唤醒。

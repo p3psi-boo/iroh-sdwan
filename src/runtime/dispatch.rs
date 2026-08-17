@@ -25,12 +25,58 @@ impl InboundDispatcher {
         }
     }
 
-    pub(super) async fn send(&self, packet: InboundPacket) -> Result<()> {
-        let shard = flow_shard(packet.packet_info, self.senders.len());
-        self.senders[shard]
-            .send(packet)
-            .await
-            .context("inbound shard queue closed")
+    pub(super) fn shard_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    fn shard_for(&self, packet: PacketInfo) -> usize {
+        flow_shard(packet, self.senders.len())
+    }
+
+    /// Reserve and publish a receive burst per flow-owner shard. Publishing a
+    /// whole reservation coalesces Tokio receiver notifications while keeping
+    /// unrelated flow shards independent under backpressure.
+    pub(super) async fn send_batch_with_scratch(
+        &self,
+        packets: &mut Vec<InboundPacket>,
+        by_shard: &mut [Vec<InboundPacket>],
+    ) -> Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(by_shard.len(), self.senders.len());
+        for bucket in by_shard.iter_mut() {
+            bucket.clear();
+        }
+        for packet in packets.drain(..) {
+            by_shard[self.shard_for(packet.packet_info)].push(packet);
+        }
+        let mut sends = FuturesUnordered::new();
+        for (index, (sender, shard)) in self.senders.iter().zip(by_shard.iter_mut()).enumerate() {
+            if shard.is_empty() {
+                continue;
+            }
+            let sender = sender.clone();
+            let mut shard = std::mem::take(shard);
+            sends.push(async move {
+                while !shard.is_empty() {
+                    let count = shard.len().min(FLOW_DISPATCH_QUEUE);
+                    let permits = sender
+                        .reserve_many(count)
+                        .await
+                        .context("inbound shard queue closed")?;
+                    for (permit, packet) in permits.zip(shard.drain(..count)) {
+                        permit.send(packet);
+                    }
+                }
+                Ok::<_, anyhow::Error>((index, shard))
+            });
+        }
+        while let Some(result) = sends.next().await {
+            let (index, empty) = result?;
+            by_shard[index] = empty;
+        }
+        Ok(())
     }
 }
 
