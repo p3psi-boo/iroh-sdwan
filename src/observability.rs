@@ -71,6 +71,21 @@ pub struct PeerCounters {
     pub fec_unprotected_shards: AtomicU64,
     pub fec_expired_blocks: AtomicU64,
     pub fec_overhead_bytes: AtomicU64,
+    pub tx_fragment_copy_bytes: AtomicU64,
+    pub fec_encode_copy_bytes: AtomicU64,
+    pub fec_decode_copy_bytes: AtomicU64,
+    pub reassembly_copy_bytes: AtomicU64,
+    pub tun_fallback_copy_bytes: AtomicU64,
+    pub quic_crypto_tx_datagrams: AtomicU64,
+    pub quic_crypto_tx_bytes: AtomicU64,
+    pub quic_crypto_rx_datagrams: AtomicU64,
+    pub quic_crypto_rx_bytes: AtomicU64,
+    pub fec_feedback_reports: AtomicU64,
+    pub fec_feedback_rx_recovery_shards: AtomicU64,
+    pub fec_feedback_recovered_shards: AtomicU64,
+    pub fec_feedback_expired_blocks: AtomicU64,
+    pub fec_feedback_utility_ppm: AtomicU64,
+    pub fec_feedback_effective_utility_ppm: AtomicU64,
     pub fec_active: AtomicBool,
     pub fec_data_shards: AtomicU64,
     pub fec_recovery_shards: AtomicU64,
@@ -160,6 +175,21 @@ impl PeerCounters {
             fec_unprotected_shards: AtomicU64::new(0),
             fec_expired_blocks: AtomicU64::new(0),
             fec_overhead_bytes: AtomicU64::new(0),
+            tx_fragment_copy_bytes: AtomicU64::new(0),
+            fec_encode_copy_bytes: AtomicU64::new(0),
+            fec_decode_copy_bytes: AtomicU64::new(0),
+            reassembly_copy_bytes: AtomicU64::new(0),
+            tun_fallback_copy_bytes: AtomicU64::new(0),
+            quic_crypto_tx_datagrams: AtomicU64::new(0),
+            quic_crypto_tx_bytes: AtomicU64::new(0),
+            quic_crypto_rx_datagrams: AtomicU64::new(0),
+            quic_crypto_rx_bytes: AtomicU64::new(0),
+            fec_feedback_reports: AtomicU64::new(0),
+            fec_feedback_rx_recovery_shards: AtomicU64::new(0),
+            fec_feedback_recovered_shards: AtomicU64::new(0),
+            fec_feedback_expired_blocks: AtomicU64::new(0),
+            fec_feedback_utility_ppm: AtomicU64::new(0),
+            fec_feedback_effective_utility_ppm: AtomicU64::new(0),
             fec_active: AtomicBool::new(false),
             fec_data_shards: AtomicU64::new(0),
             fec_recovery_shards: AtomicU64::new(0),
@@ -591,6 +621,36 @@ pub struct PeerStatus {
     #[serde(default)]
     pub fec_overhead_bytes: u64,
     #[serde(default)]
+    pub tx_fragment_copy_bytes: u64,
+    #[serde(default)]
+    pub fec_encode_copy_bytes: u64,
+    #[serde(default)]
+    pub fec_decode_copy_bytes: u64,
+    #[serde(default)]
+    pub reassembly_copy_bytes: u64,
+    #[serde(default)]
+    pub tun_fallback_copy_bytes: u64,
+    #[serde(default)]
+    pub quic_crypto_tx_datagrams: u64,
+    #[serde(default)]
+    pub quic_crypto_tx_bytes: u64,
+    #[serde(default)]
+    pub quic_crypto_rx_datagrams: u64,
+    #[serde(default)]
+    pub quic_crypto_rx_bytes: u64,
+    #[serde(default)]
+    pub fec_feedback_reports: u64,
+    #[serde(default)]
+    pub fec_feedback_rx_recovery_shards: u64,
+    #[serde(default)]
+    pub fec_feedback_recovered_shards: u64,
+    #[serde(default)]
+    pub fec_feedback_expired_blocks: u64,
+    #[serde(default)]
+    pub fec_feedback_utility_ppm: u64,
+    #[serde(default)]
+    pub fec_feedback_effective_utility_ppm: u64,
+    #[serde(default)]
     pub fec_active: bool,
     #[serde(default)]
     pub fec_data_shards: u64,
@@ -786,6 +846,25 @@ fn peer_snapshot(peer: &PeerCounters) -> PeerStatus {
         fec_unprotected_shards: peer.fec_unprotected_shards.load(Ordering::Relaxed),
         fec_expired_blocks: peer.fec_expired_blocks.load(Ordering::Relaxed),
         fec_overhead_bytes: peer.fec_overhead_bytes.load(Ordering::Relaxed),
+        tx_fragment_copy_bytes: peer.tx_fragment_copy_bytes.load(Ordering::Relaxed),
+        fec_encode_copy_bytes: peer.fec_encode_copy_bytes.load(Ordering::Relaxed),
+        fec_decode_copy_bytes: peer.fec_decode_copy_bytes.load(Ordering::Relaxed),
+        reassembly_copy_bytes: peer.reassembly_copy_bytes.load(Ordering::Relaxed),
+        tun_fallback_copy_bytes: peer.tun_fallback_copy_bytes.load(Ordering::Relaxed),
+        quic_crypto_tx_datagrams: peer.quic_crypto_tx_datagrams.load(Ordering::Relaxed),
+        quic_crypto_tx_bytes: peer.quic_crypto_tx_bytes.load(Ordering::Relaxed),
+        quic_crypto_rx_datagrams: peer.quic_crypto_rx_datagrams.load(Ordering::Relaxed),
+        quic_crypto_rx_bytes: peer.quic_crypto_rx_bytes.load(Ordering::Relaxed),
+        fec_feedback_reports: peer.fec_feedback_reports.load(Ordering::Relaxed),
+        fec_feedback_rx_recovery_shards: peer
+            .fec_feedback_rx_recovery_shards
+            .load(Ordering::Relaxed),
+        fec_feedback_recovered_shards: peer.fec_feedback_recovered_shards.load(Ordering::Relaxed),
+        fec_feedback_expired_blocks: peer.fec_feedback_expired_blocks.load(Ordering::Relaxed),
+        fec_feedback_utility_ppm: peer.fec_feedback_utility_ppm.load(Ordering::Relaxed),
+        fec_feedback_effective_utility_ppm: peer
+            .fec_feedback_effective_utility_ppm
+            .load(Ordering::Relaxed),
         fec_active: peer.fec_active.load(Ordering::Relaxed),
         fec_data_shards: peer.fec_data_shards.load(Ordering::Relaxed),
         fec_recovery_shards: peer.fec_recovery_shards.load(Ordering::Relaxed),
@@ -1053,6 +1132,25 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             ("fec_unprotected_shards_total", peer.fec_unprotected_shards),
             ("fec_expired_blocks_total", peer.fec_expired_blocks),
             ("fec_overhead_bytes_total", peer.fec_overhead_bytes),
+            ("tx_fragment_copy_bytes_total", peer.tx_fragment_copy_bytes),
+            ("fec_encode_copy_bytes_total", peer.fec_encode_copy_bytes),
+            ("fec_decode_copy_bytes_total", peer.fec_decode_copy_bytes),
+            ("reassembly_copy_bytes_total", peer.reassembly_copy_bytes),
+            (
+                "tun_fallback_copy_bytes_total",
+                peer.tun_fallback_copy_bytes,
+            ),
+            (
+                "quic_crypto_tx_datagrams_total",
+                peer.quic_crypto_tx_datagrams,
+            ),
+            ("quic_crypto_tx_bytes_total", peer.quic_crypto_tx_bytes),
+            (
+                "quic_crypto_rx_datagrams_total",
+                peer.quic_crypto_rx_datagrams,
+            ),
+            ("quic_crypto_rx_bytes_total", peer.quic_crypto_rx_bytes),
+            ("fec_feedback_reports_total", peer.fec_feedback_reports),
             ("invalid_packets_total", peer.invalid_packets),
             ("policy_drops_total", peer.policy_drops),
             ("frame_drops_total", peer.frame_drops),
@@ -1101,6 +1199,23 @@ fn render_prometheus(status: &RuntimeStatus) -> String {
             ("fec_active", u64::from(peer.fec_active)),
             ("fec_data_shards", peer.fec_data_shards),
             ("fec_recovery_shards", peer.fec_recovery_shards),
+            (
+                "fec_feedback_rx_recovery_shards",
+                peer.fec_feedback_rx_recovery_shards,
+            ),
+            (
+                "fec_feedback_recovered_shards",
+                peer.fec_feedback_recovered_shards,
+            ),
+            (
+                "fec_feedback_expired_blocks",
+                peer.fec_feedback_expired_blocks,
+            ),
+            ("fec_feedback_utility_ppm", peer.fec_feedback_utility_ppm),
+            (
+                "fec_feedback_effective_utility_ppm",
+                peer.fec_feedback_effective_utility_ppm,
+            ),
             (
                 "fec_block_timeout_milliseconds",
                 peer.fec_block_timeout_millis,

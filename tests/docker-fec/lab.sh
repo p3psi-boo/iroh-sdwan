@@ -93,6 +93,10 @@ test "$received" -ge 970
 
 echo "==> proving recovery stops cleanly after loss removal"
 ip netns exec fec-a tc qdisc del dev fa0 root
+# Let the one-second reporter publish every recovery completed by the lossy
+# burst before taking the clean-path baseline. Otherwise the assertion races a
+# final status-file refresh even though no clean-path packet needed recovery.
+sleep 2
 before=$(awk '$1 ~ /ironet_peer_fec_recovered_shards_total/ {print $NF}' /state/node-b/metrics.prom)
 ip netns exec fec-a ping -q -c 64 -i 0.005 -W 2 -I 10.241.0.1 10.241.0.2 >/dev/null
 sleep 2

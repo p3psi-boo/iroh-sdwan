@@ -96,3 +96,39 @@ lost samples 为 0：
 
 因此当前主要剩余成本已经收敛到 QUIC 每包 AEAD、内核 UDP/TUN copy 与通用
 `memcpy`，而不是应用状态机、锁或逐 datagram 接收唤醒。
+
+## p2 → wuwei-ws 密码套件自动择优、FEC v2 feedback 与复制归因
+
+测试日期：2026-08-17 UTC。两端均通过运营商 IPv6 直连；验收状态中的远端地址
+位于 `2408:8207:18d3:2890::/64`，没有使用 `200::/7` Yggdrasil overlay。
+`udp_segmentation_offload = "auto"` 的真实双 segment 出口探测在两端通过并自动
+启用 GSO。启动基准在 p2 测得 ChaCha/AES-256 为 11.91/3.72 ms，在 wuwei-ws
+测得 4.74/1.72 ms，因此双方自动优先 AES-256-GCM；同一版本部署到 p6 后则根据
+该主机实测保留 ChaCha，证明选择是逐主机完成而非编译时固定。
+
+| 路径 | 接收吞吐 | TCP retransmits | 说明 |
+| --- | ---: | ---: | --- |
+| 运营商 IPv6 underlay | 101.888 Mbit/s | 7,719 | `p2-wuwei-crypto-auto-fec-feedback-underlay.json` |
+| ironet overlay（带符号、双端 profile） | 68.172 Mbit/s | 2,165 | `p2-wuwei-crypto-auto-fec-feedback-profile-overlay.json` |
+| ironet overlay（精简生产二进制） | 69.750 Mbit/s | 1,828 | `p2-wuwei-crypto-auto-fec-feedback-overlay.json` |
+
+生产二进制的 overlay/underlay 效率为 **68.46%**；相对上一轮相同 underlay
+约 101.9 Mbit/s 时的 67.5 Mbit/s / 66.2%，overlay 吞吐提高 **3.3%**，效率
+提高 **2.3 个百分点**。最终生产测试结束时 p2 的 loss EWMA 为 7.89%，FEC
+收敛到 `16+3@15ms`。该轮发送 62,248 个 recovery shard，接收端观察到 51,128
+个，实际恢复 144 个数据 shard；累计有效收益仅为已发送 parity 的 0.23%。FEC
+v2 feedback 因而移除低收益的安全余量，同时仍受 EWMA 平均丢包下限约束；测试
+全程两端 `frame_drops` 保持 0。
+
+双端火焰图使用 `perf record -e task-clock -F 99 --call-graph dwarf,8192`，lost
+samples 均为 0：
+
+- `p2-wuwei-crypto-auto-fec-feedback-p2.svg`：AES-GCM VAES/AVX2 seal 2.44%，上一轮 ChaCha seal 为 9.00%；`memcpy` 8.41%，没有状态机或锁竞争主热点；
+- `p2-wuwei-crypto-auto-fec-feedback-wuwei.svg`：AES-GCM VAES/AVX2 open 0.95%，上一轮 ChaCha open 为 6.41%；`memcpy` 5.34%；
+- p2 采集期 task-clock 为 14.90 秒/47 秒（约 31.7% 单核），上一轮为 11.44 秒/35 秒（约 32.7% 单核）；加密成本下降后并未把热点转移到锁或状态机。
+
+新增计数把 profile 中的 `memcpy` 还原到数据面阶段。40 秒 profile 区间内，p2
+的 jumbo 分片一次复制 483.53 MB、FEC systematic/recovery 构造复制 532.99 MB；
+wuwei-ws 仅在真实恢复时产生 1.79 MB FEC decode copy，必需的 jumbo 重组复制
+394.45 MB，TUN fallback copy 仅 1.66 MB。下一步若继续降低 `memcpy`，边界已经
+明确为 jumbo 重组和内核 UDP/TUN 交付，而不是再删除应用层锁或状态机。

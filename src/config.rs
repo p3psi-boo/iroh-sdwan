@@ -42,14 +42,23 @@ pub struct Config {
         skip_serializing_if = "is_default_max_frame_size"
     )]
     pub max_frame_size: u16,
-    /// Use UDP segmentation offload for batched QUIC datagram transmission.
-    /// Keep disabled unless the host UDP stack and network interface support it.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub udp_segmentation_offload: bool,
+    /// UDP segmentation offload policy for batched QUIC datagrams. `auto`
+    /// performs an egress-path send probe before enabling it. Legacy booleans
+    /// remain accepted (`true` = enabled, `false` = disabled).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_udp_segmentation_offload",
+        skip_serializing_if = "is_default"
+    )]
+    pub udp_segmentation_offload: UdpSegmentationOffload,
     /// Let peers negotiate conservative initial transport settings and adapt
     /// them from live path telemetry. Explicit values remain hard ceilings.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub quic_auto_tune: bool,
+    /// QUIC payload cipher preference. `auto` benchmarks the host at startup;
+    /// fixed values remain available as operational overrides.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub quic_cipher_preference: QuicCipherPreference,
     /// Bounded userspace QUIC DATAGRAM send queue per connection. Larger
     /// values reduce producer/driver wakeups on fast paths at the cost of a
     /// larger non-preemptible burst.
@@ -187,6 +196,52 @@ pub enum QuicCongestionController {
     Bbr3,
     Passthrough,
     Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuicCipherPreference {
+    #[default]
+    Auto,
+    ChaCha20,
+    Aes256Gcm,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpSegmentationOffload {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+fn deserialize_udp_segmentation_offload<'de, D>(
+    deserializer: D,
+) -> std::result::Result<UdpSegmentationOffload, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CompatibleValue {
+        Legacy(bool),
+        Name(String),
+    }
+
+    use serde::de::Error as _;
+    match CompatibleValue::deserialize(deserializer)? {
+        CompatibleValue::Legacy(true) => Ok(UdpSegmentationOffload::Enabled),
+        CompatibleValue::Legacy(false) => Ok(UdpSegmentationOffload::Disabled),
+        CompatibleValue::Name(name) => match name.as_str() {
+            "auto" => Ok(UdpSegmentationOffload::Auto),
+            "enabled" => Ok(UdpSegmentationOffload::Enabled),
+            "disabled" => Ok(UdpSegmentationOffload::Disabled),
+            _ => Err(D::Error::custom(
+                "udp_segmentation_offload must be auto, enabled, disabled, true or false",
+            )),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1560,6 +1615,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn udp_gso_policy_accepts_auto_and_legacy_booleans() {
+        let example: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        assert_eq!(
+            example.udp_segmentation_offload,
+            UdpSegmentationOffload::Auto
+        );
+
+        let disabled = include_str!("../config/example.toml").replace(
+            "udp_segmentation_offload = \"auto\"",
+            "udp_segmentation_offload = false",
+        );
+        let disabled: Config = toml::from_str(&disabled).unwrap();
+        assert_eq!(
+            disabled.udp_segmentation_offload,
+            UdpSegmentationOffload::Disabled
+        );
+        let enabled = include_str!("../config/example.toml").replace(
+            "udp_segmentation_offload = \"auto\"",
+            "udp_segmentation_offload = true",
+        );
+        let enabled: Config = toml::from_str(&enabled).unwrap();
+        assert_eq!(
+            enabled.udp_segmentation_offload,
+            UdpSegmentationOffload::Enabled
+        );
+    }
+
+    #[test]
     fn transit_node_info_does_not_require_an_attachment_address() {
         let config = Config {
             network_id: "example".into(),
@@ -1570,8 +1653,9 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
-            udp_segmentation_offload: false,
+            udp_segmentation_offload: UdpSegmentationOffload::Disabled,
             quic_auto_tune: true,
+            quic_cipher_preference: QuicCipherPreference::default(),
             quic_send_buffer_bytes: default_quic_send_buffer_bytes(),
             quic_receive_buffer_bytes: default_quic_receive_buffer_bytes(),
             quic_data_lanes: default_quic_data_lanes(),

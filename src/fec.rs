@@ -38,6 +38,9 @@ pub struct EncodeBatch {
     /// Original shards whose block aged out or changed size before parity could be made.
     pub unprotected_shards: u64,
     pub overhead_bytes: u64,
+    /// Payload bytes copied while constructing systematic and recovery wire
+    /// shards. Reed-Solomon's internal SIMD loads are intentionally excluded.
+    pub copy_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -124,6 +127,7 @@ impl FecEncoder {
 
         let block = self.block.as_mut().expect("block was initialized");
         let index = block.originals.len();
+        let frame_len = frame.len();
         let (wire, original) = encode_original_shard(
             block.id,
             index,
@@ -132,6 +136,7 @@ impl FecEncoder {
             shard_bytes,
             frame,
         )?;
+        batch.copy_bytes = batch.copy_bytes.saturating_add(frame_len as u64);
         batch.overhead_bytes += WIRE_OVERHEAD as u64;
         batch.datagrams.push(EncodedDatagram {
             bytes: wire,
@@ -166,6 +171,7 @@ impl FecEncoder {
             }
             let encoded = encoder.encode().context("failed encoding FEC block")?;
             for (index, recovery) in encoded.recovery_iter().enumerate() {
+                batch.copy_bytes = batch.copy_bytes.saturating_add(recovery.len() as u64);
                 batch.overhead_bytes += (HEADER_LEN + recovery.len()) as u64;
                 batch.datagrams.push(EncodedDatagram {
                     bytes: encode_envelope(
@@ -220,6 +226,8 @@ pub struct DecodeBatch {
     pub recovery_shards: u64,
     pub recovered_shards: u64,
     pub expired_blocks: u64,
+    /// Bytes copied only because a block required Reed-Solomon recovery.
+    pub copy_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -316,11 +324,15 @@ impl FecDecoder {
         }
 
         let envelope = Envelope::parse(v1.payload)?;
+        if envelope.kind == KIND_RECOVERY {
+            // Count every recovery shard observed on the wire, including tail
+            // parity that arrives after all systematic data. The FEC feedback
+            // controller needs that denominator to distinguish useful repair
+            // from delivered-but-unnecessary redundancy.
+            batch.recovery_shards = 1;
+        }
         if self.completed.contains(&envelope.block_id) {
             return Ok(batch);
-        }
-        if envelope.kind == KIND_RECOVERY {
-            batch.recovery_shards = 1;
         }
         if !self.blocks.contains_key(&envelope.block_id) {
             if self.capacity_exceeded(envelope.shard_bytes) {
@@ -472,6 +484,13 @@ impl FecDecoder {
                         .transpose()
                 })
                 .collect::<Result<Vec<_>>>()?;
+            batch.copy_bytes = batch.copy_bytes.saturating_add(
+                expanded_originals
+                    .iter()
+                    .flatten()
+                    .map(|original| original.len() as u64)
+                    .sum::<u64>(),
+            );
             for (index, original) in expanded_originals.iter().enumerate() {
                 if let Some(original) = original {
                     decoder
@@ -491,9 +510,16 @@ impl FecDecoder {
                 .restored_original_iter()
                 .map(|(index, shard)| (index, shard.to_vec()))
                 .collect();
+            batch.copy_bytes = batch.copy_bytes.saturating_add(
+                restored
+                    .iter()
+                    .map(|(_, original)| original.len() as u64)
+                    .sum::<u64>(),
+            );
             drop(decoded);
             for (index, original) in restored {
                 let frame = original_from_expanded(&original)?;
+                batch.copy_bytes = batch.copy_bytes.saturating_add(frame.len() as u64);
                 if !block.delivered[index] {
                     block.delivered[index] = true;
                     batch.recovered_shards += 1;
@@ -1084,6 +1110,27 @@ mod tests {
                 .frames
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn late_recovery_is_counted_but_not_decoded_again() {
+        let mut encoder = encoder();
+        let mut datagrams = Vec::new();
+        for frame in [b"zero".as_slice(), b"one", b"two", b"three"] {
+            datagrams.extend(
+                encoder
+                    .push(Bytes::copy_from_slice(frame), 128)
+                    .unwrap()
+                    .datagrams,
+            );
+        }
+        let mut decoder = FecDecoder::new(Duration::from_secs(1)).unwrap();
+        for datagram in &datagrams[..4] {
+            decoder.push(datagram.bytes.clone()).unwrap();
+        }
+        let late = decoder.push(datagrams[4].bytes.clone()).unwrap();
+        assert_eq!(late.recovery_shards, 1);
+        assert!(late.frames.is_empty());
     }
 
     #[test]

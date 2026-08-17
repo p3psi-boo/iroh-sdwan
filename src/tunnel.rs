@@ -132,20 +132,33 @@ pub fn tun_read_pool(mtu: u16) -> PacketSlotPool {
 
 /// Place a virtio-net header in unused prefix bytes when the packet is unique.
 pub fn attach_virtio(packet: DataplaneBuf) -> BytesMut {
+    attach_virtio_counted(packet).0
+}
+
+/// Return the prepared TUN buffer and the number of packet payload bytes that
+/// had to be copied because the received allocation could not be reused.
+pub fn attach_virtio_counted(packet: DataplaneBuf) -> (BytesMut, u64) {
     const HDR: usize = VIRTIO_NET_HDR_LEN;
     if packet.can_prepend(HDR) {
         match packet.try_prepend(&[0_u8; HDR]) {
             Ok(sealed) => match sealed.try_into_mut() {
                 Ok(mut unique) => {
                     unique[..HDR].fill(0);
-                    return unique;
+                    return (unique, 0);
                 }
-                Err(sealed) => return attach_virtio_copy(&sealed[HDR..]),
+                Err(sealed) => {
+                    let packet_len = sealed.len().saturating_sub(HDR);
+                    return (attach_virtio_copy(&sealed[HDR..]), packet_len as u64);
+                }
             },
-            Err(packet) => return attach_virtio_copy(packet.as_slice()),
+            Err(packet) => {
+                let packet_len = packet.len();
+                return (attach_virtio_copy(packet.as_slice()), packet_len as u64);
+            }
         }
     }
-    attach_virtio_copy(packet.as_slice())
+    let packet_len = packet.len();
+    (attach_virtio_copy(packet.as_slice()), packet_len as u64)
 }
 
 pub fn attach_virtio_copy(packet: &[u8]) -> BytesMut {
@@ -166,6 +179,14 @@ mod tests {
         let packet = DataplaneBuf::from_pooled(raw.freeze(), VIRTIO_NET_HDR_LEN);
         let prepared = attach_virtio(packet);
         assert_eq!(&prepared[..VIRTIO_NET_HDR_LEN], &[0; VIRTIO_NET_HDR_LEN]);
+        assert_eq!(&prepared[VIRTIO_NET_HDR_LEN..], b"abcd");
+    }
+
+    #[test]
+    fn attach_virtio_reports_fallback_copy_bytes() {
+        let packet = DataplaneBuf::from_static(b"abcd");
+        let (prepared, copied) = attach_virtio_counted(packet);
+        assert_eq!(copied, 4);
         assert_eq!(&prepared[VIRTIO_NET_HDR_LEN..], b"abcd");
     }
 

@@ -1919,6 +1919,7 @@ dependencies = [
  "noq-udp",
  "ratatui",
  "reed-solomon-simd",
+ "ring",
  "rustc-hash",
  "rustls",
  "serde",

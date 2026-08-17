@@ -638,10 +638,16 @@ mod tests {
 
     async fn connections() -> (Endpoint, Endpoint, Connection, Connection) {
         let alpn = b"ironet/session-v1-test".to_vec();
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.cipher_suites.sort_by_key(|suite| {
+            u8::from(suite.suite() != rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
+        });
+        let provider = std::sync::Arc::new(provider);
         let client_key = SecretKey::generate();
         let server_key = SecretKey::generate();
         let client = Endpoint::builder(presets::N0)
             .secret_key(client_key)
+            .crypto_provider(provider.clone())
             .alpns(vec![alpn.clone()])
             .relay_mode(RelayMode::Disabled)
             .clear_address_lookup()
@@ -652,6 +658,7 @@ mod tests {
             .unwrap();
         let server = Endpoint::builder(presets::N0)
             .secret_key(server_key.clone())
+            .crypto_provider(provider)
             .alpns(vec![alpn.clone()])
             .relay_mode(RelayMode::Disabled)
             .clear_address_lookup()

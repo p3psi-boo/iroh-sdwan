@@ -35,13 +35,29 @@ pub struct RepairRequest {
     pub missing_offsets: Vec<u16>,
 }
 
+/// Cumulative receiver-side evidence used by the sender's adaptive FEC
+/// controller.  Cumulative values make the feedback robust to loss of the
+/// unreliable heartbeat datagram; the sender derives interval deltas from the
+/// newest report it receives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FecFeedback {
+    pub received_recovery_shards: u64,
+    pub recovered_data_shards: u64,
+    pub expired_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub fec_feedback: Option<FecFeedback>,
+}
+
 #[derive(Debug, Clone)]
 pub enum WireDatagram {
     Frames(Vec<Bytes>),
     RepairRequest(RepairRequest),
     CapacityProbe(CapacityProbeMessage),
     Delivery(DeliveryMessage),
-    Heartbeat,
+    Heartbeat(Heartbeat),
     ConnectionRefresh,
     AddressCandidates(Vec<SocketAddr>),
 }
@@ -50,6 +66,18 @@ pub fn encode_heartbeat() -> Bytes {
     Envelope::new(MessageType::Heartbeat, Bytes::new())
         .encode()
         .expect("empty V1 heartbeat envelope is valid")
+}
+
+pub fn encode_heartbeat_with_fec_feedback(feedback: FecFeedback) -> Bytes {
+    const VERSION: u8 = 1;
+    let mut payload = BytesMut::with_capacity(1 + 3 * size_of::<u64>());
+    payload.put_u8(VERSION);
+    payload.put_u64(feedback.received_recovery_shards);
+    payload.put_u64(feedback.recovered_data_shards);
+    payload.put_u64(feedback.expired_blocks);
+    Envelope::new(MessageType::Heartbeat, payload.freeze())
+        .encode()
+        .expect("bounded V1 heartbeat feedback is valid")
 }
 
 #[cfg(test)]
@@ -94,7 +122,7 @@ pub(crate) fn encode_packet(packet: &[u8], maximum: usize, packet_id: u64) -> Re
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EncodeStats {
-    pub payload_copies: u64,
+    pub payload_copy_bytes: u64,
     pub frames: u64,
 }
 
@@ -109,7 +137,7 @@ pub fn encode_packet_tagged(
 }
 
 /// Encode an owned packet. A unique buffer with enough unused prefix is
-/// sealed in place for the single-datagram case (`payload_copies == 0`).
+/// sealed in place for the single-datagram case (`payload_copy_bytes == 0`).
 /// Jumbo packets freeze the payload once and copy each fragment once.
 pub fn encode_packet_from_buf(
     packet: &mut DataplaneBuf,
@@ -141,33 +169,46 @@ pub fn encode_packet_from_buf(
         return Ok((
             vec![frame],
             EncodeStats {
-                payload_copies: copies,
+                payload_copy_bytes: copies.saturating_mul(packet.len() as u64),
                 frames: 1,
             },
         ));
     }
 
     let payload = packet.as_slice();
-    let mut frames = Vec::with_capacity(payload.len().div_ceil(chunk_size));
+    let frame_count = payload.len().div_ceil(chunk_size);
+    let allocation_len = payload
+        .len()
+        .saturating_add(frame_count.saturating_mul(sealed_header_len));
+    // All jumbo fragments share one allocation. This retains the unavoidable
+    // single payload copy required by noq's contiguous DATAGRAM API while
+    // removing one allocator trip and one ref-count owner per fragment.
+    let mut backing = BytesMut::with_capacity(allocation_len);
+    let mut ranges = Vec::with_capacity(frame_count);
     for (index, chunk) in payload.chunks(chunk_size).enumerate() {
+        let start = backing.len();
         let offset = index * chunk_size;
         let header = fragment_header(packet_id, payload.len(), offset, chunk.len(), delivery_tag);
-        let mut out = BytesMut::with_capacity(sealed_header_len + chunk.len());
         envelope::write_header(
-            &mut out,
+            &mut backing,
             MessageType::IpFragment,
             0,
             ENVELOPE_HEADER_LEN as u16,
         );
-        out.extend_from_slice(&header);
-        out.extend_from_slice(chunk);
-        frames.push(out.freeze());
+        backing.extend_from_slice(&header);
+        backing.extend_from_slice(chunk);
+        ranges.push(start..backing.len());
     }
+    let backing = backing.freeze();
+    let frames = ranges
+        .into_iter()
+        .map(|range| backing.slice(range))
+        .collect::<Vec<_>>();
     let frame_count = frames.len() as u64;
     Ok((
         frames,
         EncodeStats {
-            payload_copies: frame_count,
+            payload_copy_bytes: payload.len() as u64,
             frames: frame_count,
         },
     ))
@@ -282,13 +323,7 @@ pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
             &envelope.payload,
         )?)),
         MessageType::Delivery => Ok(WireDatagram::Delivery(decode_delivery(&envelope.payload)?)),
-        MessageType::Heartbeat => {
-            ensure!(
-                envelope.payload.is_empty(),
-                "heartbeat payload is not empty"
-            );
-            Ok(WireDatagram::Heartbeat)
-        }
+        MessageType::Heartbeat => decode_heartbeat(&envelope.payload),
         MessageType::ConnectionRefresh => {
             ensure!(envelope.payload.is_empty(), "refresh payload is not empty");
             Ok(WireDatagram::ConnectionRefresh)
@@ -296,6 +331,29 @@ pub fn decode_datagram(datagram: Bytes) -> Result<WireDatagram> {
         MessageType::AddressCandidates => decode_address_candidates(&envelope.payload),
         MessageType::FecShard => anyhow::bail!("FEC shard reached the inner V1 decoder"),
     }
+}
+
+fn decode_heartbeat(payload: &[u8]) -> Result<WireDatagram> {
+    if payload.is_empty() {
+        return Ok(WireDatagram::Heartbeat(Heartbeat::default()));
+    }
+    const VERSION: u8 = 1;
+    const FEEDBACK_LEN: usize = 1 + 3 * size_of::<u64>();
+    ensure!(
+        payload.len() == FEEDBACK_LEN,
+        "invalid heartbeat feedback length"
+    );
+    ensure!(
+        payload[0] == VERSION,
+        "unsupported heartbeat feedback version"
+    );
+    Ok(WireDatagram::Heartbeat(Heartbeat {
+        fec_feedback: Some(FecFeedback {
+            received_recovery_shards: u64::from_be_bytes(payload[1..9].try_into().unwrap()),
+            recovered_data_shards: u64::from_be_bytes(payload[9..17].try_into().unwrap()),
+            expired_blocks: u64::from_be_bytes(payload[17..25].try_into().unwrap()),
+        }),
+    }))
 }
 
 fn decode_address_candidates(datagram: &[u8]) -> Result<WireDatagram> {
@@ -449,6 +507,7 @@ pub struct Reassembler {
     max_buffered_bytes: usize,
     next_expiry: Instant,
     evictions: u64,
+    copy_bytes: u64,
     budget: Option<Arc<BufferBudget>>,
 }
 
@@ -462,6 +521,7 @@ impl Default for Reassembler {
             max_buffered_bytes: MAX_BUFFERED_BYTES,
             next_expiry: Instant::now() + EXPIRY_INTERVAL,
             evictions: 0,
+            copy_bytes: 0,
             budget: None,
         }
     }
@@ -600,7 +660,8 @@ impl Reassembler {
             "overlay packet delivery tag changed"
         );
 
-        record_fragment(assembly, offset, &frame[header_len..])?;
+        let copied = record_fragment(assembly, offset, &frame[header_len..])?;
+        self.copy_bytes = self.copy_bytes.saturating_add(copied as u64);
 
         if assembly.received_count == total_len {
             let complete = self.assemblies.remove(&packet_id);
@@ -669,6 +730,10 @@ impl Reassembler {
 
     pub fn take_evictions(&mut self) -> u64 {
         std::mem::take(&mut self.evictions)
+    }
+
+    pub fn take_copy_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.copy_bytes)
     }
 
     fn expire(&mut self, force: bool) {
@@ -758,7 +823,7 @@ fn missing_offsets(assembly: &Assembly) -> Vec<u16> {
     missing
 }
 
-fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Result<()> {
+fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Result<usize> {
     let end = offset + data.len();
     let payload_offset = tun_rs::VIRTIO_NET_HDR_LEN;
     let mut already_received = 0_usize;
@@ -779,7 +844,7 @@ fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Resul
     }
 
     if already_received == data.len() {
-        return Ok(());
+        return Ok(0);
     }
     assembly.buffer[payload_offset + offset..payload_offset + end].copy_from_slice(data);
     assembly.received_count = assembly
@@ -805,7 +870,7 @@ fn record_fragment(assembly: &mut Assembly, offset: usize, data: &[u8]) -> Resul
     assembly
         .received_ranges
         .splice(first..last, std::iter::once(merged_start..merged_end));
-    Ok(())
+    Ok(data.len())
 }
 
 #[cfg(test)]
@@ -825,6 +890,20 @@ mod tests {
             }
         }
         assert_eq!(complete.unwrap(), packet);
+    }
+
+    #[test]
+    fn jumbo_fragments_share_one_backing_allocation_and_copy_payload_once() {
+        let mut packet = DataplaneBuf::from_vec(vec![7; 4_000]);
+        let (frames, stats) = encode_packet_from_buf(&mut packet, 1_200, 42, None).unwrap();
+        assert_eq!(stats.payload_copy_bytes, 4_000);
+        assert_eq!(stats.frames, frames.len() as u64);
+        for adjacent in frames.windows(2) {
+            assert_eq!(
+                adjacent[0].as_ptr().wrapping_add(adjacent[0].len()),
+                adjacent[1].as_ptr(),
+            );
+        }
     }
 
     #[test]
@@ -922,11 +1001,26 @@ mod tests {
     fn heartbeat_round_trips_and_rejects_trailing_data() {
         assert!(matches!(
             decode_datagram(encode_heartbeat()).unwrap(),
-            WireDatagram::Heartbeat
+            WireDatagram::Heartbeat(Heartbeat { fec_feedback: None })
         ));
         let mut invalid = encode_heartbeat().to_vec();
         invalid.push(0);
         assert!(decode_datagram(Bytes::from(invalid)).is_err());
+    }
+
+    #[test]
+    fn heartbeat_carries_cumulative_fec_feedback() {
+        let feedback = FecFeedback {
+            received_recovery_shards: 10_000,
+            recovered_data_shards: 321,
+            expired_blocks: 7,
+        };
+        let WireDatagram::Heartbeat(heartbeat) =
+            decode_datagram(encode_heartbeat_with_fec_feedback(feedback)).unwrap()
+        else {
+            panic!("expected heartbeat");
+        };
+        assert_eq!(heartbeat.fec_feedback, Some(feedback));
     }
 
     #[test]

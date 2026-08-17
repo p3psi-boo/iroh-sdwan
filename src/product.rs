@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{
         AttachmentMode, Config, FecConfig, NodeInfo, ObservabilityConfig, PacketPolicyConfig,
-        PeerConfig, RelayConfig, RoutingConfig, config_digest_path,
+        PeerConfig, RelayConfig, RoutingConfig, UdpSegmentationOffload, config_digest_path,
     },
     deployment,
     derp::DerpPublicKey,
@@ -969,8 +969,9 @@ fn base_config(
         attachment: AttachmentMode::Tun,
         tun_mtu: u16::MAX,
         max_frame_size: 1400,
-        udp_segmentation_offload: false,
+        udp_segmentation_offload: UdpSegmentationOffload::Auto,
         quic_auto_tune: true,
+        quic_cipher_preference: crate::config::QuicCipherPreference::default(),
         quic_send_buffer_bytes: crate::config::default_quic_send_buffer_bytes(),
         quic_receive_buffer_bytes: crate::config::default_quic_receive_buffer_bytes(),
         quic_data_lanes: crate::config::default_quic_data_lanes(),

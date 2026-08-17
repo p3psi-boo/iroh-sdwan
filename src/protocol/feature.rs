@@ -36,7 +36,16 @@ pub fn core_offers(transit: bool, fec: bool, mesh: bool, private_link: bool) -> 
         offers.push(offer(TRANSIT, false));
     }
     if fec {
-        offers.push(offer(FEC, false));
+        // Version 2 adds cumulative receiver-side FEC utility feedback to the
+        // authenticated overlay heartbeat.  Keeping version 1 in the range
+        // makes rolling upgrades safe: an older peer negotiates v1 and both
+        // sides continue to send the original empty heartbeat.
+        offers.push(FeatureOffer {
+            id: FEC,
+            min_version: 1,
+            max_version: 2,
+            required: false,
+        });
     }
     if mesh {
         offers.push(offer(MESH, false));

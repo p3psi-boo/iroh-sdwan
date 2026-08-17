@@ -536,7 +536,7 @@ mod tests {
         let mut packet = pool.take(LARGE_SLOT_COUNT, 128);
         let payload_pointer = packet.as_slice().as_ptr();
         let (frames, stats) = encode_packet_from_buf(&mut packet, 1_200, 1, None).unwrap();
-        assert_eq!(stats.payload_copies, 0);
+        assert_eq!(stats.payload_copy_bytes, 0);
         assert_eq!(frames[0][12 + 16..].as_ptr(), payload_pointer);
 
         drop(frames);

@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
     hash::{DefaultHasher, Hash, Hasher},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -29,6 +29,7 @@ use noq_proto::{
     MtuDiscoveryConfig,
     congestion::{Bbr3Config, CubicConfig},
 };
+use noq_udp::{Transmit as UdpTransmit, UdpSockRef, UdpSocketState};
 use rustc_hash::FxHashMap;
 use rustls::{CipherSuite, crypto::CryptoProvider};
 use tokio::{
@@ -54,7 +55,10 @@ use crate::{
         CapacityProbeStart, ProbeReceiver, ProbeRequest, ProbeStatusSnapshot, append_probe_hop,
         encode_probe, forward_next_hop, reverse_next_hop,
     },
-    config::{AttachmentMode, Config, DialRole, PeerConfig, QuicCongestionController, RelayConfig},
+    config::{
+        AttachmentMode, Config, DialRole, PeerConfig, QuicCipherPreference,
+        QuicCongestionController, RelayConfig, UdpSegmentationOffload,
+    },
     delivery::{
         DELIVERY_ROUTE_TEMPLATE_TTL, DELIVERY_SESSION_TTL, DELIVERY_TAG_WIRE_BYTES,
         DeliveryMessage, DeliveryReceiver, DeliveryReport, DeliverySessionRegister, DeliverySource,
@@ -90,13 +94,13 @@ use crate::{
         OutboundQueue, RepairCache, adaptive_queue_max_age, store_duration_micros,
     },
     tunnel::{
-        OverlayTunnel, OverlayTunnelQueueWriter, attach_virtio, data_plane_parallelism,
+        OverlayTunnel, OverlayTunnelQueueWriter, attach_virtio_counted, data_plane_parallelism,
         tun_read_pool,
     },
     wire::{
-        MAX_PACKET_FRAME_HEADER_LEN, Reassembler, WireDatagram, decode_datagram,
-        encode_address_candidates, encode_batch, encode_heartbeat, encode_packet_from_buf,
-        encode_repair_request,
+        FecFeedback, MAX_PACKET_FRAME_HEADER_LEN, Reassembler, WireDatagram, decode_datagram,
+        encode_address_candidates, encode_batch, encode_heartbeat,
+        encode_heartbeat_with_fec_feedback, encode_packet_from_buf, encode_repair_request,
     },
 };
 
@@ -210,6 +214,42 @@ enum TransmissionOutcome {
     Preempted(OutboundItem),
     Reframe,
     Failed,
+}
+
+/// Flush hot-path crypto workload accounting once per transmission job rather
+/// than issuing two locked atomic instructions for every QUIC datagram.
+struct CryptoTxCounterBatch<'a> {
+    counters: &'a PeerCounters,
+    datagrams: u64,
+    bytes: u64,
+}
+
+impl<'a> CryptoTxCounterBatch<'a> {
+    fn new(counters: &'a PeerCounters) -> Self {
+        Self {
+            counters,
+            datagrams: 0,
+            bytes: 0,
+        }
+    }
+
+    fn record(&mut self, bytes: u64) {
+        self.datagrams = self.datagrams.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+impl Drop for CryptoTxCounterBatch<'_> {
+    fn drop(&mut self) {
+        if self.datagrams != 0 {
+            self.counters
+                .quic_crypto_tx_datagrams
+                .fetch_add(self.datagrams, Ordering::Relaxed);
+            self.counters
+                .quic_crypto_tx_bytes
+                .fetch_add(self.bytes, Ordering::Relaxed);
+        }
+    }
 }
 
 fn data_committed_before_recovery_failure(
@@ -1334,7 +1374,19 @@ async fn inbound_to_router_shard(
             local_delivery.clear();
             for inbound in local.drain(..) {
                 local_delivery.push((inbound.delivery_tag, inbound.packet.len()));
-                tun_buffers.push(attach_virtio(inbound.packet));
+                let peer_id = inbound.peer_id;
+                let (buffer, copied) = attach_virtio_counted(inbound.packet);
+                if copied != 0
+                    && let Some(adjacency_index) = active_snapshot.adjacency_by_owner.get(&peer_id)
+                    && let Some(adjacency) = active_snapshot.adjacencies.get(*adjacency_index)
+                {
+                    adjacency
+                        .peer
+                        .counters
+                        .tun_fallback_copy_bytes
+                        .fetch_add(copied, Ordering::Relaxed);
+                }
+                tun_buffers.push(buffer);
             }
             writer
                 .send_owned(&mut tun_buffers)
@@ -2916,12 +2968,34 @@ struct FecNetworkSample {
     rate_bps: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FecUtilitySample {
+    sent_recovery_shards: u64,
+    received_recovery_shards: u64,
+    recovered_data_shards: u64,
+    expired_blocks: u64,
+}
+
+fn cumulative_counter_delta(current: u64, previous: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        // The remote daemon restarted and its cumulative counters began a new
+        // epoch. Treat the new value as the complete interval instead of
+        // suppressing feedback until it catches the old process lifetime.
+        current
+    }
+}
+
 #[derive(Debug, Default)]
 struct AdaptiveFecController {
     impaired_intervals: u8,
     healthy_intervals: u8,
     profile_candidate: Option<AdaptiveFecProfile>,
     profile_intervals: u8,
+    low_utility_intervals: u8,
+    pressured_intervals: u8,
+    recovery_discount: u8,
 }
 
 #[derive(Debug, Default)]
@@ -3029,6 +3103,7 @@ impl AdaptiveFecController {
         &mut self,
         current: AdaptiveFecProfile,
         sample: FecNetworkSample,
+        utility: Option<FecUtilitySample>,
         immediate: bool,
     ) -> AdaptiveFecProfile {
         if sample.packets < 64 {
@@ -3036,7 +3111,8 @@ impl AdaptiveFecController {
             self.profile_intervals = 0;
             return current;
         }
-        let desired = adaptive_fec_profile(sample);
+        let base = adaptive_fec_profile(sample);
+        let desired = self.apply_utility_feedback(base, sample.loss_ppm, utility);
         if desired == current {
             self.profile_candidate = None;
             self.profile_intervals = 0;
@@ -3059,6 +3135,72 @@ impl AdaptiveFecController {
             desired
         } else {
             current
+        }
+    }
+
+    fn apply_utility_feedback(
+        &mut self,
+        base: AdaptiveFecProfile,
+        loss_ppm: u32,
+        sample: Option<FecUtilitySample>,
+    ) -> AdaptiveFecProfile {
+        const MIN_FEEDBACK_SHARDS: u64 = 64;
+        const LOW_UTILITY_PPM: u64 = 100_000;
+        const LOW_EFFECTIVE_UTILITY_PPM: u64 = 10_000;
+        const HIGH_UTILITY_PPM: u64 = 600_000;
+        const MAX_DISCOUNT: u8 = 2;
+
+        if let Some(sample) = sample
+            && sample.sent_recovery_shards >= MIN_FEEDBACK_SHARDS
+        {
+            let utility_ppm = sample.recovered_data_shards.saturating_mul(1_000_000)
+                / sample.received_recovery_shards.max(1);
+            let effective_utility_ppm = sample.recovered_data_shards.saturating_mul(1_000_000)
+                / sample.sent_recovery_shards.max(1);
+            // Expiry normally asks for more margin. It must not, however,
+            // force ever more tail parity into a congested path when fewer
+            // than 1% of transmitted recovery shards actually recover data.
+            // In that regime parity itself is consuming the scarce window;
+            // remove only the two safety shards and retain the mean-loss floor.
+            let demonstrably_wasted_under_pressure =
+                sample.expired_blocks != 0 && effective_utility_ppm <= LOW_EFFECTIVE_UTILITY_PPM;
+            if (sample.expired_blocks == 0 && utility_ppm <= LOW_UTILITY_PPM)
+                || demonstrably_wasted_under_pressure
+            {
+                self.low_utility_intervals = self.low_utility_intervals.saturating_add(1);
+                self.pressured_intervals = 0;
+                if self.low_utility_intervals >= 3 {
+                    self.recovery_discount =
+                        self.recovery_discount.saturating_add(1).min(MAX_DISCOUNT);
+                    self.low_utility_intervals = 0;
+                }
+            } else if sample.expired_blocks > 0 || utility_ppm >= HIGH_UTILITY_PPM {
+                self.pressured_intervals = self.pressured_intervals.saturating_add(1);
+                self.low_utility_intervals = 0;
+                if self.pressured_intervals >= 2 {
+                    self.recovery_discount = self.recovery_discount.saturating_sub(1);
+                    self.pressured_intervals = 0;
+                }
+            } else {
+                self.low_utility_intervals = 0;
+                self.pressured_intervals = 0;
+            }
+        }
+
+        // Never tune below the number of shards required to cover the EWMA
+        // mean loss. Feedback may remove only the burst/safety margin, at most
+        // two shards, and expiry immediately restores that margin.
+        let mean_loss_floor = u64::from(base.data_shards)
+            .saturating_mul(u64::from(loss_ppm))
+            .saturating_add(999_999)
+            / 1_000_000;
+        let minimum = mean_loss_floor.clamp(1, u64::from(base.data_shards)) as u8;
+        AdaptiveFecProfile {
+            recovery_shards: base
+                .recovery_shards
+                .saturating_sub(self.recovery_discount)
+                .max(minimum),
+            ..base
         }
     }
 }
@@ -3391,6 +3533,75 @@ impl noq_proto::congestion::Controller for AdaptiveTunnelController {
     }
 }
 
+fn probe_udp_gso_destination(destination: SocketAddr) -> std::io::Result<bool> {
+    const SEGMENT_BYTES: usize = 1_200;
+    const SEGMENTS: usize = 2;
+
+    let bind_address = if destination.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = UdpSocket::bind(bind_address)?;
+    let state = UdpSocketState::new(UdpSockRef::from(&socket))?;
+    if state.max_gso_segments().get() < SEGMENTS {
+        return Ok(false);
+    }
+
+    // Port 9 keeps the probe outside the peer's QUIC listener while exercising
+    // the exact egress route and NIC selected for that direct peer address.
+    let mut probe_destination = destination;
+    probe_destination.set_port(9);
+    let payload = [0_u8; SEGMENT_BYTES * SEGMENTS];
+    state.try_send(
+        UdpSockRef::from(&socket),
+        &UdpTransmit {
+            destination: probe_destination,
+            ecn: None,
+            contents: &payload,
+            segment_size: Some(SEGMENT_BYTES),
+            src_ip: None,
+        },
+    )?;
+    Ok(state.max_gso_segments().get() >= SEGMENTS)
+}
+
+fn udp_segmentation_offload_enabled(config: &Config) -> bool {
+    match config.udp_segmentation_offload {
+        UdpSegmentationOffload::Enabled => return true,
+        UdpSegmentationOffload::Disabled => return false,
+        UdpSegmentationOffload::Auto => {}
+    }
+
+    let destinations = config
+        .peers
+        .iter()
+        .flat_map(|peer| peer.direct_addresses.iter().copied())
+        .collect::<HashSet<_>>();
+    if destinations.is_empty() {
+        info!("UDP GSO auto-probe found no direct egress path; keeping GSO disabled");
+        return false;
+    }
+
+    for destination in destinations {
+        match probe_udp_gso_destination(destination) {
+            Ok(true) => {
+                debug!(%destination, "UDP GSO egress probe succeeded");
+            }
+            Ok(false) => {
+                info!(%destination, "UDP GSO egress probe reported no segmentation support");
+                return false;
+            }
+            Err(error) => {
+                info!(%destination, %error, "UDP GSO egress probe failed; keeping GSO disabled");
+                return false;
+            }
+        }
+    }
+    info!("UDP GSO egress probes passed; enabling segmentation offload");
+    true
+}
+
 async fn build_endpoint(
     config: &Config,
     secret_key: SecretKey,
@@ -3398,6 +3609,7 @@ async fn build_endpoint(
     probe_alpn: &[u8],
     derp_transport: Option<Arc<DerpTransport>>,
 ) -> Result<Endpoint> {
+    let udp_segmentation_offload = udp_segmentation_offload_enabled(config);
     let configured_relays = config.inherited_peer_relays()?;
     let relay_mode = iroh_relay_mode(config, configured_relays);
     // Auto mode uses the tunnel-aware controller so inner TCP does not fight a
@@ -3462,11 +3674,10 @@ async fn build_endpoint(
         .default_path_keep_alive_interval(keep_alive)
         .default_path_max_idle_timeout(path_idle_timeout)
         // Several cloud/NAT virtual NICs accept UDP_SEGMENT at socket setup
-        // but return EIO on the first real GSO batch. noq then disables GSO,
-        // yet the loss burst can close the only direct path. Userspace batching
-        // plus the large virtual TUN MTU keep
-        // syscall cost low without that WAN-visible one-time outage.
-        .enable_segmentation_offload(config.udp_segmentation_offload)
+        // but return EIO on the first real GSO batch. Auto mode therefore runs
+        // a two-segment sendmsg over every configured direct egress before noq
+        // is allowed to batch production traffic.
+        .enable_segmentation_offload(udp_segmentation_offload)
         .datagram_send_buffer_size(config.quic_send_buffer_bytes)
         .datagram_receive_buffer_size(Some(config.quic_receive_buffer_bytes))
         // Peer-observed socket addresses are endpoint-wide and can therefore
@@ -3500,7 +3711,7 @@ async fn build_endpoint(
         vec![alpn.to_vec()]
     };
     let mut builder = Endpoint::builder(presets::N0)
-        .crypto_provider(dataplane_crypto_provider())
+        .crypto_provider(dataplane_crypto_provider(config.quic_cipher_preference))
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(relay_mode)
@@ -3523,27 +3734,106 @@ async fn build_endpoint(
     builder.bind().await.context("failed to bind iroh endpoint")
 }
 
-/// Prefer ChaCha20 for QUIC payload protection while retaining AES-GCM for
-/// QUIC initial packets and interoperability.
-///
-/// A peer may expose AES-NI without PCLMULQDQ (notably older/default QEMU CPU
-/// models). ring then combines AES assembly with its scalar GHASH fallback;
-/// production profiles showed that pair consuming roughly 30% of all sender
-/// CPU and capping one direct overlay near 370 Mbit/s. rustls servers honor the
-/// client's suite order by default, so every endpoint must advertise ChaCha20
-/// first rather than trying to make a local CPU-only choice. On modern x86 and
-/// ARM, ring's vectorized ChaCha20 remains comfortably above the WAN rates this
-/// dataplane targets.
-fn dataplane_crypto_provider() -> Arc<CryptoProvider> {
+/// Benchmark the same ring AEAD implementations used by rustls and prefer AES
+/// only when it wins materially. This preserves ChaCha on older/QEMU x86 CPUs
+/// that expose AES-NI without fast GHASH while taking advantage of
+/// AES-NI+PCLMUL on capable hosts. Both suites remain advertised for rolling
+/// upgrades and interoperability; QUIC Initial protection remains unchanged.
+#[derive(Debug, Clone, Copy)]
+struct CryptoBenchmark {
+    chacha_nanos: u128,
+    aes256gcm_nanos: u128,
+}
+
+fn crypto_benchmark() -> CryptoBenchmark {
+    static BENCHMARK: std::sync::OnceLock<CryptoBenchmark> = std::sync::OnceLock::new();
+    *BENCHMARK.get_or_init(|| {
+        let result = CryptoBenchmark {
+            chacha_nanos: benchmark_aead(&ring::aead::CHACHA20_POLY1305, 1),
+            aes256gcm_nanos: benchmark_aead(&ring::aead::AES_256_GCM, 2),
+        };
+        info!(
+            chacha_nanos = result.chacha_nanos,
+            aes256gcm_nanos = result.aes256gcm_nanos,
+            "benchmarked QUIC payload ciphers"
+        );
+        result
+    })
+}
+
+fn benchmark_aead(algorithm: &'static ring::aead::Algorithm, nonce_domain: u32) -> u128 {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
+    const PAYLOAD_BYTES: usize = 1_400;
+    const ITERATIONS: u32 = 4_096;
+
+    let key_bytes = vec![nonce_domain as u8; algorithm.key_len()];
+    let sealing_key = LessSafeKey::new(
+        UnboundKey::new(algorithm, &key_bytes).expect("fixed-size benchmark AEAD key is valid"),
+    );
+    let opening_key = LessSafeKey::new(
+        UnboundKey::new(algorithm, &key_bytes).expect("fixed-size benchmark AEAD key is valid"),
+    );
+    let mut buffer = Vec::with_capacity(PAYLOAD_BYTES + algorithm.tag_len());
+    buffer.resize(PAYLOAD_BYTES, 0x5a);
+    let started = Instant::now();
+    for sequence in 0..ITERATIONS {
+        let mut nonce = [0_u8; 12];
+        nonce[..4].copy_from_slice(&nonce_domain.to_be_bytes());
+        nonce[4..].copy_from_slice(&u64::from(sequence).to_be_bytes());
+        sealing_key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::empty(),
+                &mut buffer,
+            )
+            .expect("benchmark AEAD seal succeeds");
+        std::hint::black_box(
+            opening_key
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::empty(),
+                    &mut buffer,
+                )
+                .expect("benchmark AEAD open succeeds"),
+        );
+        buffer.truncate(PAYLOAD_BYTES);
+    }
+    started.elapsed().as_nanos()
+}
+
+fn dataplane_crypto_provider(preference: QuicCipherPreference) -> Arc<CryptoProvider> {
+    let preferred = match preference {
+        QuicCipherPreference::ChaCha20 => CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        QuicCipherPreference::Aes256Gcm => CipherSuite::TLS13_AES_256_GCM_SHA384,
+        QuicCipherPreference::Auto => {
+            let benchmark = crypto_benchmark();
+            // Keep ChaCha for a marginal result. A 10% threshold avoids
+            // changing the whole connection for startup noise while allowing
+            // AES-NI+PCLMUL hosts to select their materially faster path.
+            if benchmark.aes256gcm_nanos.saturating_mul(10)
+                < benchmark.chacha_nanos.saturating_mul(9)
+            {
+                CipherSuite::TLS13_AES_256_GCM_SHA384
+            } else {
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            }
+        }
+    };
     let mut provider = rustls::crypto::ring::default_provider();
     provider
         .cipher_suites
         .sort_by_key(|suite| match suite.suite() {
-            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 0,
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => 1,
-            CipherSuite::TLS13_AES_256_GCM_SHA384 => 2,
-            _ => 3,
+            suite if suite == preferred => 0,
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 1,
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => 2,
+            CipherSuite::TLS13_AES_256_GCM_SHA384 => 3,
+            _ => 4,
         });
+    info!(
+        ?preference,
+        ?preferred,
+        "selected QUIC payload cipher preference"
+    );
     Arc::new(provider)
 }
 
@@ -4235,6 +4525,7 @@ struct Peer {
     fec_available: bool,
     fec_forced: bool,
     fec_negotiated: AtomicBool,
+    fec_feedback_negotiated: AtomicBool,
     fec_active: AtomicBool,
     derp_transport: Option<Arc<DerpTransport>>,
     mesh_runtime: Option<Arc<MeshRuntime>>,
@@ -4592,6 +4883,7 @@ impl Peer {
             fec_available,
             fec_forced: config.fec.enabled,
             fec_negotiated: AtomicBool::new(false),
+            fec_feedback_negotiated: AtomicBool::new(false),
             fec_active: AtomicBool::new(false),
             derp_transport: services.derp_transport.cloned(),
             mesh_runtime: services.mesh_runtime,
@@ -4830,7 +5122,7 @@ impl Peer {
 
         let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let mut first = first;
-        let (frames, _stats) = match encode_packet_from_buf(
+        let (frames, stats) = match encode_packet_from_buf(
             &mut first.data,
             inner_maximum,
             packet_id,
@@ -4842,6 +5134,11 @@ impl Peer {
                 return Ok(None);
             }
         };
+        if stats.payload_copy_bytes != 0 {
+            self.counters
+                .tx_fragment_copy_bytes
+                .fetch_add(stats.payload_copy_bytes, Ordering::Relaxed);
+        }
         if frames.len() > 1 {
             debug!(peer = %self.name, len = first.data.len(), fragments = frames.len(), maximum, "fragmenting overlay packet");
             self.repair_cache
@@ -4878,12 +5175,17 @@ impl Peer {
             );
             for mut packet in additional {
                 let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
-                let (frame, _) = encode_packet_from_buf(
+                let (frame, stats) = encode_packet_from_buf(
                     &mut packet.data,
                     inner_maximum,
                     packet_id,
                     packet.delivery_tag,
                 )?;
+                if stats.payload_copy_bytes != 0 {
+                    self.counters
+                        .tx_fragment_copy_bytes
+                        .fetch_add(stats.payload_copy_bytes, Ordering::Relaxed);
+                }
                 debug_assert_eq!(frame.len(), 1);
                 packet_count += 1;
                 packet_bytes = packet_bytes.saturating_add(packet.data.len() as u64);
@@ -4901,6 +5203,7 @@ impl Peer {
         let mut encoded_datagrams = VecDeque::new();
         if fec_active {
             let encoder = fec_encoder.as_mut().expect("active FEC has an encoder");
+            let mut copy_bytes = 0_u64;
             for datagram in datagrams {
                 let batch = encoder.push(datagram, maximum)?;
                 self.counters
@@ -4909,7 +5212,13 @@ impl Peer {
                 self.counters
                     .fec_overhead_bytes
                     .fetch_add(batch.overhead_bytes, Ordering::Relaxed);
+                copy_bytes = copy_bytes.saturating_add(batch.copy_bytes);
                 encoded_datagrams.extend(batch.datagrams);
+            }
+            if copy_bytes != 0 {
+                self.counters
+                    .fec_encode_copy_bytes
+                    .fetch_add(copy_bytes, Ordering::Relaxed);
             }
         } else {
             encoded_datagrams.extend(datagrams.into_iter().map(|bytes| EncodedDatagram {
@@ -4938,9 +5247,11 @@ impl Peer {
         queue_max_age: Duration,
         outbound: &mut OutboundConsumer,
     ) -> TransmissionOutcome {
+        let mut crypto_counters = CryptoTxCounterBatch::new(&self.counters);
         while let Some(datagram) = job.datagrams.pop_front() {
             let recovery = datagram.recovery;
             let frame = datagram.bytes;
+            let frame_len = frame.len() as u64;
             if connection
                 .max_datagram_size()
                 .is_some_and(|maximum| frame.len() > maximum)
@@ -4999,6 +5310,7 @@ impl Peer {
                 }
                 return TransmissionOutcome::Failed;
             }
+            crypto_counters.record(frame_len);
             if recovery {
                 self.counters
                     .fec_tx_recovery_shards
@@ -5406,6 +5718,13 @@ impl Peer {
             .iter()
             .any(|selected| selected.id == feature::FEC);
         self.fec_negotiated.store(fec_negotiated, Ordering::Relaxed);
+        self.fec_feedback_negotiated.store(
+            negotiated
+                .features
+                .iter()
+                .any(|selected| selected.id == feature::FEC && selected.version >= 2),
+            Ordering::Relaxed,
+        );
         let negotiated_lanes = negotiated
             .transport
             .map_or(1, |profile| profile.outbound.data_lanes)
@@ -5576,6 +5895,19 @@ impl Peer {
                                 None => break,
                             }
                         }
+                        let crypto_datagrams = receive_burst.len() as u64;
+                        let crypto_bytes = receive_burst
+                            .iter()
+                            .map(|datagram| datagram.len() as u64)
+                            .sum::<u64>();
+                        peer.counters
+                            .quic_crypto_rx_datagrams
+                            .fetch_add(crypto_datagrams, Ordering::Relaxed);
+                        peer.counters
+                            .quic_crypto_rx_bytes
+                            .fetch_add(crypto_bytes, Ordering::Relaxed);
+                        let mut fec_copy_bytes = 0_u64;
+                        let mut reassembly_copy_bytes = 0_u64;
                         for datagram in receive_burst.drain(..) {
                         let decoded = match fec_decoder.push(datagram) {
                             Ok(decoded) => decoded,
@@ -5589,6 +5921,7 @@ impl Peer {
                         peer.counters.fec_rx_recovery_shards.fetch_add(decoded.recovery_shards, Ordering::Relaxed);
                         peer.counters.fec_recovered_shards.fetch_add(decoded.recovered_shards, Ordering::Relaxed);
                         peer.counters.fec_expired_blocks.fetch_add(decoded.expired_blocks, Ordering::Relaxed);
+                        fec_copy_bytes = fec_copy_bytes.saturating_add(decoded.copy_bytes);
                         for overlay_datagram in decoded.frames {
                             let wire = match decode_datagram(overlay_datagram) {
                                 Ok(wire) => wire,
@@ -5615,6 +5948,9 @@ impl Peer {
                                 for frame in frames {
                                     let result = reassembler.push_tagged(frame);
                                     let evictions = reassembler.take_evictions();
+                                    let copy_bytes = reassembler.take_copy_bytes();
+                                    reassembly_copy_bytes =
+                                        reassembly_copy_bytes.saturating_add(copy_bytes);
                                     peer.counters
                                         .reassembly_evictions
                                         .fetch_add(evictions, Ordering::Relaxed);
@@ -5657,10 +5993,26 @@ impl Peer {
                                     }
                                 }
                             }
-                            WireDatagram::Heartbeat => {
+                            WireDatagram::Heartbeat(heartbeat) => {
                                 peer.counters
                                     .heartbeats_received
                                     .fetch_add(1, Ordering::Relaxed);
+                                if let Some(feedback) = heartbeat.fec_feedback
+                                    && peer.fec_feedback_negotiated.load(Ordering::Relaxed)
+                                {
+                                    peer.counters
+                                        .fec_feedback_rx_recovery_shards
+                                        .store(feedback.received_recovery_shards, Ordering::Relaxed);
+                                    peer.counters
+                                        .fec_feedback_recovered_shards
+                                        .store(feedback.recovered_data_shards, Ordering::Relaxed);
+                                    peer.counters
+                                        .fec_feedback_expired_blocks
+                                        .store(feedback.expired_blocks, Ordering::Relaxed);
+                                    peer.counters
+                                        .fec_feedback_reports
+                                        .fetch_add(1, Ordering::Release);
+                                }
                             }
                             WireDatagram::ConnectionRefresh => {
                                 if peer.can_dial() {
@@ -5689,6 +6041,16 @@ impl Peer {
                             }
                             }
                         }
+                        }
+                        if fec_copy_bytes != 0 {
+                            peer.counters
+                                .fec_decode_copy_bytes
+                                .fetch_add(fec_copy_bytes, Ordering::Relaxed);
+                        }
+                        if reassembly_copy_bytes != 0 {
+                            peer.counters
+                                .reassembly_copy_bytes
+                                .fetch_add(reassembly_copy_bytes, Ordering::Relaxed);
                         }
                         if let Err(error) = peer
                             .inbound_packets
@@ -5866,9 +6228,24 @@ impl Peer {
                     peer.reconnect_needed.notify_one();
                     break;
                 }
+                let heartbeat_datagram = if peer.fec_feedback_negotiated.load(Ordering::Relaxed) {
+                    encode_heartbeat_with_fec_feedback(FecFeedback {
+                        received_recovery_shards: peer
+                            .counters
+                            .fec_rx_recovery_shards
+                            .load(Ordering::Relaxed),
+                        recovered_data_shards: peer
+                            .counters
+                            .fec_recovered_shards
+                            .load(Ordering::Relaxed),
+                        expired_blocks: peer.counters.fec_expired_blocks.load(Ordering::Relaxed),
+                    })
+                } else {
+                    encode_heartbeat()
+                };
                 match tokio::time::timeout(
                     Duration::from_secs(1),
-                    heartbeat_connection.send_datagram_wait(encode_heartbeat()),
+                    heartbeat_connection.send_datagram_wait(heartbeat_datagram),
                 )
                 .await
                 {
@@ -5900,6 +6277,22 @@ impl Peer {
             let mut lane_controller = AdaptiveLaneController::default();
             let mut previous_tx_datagrams = 0_u64;
             let mut previous_tx_bytes = peer.counters.tx_bytes.load(Ordering::Relaxed);
+            let mut previous_feedback_reports =
+                peer.counters.fec_feedback_reports.load(Ordering::Acquire);
+            let mut previous_feedback_recovery = peer
+                .counters
+                .fec_feedback_rx_recovery_shards
+                .load(Ordering::Relaxed);
+            let mut previous_feedback_recovered = peer
+                .counters
+                .fec_feedback_recovered_shards
+                .load(Ordering::Relaxed);
+            let mut previous_feedback_expired = peer
+                .counters
+                .fec_feedback_expired_blocks
+                .load(Ordering::Relaxed);
+            let mut previous_feedback_sent =
+                peer.counters.fec_tx_recovery_shards.load(Ordering::Relaxed);
             loop {
                 tokio::select! {
                     _ = telemetry_cancel.cancelled() => break,
@@ -6026,6 +6419,74 @@ impl Peer {
                             .saturating_sub(previous_tx_bytes)
                             .saturating_mul(8);
                         previous_tx_bytes = tx_bytes;
+                        let feedback_reports = peer
+                            .counters
+                            .fec_feedback_reports
+                            .load(Ordering::Acquire);
+                        let utility_sample = if feedback_reports != previous_feedback_reports {
+                            previous_feedback_reports = feedback_reports;
+                            let recovery = peer
+                                .counters
+                                .fec_feedback_rx_recovery_shards
+                                .load(Ordering::Relaxed);
+                            let recovered = peer
+                                .counters
+                                .fec_feedback_recovered_shards
+                                .load(Ordering::Relaxed);
+                            let expired = peer
+                                .counters
+                                .fec_feedback_expired_blocks
+                                .load(Ordering::Relaxed);
+                            let sent = peer
+                                .counters
+                                .fec_tx_recovery_shards
+                                .load(Ordering::Relaxed);
+                            let sample = FecUtilitySample {
+                                sent_recovery_shards: cumulative_counter_delta(
+                                    sent,
+                                    previous_feedback_sent,
+                                ),
+                                received_recovery_shards: cumulative_counter_delta(
+                                    recovery,
+                                    previous_feedback_recovery,
+                                ),
+                                recovered_data_shards: cumulative_counter_delta(
+                                    recovered,
+                                    previous_feedback_recovered,
+                                ),
+                                expired_blocks: cumulative_counter_delta(
+                                    expired,
+                                    previous_feedback_expired,
+                                ),
+                            };
+                            previous_feedback_recovery = recovery;
+                            previous_feedback_recovered = recovered;
+                            previous_feedback_expired = expired;
+                            previous_feedback_sent = sent;
+                            if sample.received_recovery_shards != 0 {
+                                peer.counters.fec_feedback_utility_ppm.store(
+                                    sample
+                                        .recovered_data_shards
+                                        .saturating_mul(1_000_000)
+                                        / sample.received_recovery_shards,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            if sample.sent_recovery_shards != 0 {
+                                peer.counters
+                                    .fec_feedback_effective_utility_ppm
+                                    .store(
+                                        sample
+                                            .recovered_data_shards
+                                            .saturating_mul(1_000_000)
+                                            / sample.sent_recovery_shards,
+                                        Ordering::Relaxed,
+                                    );
+                            }
+                            Some(sample)
+                        } else {
+                            None
+                        };
                         if peer.fec_available
                             && !peer.fec_forced
                             && peer.fec_negotiated.load(Ordering::Relaxed)
@@ -6074,6 +6535,7 @@ impl Peer {
                                         packets: tx_delta,
                                         rate_bps,
                                     },
+                                    utility_sample,
                                     !previous,
                                 );
                                 if profile != active_profile {
@@ -6290,6 +6752,19 @@ impl Peer {
                         None => break,
                     }
                 }
+                let crypto_datagrams = receive_burst.len() as u64;
+                let crypto_bytes = receive_burst
+                    .iter()
+                    .map(|datagram| datagram.len() as u64)
+                    .sum::<u64>();
+                peer.counters
+                    .quic_crypto_rx_datagrams
+                    .fetch_add(crypto_datagrams, Ordering::Relaxed);
+                peer.counters
+                    .quic_crypto_rx_bytes
+                    .fetch_add(crypto_bytes, Ordering::Relaxed);
+                let mut fec_copy_bytes = 0_u64;
+                let mut reassembly_copy_bytes = 0_u64;
                 for datagram in receive_burst.drain(..) {
                     let decoded = match decoder.push(datagram) {
                         Ok(decoded) => decoded,
@@ -6306,6 +6781,10 @@ impl Peer {
                     peer.counters
                         .fec_recovered_shards
                         .fetch_add(decoded.recovered_shards, Ordering::Relaxed);
+                    peer.counters
+                        .fec_expired_blocks
+                        .fetch_add(decoded.expired_blocks, Ordering::Relaxed);
+                    fec_copy_bytes = fec_copy_bytes.saturating_add(decoded.copy_bytes);
                     for overlay_datagram in decoded.frames {
                         let wire = match decode_datagram(overlay_datagram) {
                             Ok(wire) => wire,
@@ -6323,6 +6802,8 @@ impl Peer {
                                     .fetch_add(frames.len() as u64, Ordering::Relaxed);
                                 for frame in frames {
                                     let result = reassembler.push_tagged(frame);
+                                    reassembly_copy_bytes = reassembly_copy_bytes
+                                        .saturating_add(reassembler.take_copy_bytes());
                                     peer.counters
                                         .reassembly_evictions
                                         .fetch_add(reassembler.take_evictions(), Ordering::Relaxed);
@@ -6366,6 +6847,16 @@ impl Peer {
                             }
                         }
                     }
+                }
+                if fec_copy_bytes != 0 {
+                    peer.counters
+                        .fec_decode_copy_bytes
+                        .fetch_add(fec_copy_bytes, Ordering::Relaxed);
+                }
+                if reassembly_copy_bytes != 0 {
+                    peer.counters
+                        .reassembly_copy_bytes
+                        .fetch_add(reassembly_copy_bytes, Ordering::Relaxed);
                 }
                 if let Err(error) = peer
                     .inbound_packets
@@ -6493,6 +6984,8 @@ impl Peer {
 
     fn mark_disconnected(&self) {
         self.counters.connected.store(false, Ordering::Relaxed);
+        self.fec_negotiated.store(false, Ordering::Relaxed);
+        self.fec_feedback_negotiated.store(false, Ordering::Relaxed);
         self.fec_active.store(false, Ordering::Relaxed);
         self.counters.fec_active.store(false, Ordering::Relaxed);
         self.fec_reset_epoch.fetch_add(1, Ordering::Release);
@@ -6974,8 +7467,109 @@ mod tests {
             rate_bps: 0,
         };
         for _ in 0..10 {
-            assert_eq!(controller.select_profile(current, idle, false), current);
+            assert_eq!(
+                controller.select_profile(current, idle, None, false),
+                current
+            );
         }
+    }
+
+    #[test]
+    fn fec_feedback_removes_only_unused_safety_margin() {
+        let mut controller = AdaptiveFecController::default();
+        let base = AdaptiveFecProfile {
+            data_shards: 16,
+            recovery_shards: 5,
+            block_timeout_millis: 15,
+        };
+        let low_utility = FecUtilitySample {
+            sent_recovery_shards: 1_000,
+            received_recovery_shards: 1_000,
+            recovered_data_shards: 40,
+            expired_blocks: 0,
+        };
+        for _ in 0..3 {
+            controller.apply_utility_feedback(base, 152_000, Some(low_utility));
+        }
+        assert_eq!(
+            controller
+                .apply_utility_feedback(base, 152_000, None)
+                .recovery_shards,
+            4
+        );
+        for _ in 0..3 {
+            controller.apply_utility_feedback(base, 152_000, Some(low_utility));
+        }
+        // ceil(16 * 15.2%) = 3 is the hard EWMA mean-loss floor.
+        assert_eq!(
+            controller
+                .apply_utility_feedback(base, 152_000, None)
+                .recovery_shards,
+            3
+        );
+    }
+
+    #[test]
+    fn fec_feedback_restores_margin_after_expiry_pressure() {
+        let mut controller = AdaptiveFecController {
+            recovery_discount: 2,
+            ..AdaptiveFecController::default()
+        };
+        let base = AdaptiveFecProfile {
+            data_shards: 16,
+            recovery_shards: 5,
+            block_timeout_millis: 15,
+        };
+        let pressured = FecUtilitySample {
+            sent_recovery_shards: 1_000,
+            received_recovery_shards: 1_000,
+            recovered_data_shards: 700,
+            expired_blocks: 1,
+        };
+        assert_eq!(
+            controller
+                .apply_utility_feedback(base, 152_000, Some(pressured))
+                .recovery_shards,
+            3
+        );
+        assert_eq!(
+            controller
+                .apply_utility_feedback(base, 152_000, Some(pressured))
+                .recovery_shards,
+            4
+        );
+    }
+
+    #[test]
+    fn fec_feedback_counter_delta_survives_remote_restart() {
+        assert_eq!(cumulative_counter_delta(120, 100), 20);
+        assert_eq!(cumulative_counter_delta(7, 100), 7);
+    }
+
+    #[test]
+    fn fec_feedback_removes_wasted_tail_parity_despite_expiry() {
+        let mut controller = AdaptiveFecController::default();
+        let base = AdaptiveFecProfile {
+            data_shards: 16,
+            recovery_shards: 6,
+            block_timeout_millis: 15,
+        };
+        let wasted = FecUtilitySample {
+            sent_recovery_shards: 10_000,
+            received_recovery_shards: 9_000,
+            recovered_data_shards: 50,
+            expired_blocks: 500,
+        };
+        for _ in 0..6 {
+            controller.apply_utility_feedback(base, 200_000, Some(wasted));
+        }
+        // ceil(16 * 20%) = 4: only the two ineffective safety shards go away.
+        assert_eq!(
+            controller
+                .apply_utility_feedback(base, 200_000, None)
+                .recovery_shards,
+            4
+        );
     }
 
     #[test]
@@ -7844,8 +8438,8 @@ mod tests {
     }
 
     #[test]
-    fn dataplane_prefers_chacha_without_removing_quic_initial_aes() {
-        let suites = dataplane_crypto_provider()
+    fn dataplane_cipher_override_preserves_both_tls13_suites() {
+        let suites = dataplane_crypto_provider(QuicCipherPreference::ChaCha20)
             .cipher_suites
             .iter()
             .map(|suite| suite.suite())
@@ -7855,6 +8449,13 @@ mod tests {
             Some(&CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
         );
         assert!(suites.contains(&CipherSuite::TLS13_AES_128_GCM_SHA256));
+        let aes = dataplane_crypto_provider(QuicCipherPreference::Aes256Gcm)
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect::<Vec<_>>();
+        assert_eq!(aes.first(), Some(&CipherSuite::TLS13_AES_256_GCM_SHA384));
+        assert!(aes.contains(&CipherSuite::TLS13_CHACHA20_POLY1305_SHA256));
     }
 
     #[test]

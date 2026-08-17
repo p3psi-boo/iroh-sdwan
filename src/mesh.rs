@@ -1868,7 +1868,7 @@ mod tests {
 
     use crate::config::{
         AttachmentMode, FecConfig, MeshConfig, ObservabilityConfig, PacketPolicyConfig,
-        RelayConfig, RoutingConfig,
+        RelayConfig, RoutingConfig, UdpSegmentationOffload,
     };
 
     use super::*;
@@ -1883,8 +1883,9 @@ mod tests {
             attachment: AttachmentMode::Tun,
             tun_mtu: 1280,
             max_frame_size: 1400,
-            udp_segmentation_offload: false,
+            udp_segmentation_offload: UdpSegmentationOffload::Disabled,
             quic_auto_tune: true,
+            quic_cipher_preference: crate::config::QuicCipherPreference::default(),
             quic_send_buffer_bytes: crate::config::default_quic_send_buffer_bytes(),
             quic_receive_buffer_bytes: crate::config::default_quic_receive_buffer_bytes(),
             quic_data_lanes: crate::config::default_quic_data_lanes(),

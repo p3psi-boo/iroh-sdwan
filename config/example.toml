@@ -21,7 +21,10 @@ tun_mtu = 65535
 # 自动回退到 1200 字节的安全下限。
 max_frame_size = 1400
 # QUIC 数据面的运行时调优项；修改配置并 reload 即可，无需重新编译。
-udp_segmentation_offload = false
+udp_segmentation_offload = "auto"
+# 默认基准测试本机 ring 的 ChaCha20-Poly1305 与 AES-256-GCM 实现；也可固定为
+# "chacha20" 或 "aes256gcm" 作为运维覆盖。
+quic_cipher_preference = "auto"
 quic_send_buffer_bytes = 131072
 quic_receive_buffer_bytes = 8388608
 # 单 lane 是稳定默认值；多 lane 仅在验证过的并行路径上显式开启。
