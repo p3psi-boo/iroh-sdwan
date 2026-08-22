@@ -5,6 +5,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PROFILE_SCRIPT="$ROOT/scripts/profile-v2-netns.sh"
 STAMP=$(date -u +%Y%m%d-%H%M%S)
 MATRIX_OUT=${IRONET_V2_MATRIX_OUT:-$ROOT/target/v2-netns-matrix-$STAMP}
+MATRIX_OUT=$(realpath -m "$MATRIX_OUT")
 DURATION=${IRONET_V2_MATRIX_SECONDS:-15}
 STREAMS=${IRONET_V2_MATRIX_STREAMS:-4}
 FREQUENCY=${IRONET_V2_MATRIX_FREQUENCY:-99}
@@ -18,12 +19,115 @@ RESUME=${IRONET_V2_MATRIX_RESUME:-0}
 # 1 = perf + FlameGraph per scenario (CPU profiling matrix). 0 = tuner
 # behaviour only; much cheaper and the right mode for dynamic timelines.
 PERF_ENABLED=${IRONET_V2_MATRIX_PERF:-1}
-BIN=${IRONETD_BIN:-$ROOT/target/x86_64-unknown-linux-musl/profiling/ironetd}
-CLI=${IRONET_BIN:-$ROOT/target/x86_64-unknown-linux-musl/profiling/ironet}
+PROFILE_RUST_LOG=${IRONET_V2_PROFILE_RUST_LOG:-info,ironet::autotune=debug}
+PROFILE_NICE=${IRONET_V2_PROFILE_NICE:-10}
+AUTOTUNE_FORCE=${IRONET_AUTOTUNE_FORCE:-}
+AUTOTUNE_MODE=${IRONET_V2_PROFILE_AUTOTUNE_MODE:-shadow}
+AUTOTUNE_OBJECTIVE=${IRONET_V2_PROFILE_AUTOTUNE_OBJECTIVE:-balanced}
+AUTOTUNE_MEMORY=${IRONET_V2_PROFILE_AUTOTUNE_MEMORY:-0}
+AUTOTUNE_POLICY=${IRONET_V2_PROFILE_AUTOTUNE_POLICY:-builtin}
+AUTOTUNE_SHADOW_POLICY=${IRONET_V2_PROFILE_AUTOTUNE_SHADOW_POLICY:-}
+COVER_SECONDS=${IRONET_V2_PROFILE_COVER_SECONDS:-0}
+COVER_RATE_MBIT=${IRONET_V2_PROFILE_COVER_RATE_MBIT:-4}
+SECOND_PATH=${IRONET_V2_PROFILE_SECOND_PATH:-0}
+SECOND_PATH_DELAY_MS=${IRONET_V2_PROFILE_SECOND_PATH_DELAY_MS:-30}
+SECOND_PATH_LOSS_PERCENT=${IRONET_V2_PROFILE_SECOND_PATH_LOSS_PERCENT:-0}
+SECOND_PATH_RATE_MBIT=${IRONET_V2_PROFILE_SECOND_PATH_RATE_MBIT:-0}
+SECOND_PATH_QUEUE_PACKETS=${IRONET_V2_PROFILE_SECOND_PATH_QUEUE_PACKETS:-1000}
+DEFAULT_BIN=$ROOT/target/x86_64-unknown-linux-musl/profiling/ironetd
+DEFAULT_CLI=$ROOT/target/x86_64-unknown-linux-musl/profiling/ironet
+BIN=${IRONETD_BIN:-$DEFAULT_BIN}
+CLI=${IRONET_BIN:-$DEFAULT_CLI}
+CARGO=${CARGO:-cargo}
 
-[[ -x $PROFILE_SCRIPT ]] || { echo "missing profile script: $PROFILE_SCRIPT" >&2; exit 1; }
-[[ -x $BIN ]] || { echo "missing profiling daemon: $BIN" >&2; exit 1; }
-[[ -x $CLI ]] || { echo "missing profiling CLI: $CLI" >&2; exit 1; }
+if [[ -v IRONETD_BIN && -z $IRONETD_BIN ]] || [[ -v IRONET_BIN && -z $IRONET_BIN ]]; then
+  echo "IRONETD_BIN and IRONET_BIN must be non-empty when explicitly set" >&2
+  exit 1
+fi
+if [[ -v IRONETD_BIN && ! -v IRONET_BIN ]] || [[ ! -v IRONETD_BIN && -v IRONET_BIN ]]; then
+  echo "set both IRONETD_BIN and IRONET_BIN, or neither for a fresh default build" >&2
+  exit 1
+fi
+
+source_identity() {
+  local revision output_relative path content_hash
+  revision=$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null) || return
+  printf '%s:' "$revision"
+  git -C "$ROOT" diff --binary HEAD | git hash-object --stdin
+  printf ':'
+  # Include every untracked source path and its content hash. The matrix
+  # output itself is not source input, so exclude it when it lives inside
+  # this checkout.
+  if [[ $MATRIX_OUT == "$ROOT/"* ]]; then
+    output_relative=${MATRIX_OUT#"$ROOT/"}
+    while IFS= read -r -d '' path; do
+      [[ $path == "$output_relative" || $path == "$output_relative/"* ]] && continue
+      content_hash=$(git -C "$ROOT" hash-object -- "$path")
+      printf '%s\0%s\0' "$path" "$content_hash"
+    done < <(git -C "$ROOT" ls-files --others --exclude-standard -z) \
+      | git hash-object --stdin
+  else
+    while IFS= read -r -d '' path; do
+      content_hash=$(git -C "$ROOT" hash-object -- "$path")
+      printf '%s\0%s\0' "$path" "$content_hash"
+    done < <(git -C "$ROOT" ls-files --others --exclude-standard -z) \
+      | git hash-object --stdin
+  fi
+}
+
+expand_cpu_list() {
+  local list=$1 part first last cpu
+  local -a parts
+  IFS=, read -r -a parts <<<"$list"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then
+      first=${part%-*}
+      last=${part#*-}
+      for ((cpu = first; cpu <= last; cpu++)); do
+        printf '%s\n' "$cpu"
+      done
+    else
+      printf '%s\n' "$part"
+    fi
+  done
+}
+
+policy_content_sha256() {
+  local policy=$1
+  if [[ -z $policy || $policy == builtin || ! -f $policy ]]; then
+    return 0
+  fi
+  sha256sum "$policy" | awk '{print $1}'
+}
+
+# A matrix is meaningful only when the daemon and CLI were built from the
+# source being measured.  The previous implementation merely accepted any
+# executable at the default target path, which let an old profiling build
+# survive a source update unnoticed.  Build the default pair incrementally on
+# every run: Cargo makes this a no-op when it is already current, while a
+# changed source tree gets a matching pair before netns setup starts.  An
+# explicit binary path is a deliberate caller-owned artifact and is left
+# untouched for release/remote build workflows.
+ensure_profiling_binaries() {
+  if [[ -z ${IRONETD_BIN+x} && -z ${IRONET_BIN+x} ]]; then
+    MATRIX_BINARY_FRESHNESS=built-current-source
+    command -v "$CARGO" >/dev/null 2>&1 \
+      || { echo "missing cargo for fresh profiling build: $CARGO" >&2; exit 1; }
+    SOURCE_IDENTITY_BEFORE_BUILD=$(source_identity) \
+      || { echo "matrix requires a Git checkout to verify profiling-build freshness" >&2; exit 1; }
+    echo "building profiling binaries for $SOURCE_IDENTITY_BEFORE_BUILD"
+    "$CARGO" build --profile profiling --target x86_64-unknown-linux-musl \
+      --locked --bin ironetd --bin ironet
+    SOURCE_IDENTITY_AFTER_BUILD=$(source_identity) \
+      || { echo "matrix source revision disappeared while building" >&2; exit 1; }
+    [[ $SOURCE_IDENTITY_BEFORE_BUILD == "$SOURCE_IDENTITY_AFTER_BUILD" ]] \
+      || { echo "source changed while building profiling binaries; rerun the matrix" >&2; exit 1; }
+  else
+    MATRIX_BINARY_FRESHNESS=caller-supplied-unverified
+    echo "using caller-supplied profiling binaries; source freshness is caller-owned" >&2
+  fi
+}
+
 [[ $DURATION =~ ^[1-9][0-9]*$ ]] || { echo "invalid matrix duration" >&2; exit 1; }
 [[ $STREAMS =~ ^[1-9][0-9]*$ ]] || { echo "invalid matrix stream count" >&2; exit 1; }
 [[ $FREQUENCY =~ ^[1-9][0-9]*$ ]] || { echo "invalid matrix frequency" >&2; exit 1; }
@@ -88,8 +192,104 @@ if [[ -e $MATRIX_OUT && $RESUME == 0 ]]; then
   echo "matrix output already exists: $MATRIX_OUT" >&2
   exit 1
 fi
+
+ensure_profiling_binaries
+[[ -x $PROFILE_SCRIPT ]] || { echo "missing profile script: $PROFILE_SCRIPT" >&2; exit 1; }
+[[ -x $BIN ]] || { echo "missing profiling daemon: $BIN" >&2; exit 1; }
+[[ -x $CLI ]] || { echo "missing profiling CLI: $CLI" >&2; exit 1; }
 mkdir -p "$MATRIX_OUT"
-MATRIX_OUT=$(realpath "$MATRIX_OUT")
+SOURCE_REVISION=$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null || printf 'unknown')
+SOURCE_IDENTITY=$(source_identity 2>/dev/null || printf 'unknown')
+if [[ $MATRIX_BINARY_FRESHNESS == built-current-source \
+  && $SOURCE_IDENTITY != "$SOURCE_IDENTITY_AFTER_BUILD" ]]; then
+  echo "source changed after profiling build; rerun the matrix" >&2
+  exit 1
+fi
+BIN_SHA256=$(sha256sum "$BIN" | awk '{print $1}')
+CLI_SHA256=$(sha256sum "$CLI" | awk '{print $1}')
+MATRIX_SCRIPT_SHA256=$(sha256sum "$ROOT/scripts/profile-v2-netns-matrix.sh" | awk '{print $1}')
+PROFILE_SCRIPT_SHA256=$(sha256sum "$PROFILE_SCRIPT" | awk '{print $1}')
+CATALOG_SHA256=$(catalog | sha256sum | awk '{print $1}')
+AUTOTUNE_POLICY_SHA256=$(policy_content_sha256 "$AUTOTUNE_POLICY")
+AUTOTUNE_SHADOW_POLICY_SHA256=$(policy_content_sha256 "$AUTOTUNE_SHADOW_POLICY")
+PROFILE_ALLOWED_CPU_LIST=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
+mapfile -t PROFILE_ALLOWED_CPUS < <(expand_cpu_list "$PROFILE_ALLOWED_CPU_LIST")
+(( ${#PROFILE_ALLOWED_CPUS[@]} > 0 )) \
+  || { echo "no CPUs available to the profiler" >&2; exit 1; }
+PROFILE_DEFAULT_CPU_FIRST=$((${#PROFILE_ALLOWED_CPUS[@]} / 2))
+PROFILE_DEFAULT_CPUSET=$(IFS=,; echo "${PROFILE_ALLOWED_CPUS[*]:$PROFILE_DEFAULT_CPU_FIRST}")
+PROFILE_CPUSET=${IRONET_V2_PROFILE_CPUSET:-$PROFILE_DEFAULT_CPUSET}
+RUN_CONFIG_JSON=$(python3 - "$DURATION" "$STREAMS" "$PERF_ENABLED" "$FREQUENCY" \
+  "$CALL_GRAPH" "$PING_INTERVAL_MS" "$FAIRNESS_SECONDS" "$FAIRNESS_PER_STREAM_MBIT" \
+  "$SETTLE_SECONDS" "$MATRIX_SCRIPT_SHA256" "$PROFILE_SCRIPT_SHA256" "$CATALOG_SHA256" \
+  "$AUTOTUNE_FORCE" "$AUTOTUNE_MODE" "$AUTOTUNE_OBJECTIVE" "$AUTOTUNE_MEMORY" \
+  "$AUTOTUNE_POLICY" "$AUTOTUNE_POLICY_SHA256" "$AUTOTUNE_SHADOW_POLICY" \
+  "$AUTOTUNE_SHADOW_POLICY_SHA256" "$COVER_SECONDS" "$COVER_RATE_MBIT" "$SECOND_PATH" \
+  "$SECOND_PATH_DELAY_MS" "$SECOND_PATH_LOSS_PERCENT" "$SECOND_PATH_RATE_MBIT" \
+  "$SECOND_PATH_QUEUE_PACKETS" "$PROFILE_RUST_LOG" "$PROFILE_NICE" "$PROFILE_CPUSET" \
+  "$PROFILE_ALLOWED_CPU_LIST" <<'PY'
+import json
+import sys
+
+keys = (
+    "duration_seconds", "streams", "perf_enabled", "sampling_frequency_hz",
+    "call_graph", "ping_interval_ms", "fairness_seconds", "fairness_per_stream_mbit",
+    "settle_seconds", "matrix_script_sha256", "profile_script_sha256", "catalog_sha256",
+    "autotune_force", "autotune_mode", "autotune_objective", "autotune_memory",
+    "autotune_policy", "autotune_policy_sha256", "autotune_shadow_policy",
+    "autotune_shadow_policy_sha256", "cover_seconds", "cover_rate_mbit", "second_path",
+    "second_path_delay_ms", "second_path_loss_percent", "second_path_rate_mbit",
+    "second_path_queue_packets", "profile_rust_log", "profile_nice", "profile_cpuset",
+    "allowed_cpu_list",
+)
+print(json.dumps(dict(zip(keys, sys.argv[1:])), sort_keys=True, separators=(",", ":")))
+PY
+)
+if [[ $RESUME == 1 && -e $MATRIX_OUT/build.json ]]; then
+  python3 - "$MATRIX_OUT/build.json" "$SOURCE_IDENTITY" "$BIN_SHA256" "$CLI_SHA256" \
+    "$RUN_CONFIG_JSON" <<'PY'
+import json
+import pathlib
+import sys
+
+recorded = json.loads(pathlib.Path(sys.argv[1]).read_text())
+expected = {
+    "source_identity": sys.argv[2],
+    "ironetd": sys.argv[3],
+    "ironet": sys.argv[4],
+    "run_config": json.loads(sys.argv[5]),
+}
+actual = {
+    "source_identity": recorded.get("source_identity"),
+    "ironetd": (recorded.get("ironetd") or {}).get("sha256"),
+    "ironet": (recorded.get("ironet") or {}).get("sha256"),
+    "run_config": recorded.get("run_config"),
+}
+if actual != expected:
+    raise SystemExit(
+        "cannot resume matrix with different source or profiling binaries; choose a new output directory"
+    )
+PY
+elif [[ $RESUME == 1 ]] && find "$MATRIX_OUT" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+  echo "cannot resume matrix without build.json provenance; choose a new output directory" >&2
+  exit 1
+else
+  python3 - "$MATRIX_OUT/build.json" "$MATRIX_BINARY_FRESHNESS" "$SOURCE_REVISION" \
+  "$SOURCE_IDENTITY" "$BIN" "$BIN_SHA256" "$CLI" "$CLI_SHA256" "$RUN_CONFIG_JSON" <<'PY'
+import json
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "binary_freshness": sys.argv[2],
+    "source_revision": sys.argv[3],
+    "source_identity": sys.argv[4],
+    "ironetd": {"path": sys.argv[5], "sha256": sys.argv[6]},
+    "ironet": {"path": sys.argv[7], "sha256": sys.argv[8]},
+    "run_config": json.loads(sys.argv[9]),
+}, indent=2) + "\n")
+PY
+fi
 if [[ ! -s $MATRIX_OUT/manifest.tsv ]]; then
   printf 'scenario\tdirection\tdescription\toutput\n' >"$MATRIX_OUT/manifest.tsv"
 fi
@@ -103,8 +303,20 @@ while IFS='|' read -r name direction \
   [[ $seconds == 0 ]] || scenario_seconds=$seconds
   out="$MATRIX_OUT/$name"
   if [[ $RESUME == 1 && -s $out/summary.json ]]; then
-    printf 'skipping completed %s\n' "$name"
-    continue
+    if python3 - "$out/summary.json" "$name" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if summary.get("scenario") != sys.argv[2]:
+    raise SystemExit(1)
+PY
+    then
+      printf 'skipping completed %s\n' "$name"
+      continue
+    fi
+    printf 'completed summary for %s is invalid; rerunning it\n' "$name" >&2
   fi
   if [[ -e $out ]]; then
     interrupted="$MATRIX_OUT/.interrupted-$name-$(date -u +%Y%m%d-%H%M%S)"

@@ -609,13 +609,17 @@ import json
 import pathlib
 import sys
 
+def peer_traffic_value(peer, field):
+    if field in peer:
+        return int(peer[field] or 0)
+    return int((peer.get("traffic") or {}).get(field, 0) or 0)
+
 for name in sys.argv[1:]:
     status = json.loads(pathlib.Path(name).read_text())
     for peer in status.get("peers", []):
-        traffic = peer.get("traffic") or {}
-        if traffic.get("packet_train_queue_bytes", 0) != 0:
+        if peer_traffic_value(peer, "packet_train_queue_bytes") != 0:
             raise SystemExit(1)
-        if traffic.get("latency_queue_bytes", 0) != 0:
+        if peer_traffic_value(peer, "latency_queue_bytes") != 0:
             raise SystemExit(1)
 PY
 }
@@ -1550,12 +1554,16 @@ def udp_fairness():
             (sum(delivered_rates) ** 2) / (len(delivered_rates) * squares)
             if squares else None,
     }
+def peer_traffic_value(peer, field):
+    if field in peer:
+        return int(peer[field] or 0)
+    return int((peer.get("traffic") or {}).get(field, 0) or 0)
 def peer_counter(side, label, field):
     path = out / f"{side}-{label}-status.json"
     if not path.exists():
         return None
     peers = json.loads(path.read_text()).get("peers", [])
-    return sum(int((peer.get("traffic") or {}).get(field, 0)) for peer in peers)
+    return sum(peer_traffic_value(peer, field) for peer in peers)
 def counter_window(side, before, after, field):
     first = peer_counter(side, before, field)
     last = peer_counter(side, after, field)
@@ -1592,8 +1600,8 @@ def cover_profile():
     }
 def final_class_queues(side):
     peers = json.loads((out / f"{side}-final-status.json").read_text()).get("peers", [])
-    train = sum(int((peer.get("traffic") or {}).get("packet_train_queue_bytes", 0)) for peer in peers)
-    latency = sum(int((peer.get("traffic") or {}).get("latency_queue_bytes", 0)) for peer in peers)
+    train = sum(peer_traffic_value(peer, "packet_train_queue_bytes") for peer in peers)
+    latency = sum(peer_traffic_value(peer, "latency_queue_bytes") for peer in peers)
     return {
         "peers": len(peers),
         "packet_train_queue_bytes": train,
@@ -1605,18 +1613,18 @@ def final_tun_admission_shed(side):
     peers = status.get("peers", [])
     return {
         "records": int(status.get("tun_admission_drop_records", 0)) + sum(
-            int((peer.get("traffic") or {}).get("tun_admission_drop_records", 0)) for peer in peers
+            peer_traffic_value(peer, "tun_admission_drop_records") for peer in peers
         ),
         "bytes": int(status.get("tun_admission_drop_bytes", 0)) + sum(
-            int((peer.get("traffic") or {}).get("tun_admission_drop_bytes", 0)) for peer in peers
+            peer_traffic_value(peer, "tun_admission_drop_bytes") for peer in peers
         ),
     }
 def final_datagram_shape(side):
     peers = json.loads((out / f"{side}-final-status.json").read_text()).get("peers", [])
-    cells = sum(int((peer.get("traffic") or {}).get("cells_built", 0)) for peer in peers)
-    full = sum(int((peer.get("traffic") or {}).get("full_payload_cells_built", 0)) for peer in peers)
-    cover = sum(int((peer.get("traffic") or {}).get("cover_tx_bytes", 0)) for peer in peers)
-    real = sum(int((peer.get("traffic") or {}).get("cell_payload_tx_bytes", 0)) for peer in peers)
+    cells = sum(peer_traffic_value(peer, "cells_built") for peer in peers)
+    full = sum(peer_traffic_value(peer, "full_payload_cells_built") for peer in peers)
+    cover = sum(peer_traffic_value(peer, "cover_tx_bytes") for peer in peers)
+    real = sum(peer_traffic_value(peer, "cell_payload_tx_bytes") for peer in peers)
     return {
         "cells_built": cells,
         "full_payload_cells_built": full,
