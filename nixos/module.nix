@@ -35,6 +35,13 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
+    # MagicDNS is registered as per-link split DNS over resolve1. Keep the
+    # resolver and polkit broker available, and grant only the methods used by
+    # the capability-bounded ironet service account.
+    services.resolved.enable = true;
+    security.polkit.enable = true;
+    security.polkit.extraConfig = builtins.readFile ../systemd/90-ironet-resolved.rules;
+
     users.groups.ironet = { };
     users.users.ironet = {
       isSystemUser = true;
@@ -51,10 +58,17 @@ in
     };
 
     systemd.services.ironet = {
-      description = "Ironet data plane with FlowRouter";
+      description = "Ironet Protocol V2 data plane";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      wants = [
+        "network-online.target"
+        "systemd-resolved.service"
+      ];
+      after = [
+        "network-online.target"
+        "dbus.service"
+        "systemd-resolved.service"
+      ];
       path = [
         pkgs.iproute2
         pkgs.iptables

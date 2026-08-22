@@ -1,7 +1,7 @@
 [Unit]
-Description=Ironet FlowRouter data plane
-After=network-online.target systemd-sysctl.service
-Wants=network-online.target systemd-sysctl.service
+Description=Ironet Protocol V2 data plane
+After=network-online.target systemd-sysctl.service dbus.service systemd-resolved.service
+Wants=network-online.target systemd-sysctl.service systemd-resolved.service
 
 [Service]
 Type=simple

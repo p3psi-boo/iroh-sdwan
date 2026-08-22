@@ -1,0 +1,12 @@
+build: features: cranelift=true pulley=true
+mode: run file: /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin-guest-component.wasm target: pulley64 
+engine_new: 50.958µs
+input_file_bytes: 11486
+compile_or_load_time: 14.125707ms
+instantiate: p50=2.601µs p99=7.88µs max=45.645µs
+first_call: 95.996µs out_len=32
+call(1000 iters, input 1024 B): p50=55.506µs p90=60.211µs p99=73.73µs max=192.765µs
+fuel_per_call: min=7379 p50=7379 p99=7379 max=7379
+checksum: 2341000
+rss_kib: start=3052 after_load=11956 end=12108
+out0_hex: 41814e316f9748409b791206528aa63f92634a288bee02400700000040000000

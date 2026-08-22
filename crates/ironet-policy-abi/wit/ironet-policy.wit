@@ -1,0 +1,600 @@
+// Ironet adaptive-control policy ABI, V1.
+//
+// Mirror of the Rust types in `ironet-policy-abi`. Units and directions are
+// part of every field name: `*-milli` is value x 1000, `*-per-mille` is a
+// ratio x 1000, `*-ppm` a ratio x 1_000_000, `*-micros`/`*-millis` are
+// durations, `*-bytes-per-second` are rates. `local-tx-*` is the direction the
+// host transmits on, `local-rx-*` the direction it receives on, `remote-*`
+// values are reported by the peer, `host-*` values are not direction specific.
+// `0` in a cap/rate field means "no cap / host default" unless documented
+// otherwise. Fixed-size Rust arrays are carried as `list<u8>`.
+//
+// Layout of `interface types`: closed enums, `policy-fault`, small value
+// types, input records, effective action (fed back as `previous`), candidate
+// records, clamp report (host side, shared vocabulary), output records.
+// Every `record`/`enum`/`variant` here mirrors the Rust type of the same
+// name (`…V1`) field for field; `tests/wit_consistency.rs` enforces it.
+package ironet:policy@1.0.0;
+
+interface types {
+
+    /// Underlay reliability of the current path.
+    enum path-reliability {
+        datagram,
+        reliable-relay,
+    }
+
+    /// Host classification of why an effective action has its shape.
+    enum action-reason {
+        cold-start,
+        telemetry-unavailable,
+        path-changed,
+        healthy-low-loss,
+        random-loss,
+        burst-loss,
+        congested,
+        cpu-limited,
+        reliable-path,
+    }
+
+    /// Cover-traffic shaping profile.
+    enum cover-profile {
+        idle,
+        live-broadcast,
+        interactive-video,
+        generic-h3-bulk,
+    }
+
+    /// BBRv3 preset family; a hint, explicit tunables win.
+    enum bbr3-preset {
+        shared-conservative,
+        private-aggressive,
+        lossy-radio,
+        policer,
+        long-fat,
+        relay-reliable,
+        low-rtt-host,
+    }
+
+    /// Utility objective the host used.
+    enum objective {
+        balanced,
+        throughput,
+        latency,
+    }
+
+    /// FEC geometry family hint.
+    enum fec-preset-family {
+        unspecified,
+        sparse,
+        balanced,
+        dense,
+    }
+
+    /// When the receiver sends Repair requests for a detected gap.
+    enum repair-wait-policy {
+        host-default,
+        eager,
+        after-fec-window,
+        patient,
+    }
+
+    /// Which protection mechanism carries the loss-recovery budget.
+    enum protection-responsibility {
+        host-default,
+        prefer-fec,
+        prefer-repair,
+        both,
+    }
+
+    /// Scheduler behaviour hint.
+    enum scheduler-preset-hint {
+        host-default,
+        latency-first,
+        balanced,
+        bulk-throughput,
+    }
+
+    /// Kind of decision reported for diagnostics.
+    enum policy-decision-kind {
+        hold,
+        exploit,
+        explore,
+        rollback,
+        cold-start,
+        fallback,
+    }
+
+    /// Every candidate field the host may clamp, reject or ignore.
+    enum clamp-field {
+        bbr-preset,
+        bbr-probe-bw-up-pacing-gain-milli,
+        bbr-probe-bw-down-pacing-gain-milli,
+        bbr-cruise-pacing-gain-milli,
+        bbr-default-cwnd-gain-milli,
+        bbr-probe-bw-up-cwnd-gain-milli,
+        bbr-headroom-milli,
+        bbr-beta-milli,
+        bbr-loss-threshold-milli,
+        bbr-loss-is-congestion,
+        bbr-queue-guard-inflation-milli,
+        bbr-queue-guard-slack-micros,
+        bbr-probe-rtt-interval-millis,
+        bbr-probe-rtt-duration-millis,
+        bbr-probe-rtt-cwnd-gain-milli,
+        bbr-min-probe-wait-millis,
+        bbr-max-added-probe-wait-millis,
+        bbr-pacing-cap-bytes-per-second,
+        bbr-cwnd-floor-bytes,
+        bbr-cwnd-cap-bytes,
+        bbr-startup-bw-hint-bytes-per-second,
+        scheduler-train-target-bytes,
+        scheduler-bulk-quantum-cells,
+        scheduler-bulk-admission-window-bytes,
+        scheduler-preset-hint,
+        fec-enabled,
+        fec-data-cells,
+        fec-parity-cells,
+        fec-preset-family,
+        repair-cache-bytes,
+        repair-retention-target-millis,
+        repair-wait-policy,
+        repair-responsibility,
+        tx-send-buffer-bytes,
+        tx-datagram-admission-bytes,
+        tx-producer-window-bytes,
+        rx-receive-buffer-bytes,
+        rx-receive-batch,
+        rx-reassembly-budget-bytes,
+        rx-active-train-budget,
+        cover-profile,
+        cover-overhead-per-mille,
+        cover-padding-bytes-per-second,
+        egress-desired-rate-bytes-per-second,
+        egress-minimum-rate-bytes-per-second,
+        egress-priority,
+        egress-exploring,
+        extension,
+    }
+
+    /// Why a candidate field was changed.
+    enum clamp-reason {
+        below-floor,
+        above-cap,
+        invalid-value,
+        overflow,
+        cross-field-constraint,
+        unknown-extension,
+        extension-too-large,
+        too-many-extensions,
+        reliable-underlay,
+        cpu-pressure,
+        queue-pressure,
+        capability,
+        memory-budget,
+        wire-overhead,
+        egress-arbitration,
+        transition-hold,
+        unsupported,
+    }
+
+    /// Failure of one `decide` call; the host falls back to the native
+    /// baseline for the tick.
+    variant policy-fault {
+        trap,
+        timeout,
+        fuel-exhausted,
+        out-of-memory,
+        input-too-large,
+        output-too-large,
+        invalid-output,
+        state-too-large,
+        abi-mismatch,
+        unavailable,
+        internal,
+    }
+
+
+    /// Fixed 16-byte zero-padded UTF-8 diagnostics label.
+    type policy-label = list<u8>;
+
+    /// One TLV extension entry; unknown tags are ignored.
+    record policy-extension {
+        /// Tag registered in the policy SDK.
+        tag: u16,
+        /// Opaque payload, at most 4 KiB.
+        payload: list<u8>,
+    }
+
+
+    /// Telemetry for one peer path, one tick.
+    record policy-telemetry {
+        /// Smoothed path RTT.
+        path-rtt-micros: u64,
+        /// Minimum RTT observed for this path epoch.
+        path-min-rtt-micros: u64,
+        /// Estimated standing queue delay.
+        path-queue-delay-micros: u64,
+        /// Locally transmitted QUIC wire rate (delivery rate).
+        local-tx-wire-rate-bytes-per-second: u64,
+        /// Application payload rate offered by the local TUN producer.
+        local-tx-tun-ingress-bytes-per-second: u64,
+        /// Local real (non-cover) traffic rate on the wire.
+        local-tx-real-traffic-bytes-per-second: u64,
+        /// Local PacketTrain build rate.
+        local-tx-train-build-bytes-per-second: u64,
+        /// Locally transmitted packets per second.
+        local-tx-packets-per-second: u64,
+        /// QUIC lost-packet ratio on the local transmit direction.
+        local-tx-loss-ppm: u32,
+        /// Longest consecutive lost Cell run in the latest interval.
+        local-tx-burst-loss-cells: u16,
+        /// Mean TUN record size entering the local scheduler.
+        local-tx-average-record-bytes: u64,
+        /// Share of local ingress that arrived as GSO super-records.
+        local-tx-gso-ingress-ratio-ppm: u32,
+        /// Bytes staged in the local PacketTrain (bulk) queue.
+        local-tx-packet-train-queue-bytes: u64,
+        /// Bytes staged in the local latency lane.
+        local-tx-latency-queue-bytes: u64,
+        /// Mean delay Bulk waited behind latency traffic.
+        local-tx-bulk-preemption-delay-average-micros: u64,
+        /// Controller pacing rate snapshot.
+        local-tx-controller-pacing-rate-bytes-per-second: u64,
+        /// Controller send quantum snapshot.
+        local-tx-controller-send-quantum-bytes: u64,
+        /// Controller state discriminant (BBR phase), opaque.
+        local-tx-controller-state: u8,
+        /// Controller long-term bandwidth estimate.
+        local-tx-controller-bw-bytes-per-second: u64,
+        /// Controller long-term in-flight estimate.
+        local-tx-controller-inflight-longterm-bytes: u64,
+        /// Queue-guard transitions since the previous tick.
+        local-tx-controller-guard-transitions-delta: u64,
+        /// Controller was application limited during the interval.
+        local-tx-controller-app-limited: bool,
+        /// Generation of the tunables the controller last read.
+        local-tx-controller-tunables-generation: u64,
+        /// Generation of the params the controller last published.
+        local-tx-controller-params-generation: u64,
+        /// Cumulative tunable writes the controller had to clamp.
+        local-tx-controller-clamped-writes: u64,
+        /// Locally received QUIC wire rate.
+        local-rx-wire-rate-bytes-per-second: u64,
+        /// Incomplete PacketTrains evicted locally since the prior tick.
+        local-rx-reassembly-pressure-evictions: u64,
+        /// Payload bytes delivered by the remote receiver per second.
+        remote-goodput-bytes-per-second: u64,
+        /// Gaps that remained at the remote receiver when trains closed.
+        remote-residual-loss-ppm: u32,
+        /// Reordering ratio observed by the remote receiver.
+        remote-reorder-ppm: u32,
+        /// FEC stripes the remote receiver expired unrecovered since last tick.
+        remote-expired-stripes-delta: u64,
+        /// Parity the remote receiver discarded unused.
+        remote-wasted-parity-per-mille: u16,
+        /// Share of remote gaps recovered by FEC.
+        remote-fec-recovery-per-mille: u16,
+        /// Share of Repair requests the remote could satisfy from cache.
+        remote-repair-hit-per-mille: u16,
+        /// Cumulative matched Repair responses for this path epoch.
+        remote-repair-completed-requests: u64,
+        /// Mean Repair request-to-response latency; 0 = none completed.
+        remote-repair-response-latency-micros: u64,
+        /// Local latency-lane sojourn p50.
+        latency-sojourn-p50-micros: u64,
+        /// Local latency-lane sojourn p95.
+        latency-sojourn-p95-micros: u64,
+        /// Local latency-lane sojourn p99.
+        latency-sojourn-p99-micros: u64,
+        /// The latency lane was queued or served during the interval.
+        latency-queue-recently-nonempty: bool,
+        /// Host CPU utilisation attributed to this daemon.
+        host-cpu-utilization-per-mille: u16,
+    }
+
+    /// Host-computed utility of the previous tick (fixed point x 1000).
+    record host-utility {
+        objective: objective,
+        /// False on the first tick of a path epoch.
+        valid: bool,
+        utility-milli: s32,
+        throughput-milli: s32,
+        queue-delay-milli: s32,
+        latency-sojourn-milli: s32,
+        residual-loss-milli: s32,
+        jitter-milli: s32,
+        cpu-milli: s32,
+        wire-overhead-milli: s32,
+        memory-milli: s32,
+        /// Remote goodput the sample was computed from.
+        goodput-bytes-per-second: u64,
+    }
+
+    /// Static bounds the host enforces this tick; 0 in a cap = no cap.
+    record host-limits {
+        train-target-floor-bytes: u32,
+        train-target-cap-bytes: u32,
+        bulk-quantum-floor-cells: u16,
+        bulk-quantum-cap-cells: u16,
+        send-buffer-floor-bytes: u64,
+        send-buffer-cap-bytes: u64,
+        receive-buffer-floor-bytes: u64,
+        receive-buffer-cap-bytes: u64,
+        receive-batch-cap: u16,
+        repair-cache-cap-bytes: u64,
+        fec-data-cells-cap: u8,
+        fec-parity-cells-cap: u8,
+        fec-parity-per-mille-cap: u16,
+        cover-overhead-cap-per-mille: u16,
+        cover-padding-cap-bytes-per-second: u64,
+        pacing-cap-bytes-per-second: u64,
+        egress-priority-cap: u8,
+        state-cap-bytes: u32,
+        extension-payload-cap-bytes: u32,
+        extension-count-cap: u16,
+    }
+
+    /// What this host offers to the policy this tick.
+    record host-capabilities {
+        abi-major: u16,
+        abi-minor: u16,
+        fec-supported: bool,
+        repair-supported: bool,
+        cover-supported: bool,
+        bbr-tunables-writable: bool,
+        egress-coordinator: bool,
+        /// This call is a shadow evaluation; output will not be applied.
+        shadow: bool,
+        /// Extension tags present in `policy-input.extensions`.
+        extension-tags: list<u16>,
+    }
+
+    /// Node egress coordinator view for this peer (read-only).
+    record egress-allocation-view {
+        assigned-rate-bytes-per-second: u64,
+        node-cap-bytes-per-second: u64,
+        node-demand-bytes-per-second: u64,
+        /// demand / cap x 1000, saturating; 0 when uncapped.
+        pressure-per-mille: u16,
+        active-peers: u32,
+        allocation-generation: u64,
+    }
+
+
+    /// Fully resolved BBRv3 tunables.
+    record bbr-effective {
+        preset: bbr3-preset,
+        probe-bw-up-pacing-gain-milli: u32,
+        probe-bw-down-pacing-gain-milli: u32,
+        cruise-pacing-gain-milli: u32,
+        default-cwnd-gain-milli: u32,
+        probe-bw-up-cwnd-gain-milli: u32,
+        headroom-milli: u32,
+        beta-milli: u32,
+        loss-threshold-milli: u32,
+        loss-is-congestion: bool,
+        queue-guard-inflation-milli: u32,
+        queue-guard-slack-micros: u64,
+        probe-rtt-interval-millis: u64,
+        probe-rtt-duration-millis: u64,
+        probe-rtt-cwnd-gain-milli: u32,
+        min-probe-wait-millis: u64,
+        max-added-probe-wait-millis: u64,
+        pacing-cap-bytes-per-second: u64,
+        cwnd-floor-bytes: u64,
+        cwnd-cap-bytes: u64,
+        startup-bw-hint-bytes-per-second: u64,
+    }
+
+    record scheduler-effective {
+        train-target-bytes: u32,
+        bulk-quantum-cells: u16,
+        bulk-admission-window-bytes: u32,
+        preset-hint: scheduler-preset-hint,
+    }
+
+    record fec-effective {
+        enabled: bool,
+        data-cells: u8,
+        parity-cells: u8,
+        preset-family: fec-preset-family,
+    }
+
+    record repair-effective {
+        cache-bytes: u64,
+        retention-target-millis: u32,
+        wait-policy: repair-wait-policy,
+        responsibility: protection-responsibility,
+    }
+
+    record tx-effective {
+        send-buffer-bytes: u64,
+        datagram-admission-bytes: u32,
+        producer-window-bytes: u64,
+    }
+
+    record rx-effective {
+        receive-buffer-bytes: u64,
+        receive-batch: u16,
+        reassembly-budget-bytes: u64,
+        active-train-budget: u16,
+    }
+
+    record cover-effective {
+        profile: cover-profile,
+        overhead-per-mille: u16,
+        padding-bytes-per-second: u64,
+    }
+
+    /// Egress demand submitted to the node coordinator.
+    record egress-request {
+        desired-rate-bytes-per-second: u64,
+        minimum-rate-bytes-per-second: u64,
+        /// 0..=7, higher wins ties.
+        priority: u8,
+        exploring: bool,
+    }
+
+    /// Host-authoritative action; every field concrete.
+    record effective-action {
+        reason: action-reason,
+        path-epoch: u64,
+        sample-count: u32,
+        bbr: bbr-effective,
+        scheduler: scheduler-effective,
+        fec: fec-effective,
+        repair: repair-effective,
+        tx: tx-effective,
+        rx: rx-effective,
+        cover: cover-effective,
+        egress: egress-request,
+    }
+
+    /// Everything a policy sees for one `decide` call.
+    record policy-input {
+        logical-tick: u64,
+        /// Only randomness source a guest may use.
+        deterministic-seed: u64,
+        /// 32-byte opaque peer bucket hash.
+        peer-hash: list<u8>,
+        path-epoch: u64,
+        reliability: path-reliability,
+        telemetry: policy-telemetry,
+        /// Effective action applied after the previous tick.
+        previous: effective-action,
+        previous-utility: host-utility,
+        limits: host-limits,
+        capabilities: host-capabilities,
+        egress: egress-allocation-view,
+        extensions: list<policy-extension>,
+        /// Opaque policy state from the previous `decide`.
+        state: list<u8>,
+    }
+
+
+    /// BBRv3 candidate; unset fields keep the previous effective value.
+    record bbr-candidate {
+        preset: option<bbr3-preset>,
+        probe-bw-up-pacing-gain-milli: option<u32>,
+        probe-bw-down-pacing-gain-milli: option<u32>,
+        cruise-pacing-gain-milli: option<u32>,
+        default-cwnd-gain-milli: option<u32>,
+        probe-bw-up-cwnd-gain-milli: option<u32>,
+        headroom-milli: option<u32>,
+        beta-milli: option<u32>,
+        loss-threshold-milli: option<u32>,
+        loss-is-congestion: option<bool>,
+        queue-guard-inflation-milli: option<u32>,
+        queue-guard-slack-micros: option<u64>,
+        probe-rtt-interval-millis: option<u64>,
+        probe-rtt-duration-millis: option<u64>,
+        probe-rtt-cwnd-gain-milli: option<u32>,
+        min-probe-wait-millis: option<u64>,
+        max-added-probe-wait-millis: option<u64>,
+        pacing-cap-bytes-per-second: option<u64>,
+        cwnd-floor-bytes: option<u64>,
+        cwnd-cap-bytes: option<u64>,
+        startup-bw-hint-bytes-per-second: option<u64>,
+    }
+
+    record scheduler-candidate {
+        train-target-bytes: option<u32>,
+        bulk-quantum-cells: option<u16>,
+        bulk-admission-window-bytes: option<u32>,
+        preset-hint: option<scheduler-preset-hint>,
+    }
+
+    record fec-candidate {
+        /// `some(false)` explicitly turns FEC off.
+        enabled: option<bool>,
+        data-cells: option<u8>,
+        parity-cells: option<u8>,
+        preset-family: option<fec-preset-family>,
+    }
+
+    record repair-candidate {
+        cache-bytes: option<u64>,
+        retention-target-millis: option<u32>,
+        wait-policy: option<repair-wait-policy>,
+        responsibility: option<protection-responsibility>,
+    }
+
+    record tx-candidate {
+        send-buffer-bytes: option<u64>,
+        datagram-admission-bytes: option<u32>,
+        producer-window-bytes: option<u64>,
+    }
+
+    record rx-candidate {
+        receive-buffer-bytes: option<u64>,
+        receive-batch: option<u16>,
+        reassembly-budget-bytes: option<u64>,
+        active-train-budget: option<u16>,
+    }
+
+    record cover-candidate {
+        profile: option<cover-profile>,
+        overhead-per-mille: option<u16>,
+        padding-bytes-per-second: option<u64>,
+    }
+
+    /// Untrusted action proposal; absent domain = keep previous.
+    record candidate-action {
+        bbr: option<bbr-candidate>,
+        scheduler: option<scheduler-candidate>,
+        fec: option<fec-candidate>,
+        repair: option<repair-candidate>,
+        tx: option<tx-candidate>,
+        rx: option<rx-candidate>,
+        cover: option<cover-candidate>,
+        egress-request: option<egress-request>,
+        extensions: list<policy-extension>,
+    }
+
+
+    record clamp-entry {
+        field: clamp-field,
+        /// Requested value widened to s64 (bool 0/1, enum index, ext tag).
+        requested: s64,
+        effective: s64,
+        reason: clamp-reason,
+    }
+
+    record clamp-report {
+        entries: list<clamp-entry>,
+    }
+
+
+    /// Bounded diagnostics; no arbitrary strings.
+    record policy-diagnostics {
+        decision-kind: policy-decision-kind,
+        context-label: policy-label,
+        applied-arm-label: policy-label,
+        baseline-arm-label: policy-label,
+        predicted-advantage-milli: s32,
+        confidence-per-mille: u16,
+        exploring: bool,
+        rollback: bool,
+        rollbacks: u32,
+        guest-utility-milli: s32,
+        /// Schema of `next-state`; host keys persistence on it.
+        state-schema: u32,
+    }
+
+    /// Result of one `decide` call.
+    record policy-output {
+        candidate: candidate-action,
+        /// Opaque state for the next tick, at most 64 KiB.
+        next-state: list<u8>,
+        diagnostics: policy-diagnostics,
+    }
+}
+
+/// A policy component: pure, deterministic, no imports.
+world policy {
+    use types.{policy-input, policy-output, policy-fault};
+
+    /// Produce a candidate for one tick; state travels in the records.
+    export decide: func(input: policy-input) -> result<policy-output, policy-fault>;
+}

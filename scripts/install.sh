@@ -6,6 +6,7 @@ PREFIX=${PREFIX:-/usr/local}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 SYSUSERS_DIR=${SYSUSERS_DIR:-/etc/sysusers.d}
 SYSCTL_DIR=${SYSCTL_DIR:-/etc/sysctl.d}
+POLKIT_RULES_DIR=${POLKIT_RULES_DIR:-/etc/polkit-1/rules.d}
 CONFIG_DIR=${CONFIG_DIR:-/etc/ironet}
 STATE_DIR=${STATE_DIR:-/var/lib/ironet}
 
@@ -22,6 +23,8 @@ sed "s|/usr/local/bin/|$PREFIX/bin/|g" systemd/ironet.service \
   | install -D -m 0644 /dev/stdin "$SYSTEMD_DIR/ironet.service"
 install -D -m 0644 systemd/ironet.sysusers "$SYSUSERS_DIR/ironet.conf"
 install -D -m 0644 systemd/90-ironet.conf "$SYSCTL_DIR/90-ironet.conf"
+install -D -m 0644 systemd/90-ironet-resolved.rules \
+  "$POLKIT_RULES_DIR/90-ironet-resolved.rules"
 if command -v systemd-sysusers >/dev/null 2>&1; then
   systemd-sysusers "$SYSUSERS_DIR/ironet.conf"
 elif ! getent passwd ironet >/dev/null 2>&1; then

@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use ipnet::IpNet;
-use iroh::{EndpointId, RelayUrl};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::derp::{DerpPublicKey, DerpServer};
@@ -20,125 +20,13 @@ pub struct Config {
     pub bind_addresses: Vec<SocketAddr>,
     /// IP prefixes that direct underlay paths must not use. Both the local and
     /// remote address of an IP path are covered.
-    #[serde(
-        default,
-        alias = "forbidden_underlay_prefixes",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_underlay_prefixes: Vec<IpNet>,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub discovery_enabled: bool,
-    /// Local data-plane attachment. `none` turns the process into a pure
-    /// userspace transit node and does not require CAP_NET_ADMIN or /dev/net/tun.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub attachment: AttachmentMode,
     #[serde(
         default = "default_tun_mtu",
         skip_serializing_if = "is_default_tun_mtu"
     )]
     pub tun_mtu: u16,
-    #[serde(
-        default = "default_max_frame_size",
-        skip_serializing_if = "is_default_max_frame_size"
-    )]
-    pub max_frame_size: u16,
-    /// UDP segmentation offload policy for batched QUIC datagrams. `auto`
-    /// performs an egress-path send probe before enabling it. Legacy booleans
-    /// remain accepted (`true` = enabled, `false` = disabled).
-    #[serde(
-        default,
-        deserialize_with = "deserialize_udp_segmentation_offload",
-        skip_serializing_if = "is_default"
-    )]
-    pub udp_segmentation_offload: UdpSegmentationOffload,
-    /// Let peers negotiate conservative initial transport settings and adapt
-    /// them from live path telemetry. Explicit values remain hard ceilings.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub quic_auto_tune: bool,
-    /// QUIC payload cipher preference. `auto` benchmarks the host at startup;
-    /// fixed values remain available as operational overrides.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub quic_cipher_preference: QuicCipherPreference,
-    /// Bounded userspace QUIC DATAGRAM send queue per connection. Larger
-    /// values reduce producer/driver wakeups on fast paths at the cost of a
-    /// larger non-preemptible burst.
-    #[serde(
-        default = "default_quic_send_buffer_bytes",
-        skip_serializing_if = "is_default_quic_send_buffer_bytes"
-    )]
-    pub quic_send_buffer_bytes: usize,
-    #[serde(
-        default = "default_quic_receive_buffer_bytes",
-        skip_serializing_if = "is_default_quic_receive_buffer_bytes"
-    )]
-    pub quic_receive_buffer_bytes: usize,
-    /// Total authenticated QUIC connections per peer, including the primary.
-    #[serde(
-        default = "default_quic_data_lanes",
-        skip_serializing_if = "is_default_quic_data_lanes"
-    )]
-    pub quic_data_lanes: usize,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub quic_congestion_controller: QuicCongestionController,
-    #[serde(
-        default = "default_quic_initial_rtt_millis",
-        skip_serializing_if = "is_default_quic_initial_rtt_millis"
-    )]
-    pub quic_initial_rtt_millis: u64,
-    #[serde(
-        default = "default_quic_initial_mtu",
-        skip_serializing_if = "is_default_quic_initial_mtu"
-    )]
-    pub quic_initial_mtu: u16,
-    /// Run DPLPMTUD and re-probe after a congestion-induced black-hole
-    /// fallback instead of remaining at the 1200-byte minimum indefinitely.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub quic_mtu_discovery_enabled: bool,
-    #[serde(
-        default = "default_quic_mtu_black_hole_cooldown_millis",
-        skip_serializing_if = "is_default_quic_mtu_black_hole_cooldown_millis"
-    )]
-    pub quic_mtu_black_hole_cooldown_millis: u64,
-    #[serde(
-        default = "default_quic_keep_alive_millis",
-        skip_serializing_if = "is_default_quic_keep_alive_millis"
-    )]
-    pub quic_keep_alive_millis: u64,
-    #[serde(
-        default = "default_quic_passthrough_window_bytes",
-        skip_serializing_if = "is_default_quic_passthrough_window_bytes"
-    )]
-    pub quic_passthrough_window_bytes: u64,
-    /// Optional outer pacing ceiling for passthrough mode. Inner TCP retains
-    /// end-to-end congestion control; this ceiling protects non-TCP traffic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic_passthrough_pacing_mbps: Option<u64>,
-    #[serde(
-        default = "default_quic_adaptive_initial_mbps",
-        skip_serializing_if = "is_default_quic_adaptive_initial_mbps"
-    )]
-    pub quic_adaptive_initial_mbps: u64,
-    #[serde(
-        default = "default_quic_adaptive_min_mbps",
-        skip_serializing_if = "is_default_quic_adaptive_min_mbps"
-    )]
-    pub quic_adaptive_min_mbps: u64,
-    #[serde(
-        default = "default_quic_adaptive_max_mbps",
-        skip_serializing_if = "is_default_quic_adaptive_max_mbps"
-    )]
-    pub quic_adaptive_max_mbps: u64,
-    /// Pacing reduction per congestion event in basis points (100 = 1%).
-    #[serde(
-        default = "default_quic_adaptive_loss_backoff_bps",
-        skip_serializing_if = "is_default_quic_adaptive_loss_backoff_bps"
-    )]
-    pub quic_adaptive_loss_backoff_bps: u16,
-    #[serde(
-        default = "default_quic_pacing_quantum_bytes",
-        skip_serializing_if = "is_default_quic_pacing_quantum_bytes"
-    )]
-    pub quic_pacing_quantum_bytes: u64,
     #[serde(
         default = "default_node_interface",
         skip_serializing_if = "is_default_node_interface"
@@ -150,12 +38,12 @@ pub struct Config {
     pub advertised_prefixes: Vec<IpNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_info: Option<NodeInfo>,
-    /// Selection policy for concurrently available IPv4 and IPv6 underlay
-    /// paths. The preference is applied only while path quality is comparable.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub path_selection: PathSelectionConfig,
     #[serde(default, skip_serializing_if = "is_default")]
     pub relay: RelayConfig,
+    /// QUIC-visible traffic cover. Endpoint identity remains authenticated in
+    /// V2 SessionHello and is never derived from these public names.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cover: CoverConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
     /// Pairwise transport contracts. Locators in this section are local-only
@@ -172,151 +60,503 @@ pub struct Config {
     /// deployments only need the defaults; configured peers remain pinned.
     #[serde(default, skip_serializing_if = "is_default")]
     pub mesh: MeshConfig,
+    /// Local authoritative DNS synthesized from the signed mesh directory.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub packet_policy: PacketPolicyConfig,
+    pub dns: DnsConfig,
+    /// Slow-path adaptive control. The defaults require no operator tuning:
+    /// the built-in policy observes in shadow mode and persists per-peer
+    /// network memory.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub fec: FecConfig,
+    pub autotune: AutotuneConfig,
+    /// Advanced bounds for automatic QUIC path migration. RTT, ACK/PTO and
+    /// on-path challenge observations still select the live deadline inside
+    /// these bounds; this section only exists so operations can change
+    /// guardrails without rebuilding the binary.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub observability: ObservabilityConfig,
+    pub path_migration: PathMigrationConfig,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AttachmentMode {
-    #[default]
-    Tun,
-    None,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum QuicCongestionController {
-    #[default]
-    Cubic,
-    Bbr3,
-    Passthrough,
-    Adaptive,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum QuicCipherPreference {
-    #[default]
-    Auto,
-    ChaCha20,
-    Aes256Gcm,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UdpSegmentationOffload {
-    #[default]
-    Auto,
-    Enabled,
-    Disabled,
-}
-
-fn deserialize_udp_segmentation_offload<'de, D>(
-    deserializer: D,
-) -> std::result::Result<UdpSegmentationOffload, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum CompatibleValue {
-        Legacy(bool),
-        Name(String),
-    }
-
-    use serde::de::Error as _;
-    match CompatibleValue::deserialize(deserializer)? {
-        CompatibleValue::Legacy(true) => Ok(UdpSegmentationOffload::Enabled),
-        CompatibleValue::Legacy(false) => Ok(UdpSegmentationOffload::Disabled),
-        CompatibleValue::Name(name) => match name.as_str() {
-            "auto" => Ok(UdpSegmentationOffload::Auto),
-            "enabled" => Ok(UdpSegmentationOffload::Enabled),
-            "disabled" => Ok(UdpSegmentationOffload::Disabled),
-            _ => Err(D::Error::custom(
-                "udp_segmentation_offload must be auto, enabled, disabled, true or false",
-            )),
-        },
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IpFamilyPreference {
-    Ipv4,
-    #[default]
-    Ipv6,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PathSelectionConfig {
-    /// Preferred direct-path address family when IPv4 and IPv6 have comparable
-    /// health, loss and latency.
+pub struct PathMigrationConfig {
+    #[serde(default = "default_path_pto_threshold")]
+    pub pto_threshold: u32,
+    #[serde(default = "default_path_min_pto_silence_ms")]
+    pub min_pto_silence_ms: u64,
+    #[serde(default = "default_path_min_silence_ms")]
+    pub min_silence_ms: u64,
+    #[serde(default = "default_path_max_silence_ms")]
+    pub max_silence_ms: u64,
+    #[serde(default = "default_path_recovery_probation_ms")]
+    pub recovery_probation_ms: u64,
+    #[serde(default = "default_path_recovery_max_response_gap_ms")]
+    pub recovery_max_response_gap_ms: u64,
+    #[serde(default = "default_path_recovery_min_responses")]
+    pub recovery_min_responses: u64,
+    #[serde(default = "default_path_health_ttl_secs")]
+    pub health_ttl_secs: u64,
+    #[serde(default = "default_path_rtt_switch_margin_ms")]
+    pub rtt_switch_margin_ms: u64,
+    #[serde(default = "default_path_keep_alive_ms")]
+    pub keep_alive_ms: u64,
+    #[serde(default = "default_path_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for PathMigrationConfig {
+    fn default() -> Self {
+        Self {
+            pto_threshold: default_path_pto_threshold(),
+            min_pto_silence_ms: default_path_min_pto_silence_ms(),
+            min_silence_ms: default_path_min_silence_ms(),
+            max_silence_ms: default_path_max_silence_ms(),
+            recovery_probation_ms: default_path_recovery_probation_ms(),
+            recovery_max_response_gap_ms: default_path_recovery_max_response_gap_ms(),
+            recovery_min_responses: default_path_recovery_min_responses(),
+            health_ttl_secs: default_path_health_ttl_secs(),
+            rtt_switch_margin_ms: default_path_rtt_switch_margin_ms(),
+            keep_alive_ms: default_path_keep_alive_ms(),
+            idle_timeout_ms: default_path_idle_timeout_ms(),
+        }
+    }
+}
+
+impl PathMigrationConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.pto_threshold > 0,
+            "path_migration.pto_threshold must be non-zero"
+        );
+        ensure!(
+            self.min_pto_silence_ms > 0,
+            "path_migration.min_pto_silence_ms must be non-zero"
+        );
+        ensure!(
+            self.min_silence_ms > 0,
+            "path_migration.min_silence_ms must be non-zero"
+        );
+        ensure!(
+            self.min_silence_ms <= self.max_silence_ms,
+            "path_migration.min_silence_ms must not exceed max_silence_ms"
+        );
+        ensure!(
+            self.min_pto_silence_ms <= self.min_silence_ms,
+            "path_migration.min_pto_silence_ms must not exceed min_silence_ms"
+        );
+        ensure!(
+            self.recovery_probation_ms > 0,
+            "path_migration.recovery_probation_ms must be non-zero"
+        );
+        ensure!(
+            self.recovery_max_response_gap_ms > 0,
+            "path_migration.recovery_max_response_gap_ms must be non-zero"
+        );
+        ensure!(
+            self.recovery_min_responses > 0,
+            "path_migration.recovery_min_responses must be non-zero"
+        );
+        ensure!(
+            self.health_ttl_secs > 0,
+            "path_migration.health_ttl_secs must be non-zero"
+        );
+        ensure!(
+            self.keep_alive_ms > 0,
+            "path_migration.keep_alive_ms must be non-zero"
+        );
+        ensure!(
+            self.keep_alive_ms < self.idle_timeout_ms,
+            "path_migration.keep_alive_ms must be less than idle_timeout_ms"
+        );
+        ensure!(
+            self.idle_timeout_ms > self.max_silence_ms,
+            "path_migration.idle_timeout_ms must exceed max_silence_ms"
+        );
+        ensure!(
+            self.idle_timeout_ms > self.recovery_probation_ms,
+            "path_migration.idle_timeout_ms must exceed recovery_probation_ms"
+        );
+        Ok(())
+    }
+}
+
+const fn default_path_pto_threshold() -> u32 {
+    4
+}
+const fn default_path_min_pto_silence_ms() -> u64 {
+    250
+}
+const fn default_path_min_silence_ms() -> u64 {
+    1_000
+}
+const fn default_path_max_silence_ms() -> u64 {
+    5_000
+}
+const fn default_path_recovery_probation_ms() -> u64 {
+    2_000
+}
+const fn default_path_recovery_max_response_gap_ms() -> u64 {
+    2_000
+}
+const fn default_path_recovery_min_responses() -> u64 {
+    3
+}
+const fn default_path_health_ttl_secs() -> u64 {
+    300
+}
+const fn default_path_rtt_switch_margin_ms() -> u64 {
+    5
+}
+const fn default_path_keep_alive_ms() -> u64 {
+    250
+}
+const fn default_path_idle_timeout_ms() -> u64 {
+    15_000
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutotuneMode {
+    Off,
+    #[default]
+    Shadow,
+    On,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutotuneObjective {
+    #[default]
+    Balanced,
+    Throughput,
+    Latency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutotuneConfig {
     #[serde(default, skip_serializing_if = "is_default")]
-    pub prefer: IpFamilyPreference,
+    pub mode: AutotuneMode,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub objective: AutotuneObjective,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub memory: bool,
+    /// Policy backend selection with three layers of meaning:
+    ///
+    /// - `native`: the host-side conservative fallback. It only uses the
+    ///   deterministic `AutoTunerV2` propose rules, carries no learner and
+    ///   never loads an external artifact. It is kept permanently for fault
+    ///   fallback, quarantine and deployments without the WASM engine.
+    /// - `builtin` (default): the `builtin.wasm` component embedded in this
+    ///   binary, executed by the WASM runtime.
+    /// - an absolute `.wasm` path: an external policy component verified
+    ///   against `[autotune.wasm]` (signers or digest pins).
+    ///
+    /// External JSON policy artifacts were removed in Phase 6; a `.json`
+    /// path is a configuration error. A rejected external component falls
+    /// back to `builtin`, then to `native`, without preventing the dataplane
+    /// from starting.
+    #[serde(
+        default = "default_autotune_policy",
+        skip_serializing_if = "is_builtin_policy"
+    )]
+    pub policy: String,
+    /// Optional candidate evaluated without affecting the wire action. Must
+    /// be an absolute `.wasm` path (JSON artifacts were removed in Phase 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_policy: Option<PathBuf>,
+    /// WASM policy trust store, resource budget and state persistence. The
+    /// whole section is part of the sealed configuration: signers, digest
+    /// pins and policy paths are never writable by a guest.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub wasm: AutotuneWasmConfig,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LinkClass {
-    #[default]
-    PrivateCircuit,
+impl Default for AutotuneConfig {
+    fn default() -> Self {
+        Self {
+            mode: AutotuneMode::Shadow,
+            objective: AutotuneObjective::Balanced,
+            memory: true,
+            policy: default_autotune_policy(),
+            shadow_policy: None,
+            wasm: AutotuneWasmConfig::default(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LinkVisibility {
-    #[default]
-    Pairwise,
+/// `autotune.policy` value selecting the host-native conservative fallback.
+pub const AUTOTUNE_POLICY_NATIVE: &str = "native";
+/// `autotune.policy` value selecting the policy embedded in this binary.
+pub const AUTOTUNE_POLICY_BUILTIN: &str = "builtin";
+
+fn default_autotune_policy() -> String {
+    AUTOTUNE_POLICY_BUILTIN.to_owned()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DialRole {
-    #[default]
-    Auto,
-    Active,
-    Passive,
+fn is_builtin_policy(value: &str) -> bool {
+    value == AUTOTUNE_POLICY_BUILTIN
+}
+
+fn is_wasm_policy_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+}
+
+impl AutotuneConfig {
+    /// True when `policy` or `shadow_policy` names an external `.wasm`
+    /// component, i.e. when the WASM trust store actually gates loading.
+    pub fn uses_wasm_artifact(&self) -> bool {
+        let policy = Path::new(&self.policy);
+        (policy.is_absolute() && is_wasm_policy_path(policy))
+            || self
+                .shadow_policy
+                .as_deref()
+                .is_some_and(is_wasm_policy_path)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.policy.trim().is_empty(),
+            "autotune.policy cannot be empty"
+        );
+        let policy_path = Path::new(&self.policy);
+        ensure!(
+            self.policy == AUTOTUNE_POLICY_NATIVE
+                || self.policy == AUTOTUNE_POLICY_BUILTIN
+                || (policy_path.is_absolute() && is_wasm_policy_path(policy_path)),
+            "autotune.policy must be native, builtin or an absolute .wasm path \
+             (external JSON policy artifacts were removed; deploy a signed .wasm component)"
+        );
+        if let Some(path) = &self.shadow_policy {
+            ensure!(
+                path.is_absolute() && is_wasm_policy_path(path),
+                "autotune.shadow_policy must be an absolute .wasm path \
+                 (external JSON policy artifacts were removed; deploy a signed .wasm component)"
+            );
+        }
+        self.wasm.validate(self.uses_wasm_artifact())
+    }
+}
+
+/// Trust store, resource budget and state persistence for WASM policy
+/// components. Defaults follow the documented initial budget; every field is
+/// sealed together with the rest of the configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutotuneWasmConfig {
+    /// Production default. When `false`, `.wasm` policies must instead match
+    /// one of `digest_pins`; a module's self-reported key never counts as
+    /// trust.
+    #[serde(default = "default_true")]
+    pub require_signature: bool,
+    /// Upper bound on the component file size in bytes.
+    #[serde(default = "default_wasm_maximum_module_bytes")]
+    pub maximum_module_bytes: u64,
+    /// Upper bound on guest linear memory in bytes.
+    #[serde(default = "default_wasm_maximum_memory_bytes")]
+    pub maximum_memory_bytes: u64,
+    /// Upper bound on the opaque per-peer state blob in bytes.
+    #[serde(default = "default_wasm_maximum_state_bytes")]
+    pub maximum_state_bytes: u64,
+    /// Wall-clock deadline for a single `decide` call.
+    #[serde(default = "default_wasm_deadline_millis")]
+    pub deadline_millis: u64,
+    /// Minimum interval between periodic per-peer state flushes to disk.
+    /// State is also flushed on module switch, peer disconnect and shutdown.
+    #[serde(default = "default_wasm_state_flush_interval_secs")]
+    pub state_flush_interval_secs: u64,
+    /// Trusted signers. Several may coexist to rotate keys; revocation is
+    /// deleting the entry and re-sealing the configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signers: Vec<AutotuneSignerConfig>,
+    /// Development-mode alternative to signatures: exact `blake3:<hex>`
+    /// digests of the accepted component prefixes. Only consulted when
+    /// `require_signature = false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub digest_pins: Vec<String>,
+}
+
+impl Default for AutotuneWasmConfig {
+    fn default() -> Self {
+        Self {
+            require_signature: true,
+            maximum_module_bytes: default_wasm_maximum_module_bytes(),
+            maximum_memory_bytes: default_wasm_maximum_memory_bytes(),
+            maximum_state_bytes: default_wasm_maximum_state_bytes(),
+            deadline_millis: default_wasm_deadline_millis(),
+            state_flush_interval_secs: default_wasm_state_flush_interval_secs(),
+            signers: Vec::new(),
+            digest_pins: Vec::new(),
+        }
+    }
+}
+
+/// One entry of the WASM policy trust store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutotuneSignerConfig {
+    /// Operator-chosen identifier matched against the component signature
+    /// section.
+    pub signer_id: String,
+    /// `ed25519:<key>` where the key is the 32-byte public key in hex (64
+    /// characters) or RFC 4648 base32 (52 characters, optional `====`).
+    pub public_key: String,
+    /// Rollback floor: components signed by this signer are rejected when
+    /// their `policy_version` is lower.
+    #[serde(default)]
+    pub minimum_policy_version: u64,
+    /// Optional RFC 3339 expiry after which this signer is no longer trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+const WASM_MAXIMUM_STATE_BYTES_LIMIT: u64 = 1024 * 1024;
+const WASM_DEADLINE_MILLIS_RANGE: std::ops::RangeInclusive<u64> = 1..=1000;
+
+const fn default_wasm_maximum_module_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+const fn default_wasm_maximum_memory_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+const fn default_wasm_maximum_state_bytes() -> u64 {
+    64 * 1024
+}
+const fn default_wasm_deadline_millis() -> u64 {
+    10
+}
+const fn default_wasm_state_flush_interval_secs() -> u64 {
+    60
+}
+
+impl AutotuneWasmConfig {
+    fn validate(&self, uses_wasm_artifact: bool) -> Result<()> {
+        ensure!(
+            self.maximum_module_bytes > 0,
+            "autotune.wasm.maximum_module_bytes must be non-zero"
+        );
+        ensure!(
+            self.maximum_memory_bytes > 0,
+            "autotune.wasm.maximum_memory_bytes must be non-zero"
+        );
+        ensure!(
+            (1..=WASM_MAXIMUM_STATE_BYTES_LIMIT).contains(&self.maximum_state_bytes),
+            "autotune.wasm.maximum_state_bytes must be between 1 and {WASM_MAXIMUM_STATE_BYTES_LIMIT} (1 MiB)"
+        );
+        ensure!(
+            WASM_DEADLINE_MILLIS_RANGE.contains(&self.deadline_millis),
+            "autotune.wasm.deadline_millis must be between {} and {}",
+            WASM_DEADLINE_MILLIS_RANGE.start(),
+            WASM_DEADLINE_MILLIS_RANGE.end()
+        );
+        ensure!(
+            self.state_flush_interval_secs >= 1,
+            "autotune.wasm.state_flush_interval_secs must be at least 1"
+        );
+
+        let mut signer_ids = HashSet::new();
+        for signer in &self.signers {
+            let signer_id = signer.signer_id.trim();
+            ensure!(
+                !signer_id.is_empty(),
+                "autotune.wasm.signers: signer_id cannot be empty"
+            );
+            ensure!(
+                signer_ids.insert(signer_id),
+                "autotune.wasm.signers: duplicate signer_id {signer_id:?}"
+            );
+            validate_signer_public_key(signer_id, &signer.public_key)?;
+            if let Some(expires_at) = signer.expires_at.as_deref() {
+                chrono::DateTime::parse_from_rfc3339(expires_at).with_context(|| {
+                    format!(
+                        "autotune.wasm.signers[{signer_id}].expires_at must be an RFC 3339 timestamp, got {expires_at:?}"
+                    )
+                })?;
+            }
+        }
+
+        for pin in &self.digest_pins {
+            validate_digest_pin(pin)?;
+        }
+
+        if uses_wasm_artifact {
+            if self.require_signature {
+                ensure!(
+                    !self.signers.is_empty(),
+                    "autotune.wasm.require_signature = true with a .wasm policy requires at least one [[autotune.wasm.signers]] entry"
+                );
+            } else {
+                ensure!(
+                    !self.digest_pins.is_empty(),
+                    "autotune.wasm.require_signature = false with a .wasm policy requires non-empty autotune.wasm.digest_pins"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+const ED25519_KEY_PREFIX: &str = "ed25519:";
+const BLAKE3_PIN_PREFIX: &str = "blake3:";
+/// 32 bytes in RFC 4648 base32 without padding.
+const ED25519_BASE32_LEN: usize = 52;
+const ED25519_HEX_LEN: usize = 64;
+const BLAKE3_HEX_LEN: usize = 64;
+
+fn is_hex_of_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_base32_ed25519_key(value: &str) -> bool {
+    let unpadded = value.strip_suffix("====").unwrap_or(value);
+    unpadded.len() == ED25519_BASE32_LEN
+        && unpadded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7'))
+}
+
+fn validate_signer_public_key(signer_id: &str, public_key: &str) -> Result<()> {
+    let Some(encoded) = public_key.strip_prefix(ED25519_KEY_PREFIX) else {
+        bail!(
+            "autotune.wasm.signers[{signer_id}].public_key must start with {ED25519_KEY_PREFIX:?}, got {public_key:?}"
+        );
+    };
+    ensure!(
+        is_hex_of_len(encoded, ED25519_HEX_LEN) || is_base32_ed25519_key(encoded),
+        "autotune.wasm.signers[{signer_id}].public_key must be ed25519:<64 hex chars> or ed25519:<52 base32 chars> (32-byte key), got {public_key:?}"
+    );
+    Ok(())
+}
+
+fn validate_digest_pin(pin: &str) -> Result<()> {
+    let Some(encoded) = pin.strip_prefix(BLAKE3_PIN_PREFIX) else {
+        bail!(
+            "autotune.wasm.digest_pins entries must start with {BLAKE3_PIN_PREFIX:?}, got {pin:?}"
+        );
+    };
+    ensure!(
+        is_hex_of_len(encoded, BLAKE3_HEX_LEN),
+        "autotune.wasm.digest_pins entries must be blake3:<64 hex chars>, got {pin:?}"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkConfig {
-    /// Stable identifier shared by exactly the two endpoints.
-    pub id: String,
     pub name: String,
     pub peer_id: EndpointId,
-    #[serde(default)]
-    pub class: LinkClass,
-    #[serde(default)]
-    pub visibility: LinkVisibility,
-    #[serde(default)]
-    pub dial: DialRole,
     /// Private circuits are exclusive by default: path migration may not
     /// escape to discovery, relay, DERP or peer-observed public addresses.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub exclusive: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
-    /// Optional local socket delivered by the circuit provider. This is a path
-    /// allowlist, not an endpoint-wide bind directive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_bind: Option<SocketAddr>,
-    /// Pairwise locators, including RFC1918/RFC4193 delivery and private port
-    /// forwards. They are deliberately absent from Presence/NodeRecord.
+    /// Pairwise locators delivered by the private circuit. They are local
+    /// configuration and never published through V2 Presence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_addresses: Vec<SocketAddr>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_local_prefixes: Vec<IpNet>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_remote_prefixes: Vec<IpNet>,
-    /// 32-byte hexadecimal pairwise secret used by the V1 session transcript.
-    pub auth_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,26 +569,11 @@ pub struct NodeInfo {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// Optional underlay relay transports. DERP is enabled whenever `servers` is
-/// non-empty. iroh relay is disabled by default and requires an explicit
-/// opt-in so deployments can restrict fallback to DERP, overlay transit and
-/// direct UDP.
+/// Optional Tailscale DERP underlay transports. Direct UDP and V2 overlay
+/// transit remain independent path choices.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
-    /// Permit iroh relay registration and dialing. Direct iroh UDP paths stay
-    /// available when this is false.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub iroh_relay_enabled: bool,
-    /// Explicit iroh relay URLs inherited by peers without `relay_urls`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub urls: Vec<String>,
-    /// Public iroh relay/QAD endpoints used for address discovery even when
-    /// normal peer traffic uses DERP or overlay transit.  These endpoints are
-    /// also viable encrypted fallback paths, because iroh uses the same relay
-    /// map for QAD and relay registration.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub discovery_urls: Vec<String>,
     /// Tailscale DERP transport servers. Each URL is one independent region.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<String>,
@@ -358,14 +583,34 @@ impl RelayConfig {
     pub fn derp_enabled(&self) -> bool {
         !self.servers.is_empty()
     }
+}
 
-    pub fn iroh_urls(&self) -> impl Iterator<Item = &str> {
-        self.urls
-            .iter()
-            .chain(&self.discovery_urls)
-            .map(String::as_str)
-            .filter(|_| self.iroh_relay_enabled)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverConfig {
+    /// Network-level SNI pool. Selection is deterministic per peer and cover
+    /// generation, while pool order has no semantic meaning.
+    #[serde(default = "default_cover_sni_pool")]
+    pub sni_pool: Vec<String>,
+    #[serde(default = "default_cover_profile_id")]
+    pub profile_id: u32,
+}
+
+impl Default for CoverConfig {
+    fn default() -> Self {
+        Self {
+            sni_pool: default_cover_sni_pool(),
+            profile_id: default_cover_profile_id(),
+        }
     }
+}
+
+fn default_cover_sni_pool() -> Vec<String> {
+    vec!["media.example".to_owned()]
+}
+
+const fn default_cover_profile_id() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,20 +618,11 @@ impl RelayConfig {
 pub struct PeerConfig {
     pub name: String,
     pub endpoint_id: EndpointId,
-    /// Whether this peer may be used as a next hop for prefixes it does not own.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub transit_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_addresses: Vec<SocketAddr>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relay_urls: Vec<String>,
     /// X25519 public key used to address this peer on DERP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derp_public_key: Option<DerpPublicKey>,
-    /// Overlay source prefixes this adjacency may deliver, including prefixes
-    /// legitimately transited by this Peer.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_source_prefixes: Vec<IpNet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,7 +647,7 @@ pub struct RoutingConfig {
         skip_serializing_if = "is_default_rule_priority"
     )]
     pub rule_priority: u32,
-    /// Dedicated Linux policy-routing table owned by FlowRouter.
+    /// Dedicated Linux policy-routing table owned by V2 dataplane.
     #[serde(
         default = "default_routing_table",
         skip_serializing_if = "is_default_routing_table"
@@ -455,6 +691,53 @@ impl Default for MeshConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsConfig {
+    /// Serve the private zone from every attached node.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// Authoritative forward zone, without a trailing dot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Local high port advertised to systemd-resolved with SetLinkDNSEx.
+    #[serde(
+        default = "default_dns_listen_port",
+        skip_serializing_if = "is_default_dns_listen_port"
+    )]
+    pub listen_port: u16,
+    /// Add the private zone as a search domain for single-label lookups.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub short_names: bool,
+    /// Install per-link split-DNS state in systemd-resolved.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub accept_dns: bool,
+    /// Positive and negative answer TTL. Directory changes are still pushed
+    /// immediately into the local authority; this bounds external stub caches.
+    #[serde(
+        default = "default_dns_ttl_secs",
+        skip_serializing_if = "is_default_dns_ttl_secs"
+    )]
+    pub ttl_secs: u32,
+    /// Overlay allocation pools used to route reverse lookups to this link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverse_prefixes: Vec<IpNet>,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: None,
+            listen_port: default_dns_listen_port(),
+            short_names: true,
+            accept_dns: true,
+            ttl_secs: default_dns_ttl_secs(),
+            reverse_prefixes: Vec::new(),
+        }
+    }
+}
+
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
@@ -473,90 +756,6 @@ impl RoutingConfig {
     pub fn max_egress_bps(&self) -> Option<u64> {
         self.max_egress_mbps
             .and_then(|value| value.checked_mul(1_000_000))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PacketPolicyConfig {
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub enforce_overlay_prefixes: bool,
-}
-
-impl Default for PacketPolicyConfig {
-    fn default() -> Self {
-        Self {
-            enforce_overlay_prefixes: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FecConfig {
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub enabled: bool,
-    #[serde(
-        default = "default_fec_data_shards",
-        skip_serializing_if = "is_default_fec_data_shards"
-    )]
-    pub data_shards: u8,
-    #[serde(
-        default = "default_fec_recovery_shards",
-        skip_serializing_if = "is_default_fec_recovery_shards"
-    )]
-    pub recovery_shards: u8,
-    #[serde(
-        default = "default_fec_block_timeout",
-        skip_serializing_if = "is_default_fec_block_timeout"
-    )]
-    pub block_timeout_millis: u64,
-    #[serde(
-        default = "default_fec_decoder_ttl",
-        skip_serializing_if = "is_default_fec_decoder_ttl"
-    )]
-    pub decoder_ttl_millis: u64,
-}
-
-impl Default for FecConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            data_shards: default_fec_data_shards(),
-            recovery_shards: default_fec_recovery_shards(),
-            block_timeout_millis: default_fec_block_timeout(),
-            decoder_ttl_millis: default_fec_decoder_ttl(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ObservabilityConfig {
-    #[serde(
-        default = "default_status_file",
-        skip_serializing_if = "is_default_status_file"
-    )]
-    pub status_file: PathBuf,
-    #[serde(
-        default = "default_metrics_file",
-        skip_serializing_if = "is_default_metrics_file"
-    )]
-    pub metrics_file: PathBuf,
-    #[serde(
-        default = "default_report_interval",
-        skip_serializing_if = "is_default_report_interval"
-    )]
-    pub report_interval_secs: u64,
-}
-
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self {
-            status_file: default_status_file(),
-            metrics_file: default_metrics_file(),
-            report_interval_secs: default_report_interval(),
-        }
     }
 }
 
@@ -665,86 +864,10 @@ impl Config {
             !self.network_id.trim().is_empty(),
             "network_id cannot be empty"
         );
-        // 1280 is the IPv6 minimum link MTU. Transit-only nodes do not create
-        // an interface, but keep validating the wire frame ceiling below.
-        if self.attachment == AttachmentMode::Tun {
-            ensure!(self.tun_mtu >= 1280, "tun_mtu must be at least 1280");
-            validate_interface_name(&self.node_interface)?;
-        }
-        ensure!(
-            self.max_frame_size >= 256,
-            "max_frame_size must be at least 256"
-        );
-        ensure!(
-            (8 * 1024..=8 * 1024 * 1024).contains(&self.quic_send_buffer_bytes),
-            "quic_send_buffer_bytes must be between 8192 and 8388608"
-        );
-        ensure!(
-            (64 * 1024..=64 * 1024 * 1024).contains(&self.quic_receive_buffer_bytes),
-            "quic_receive_buffer_bytes must be between 65536 and 67108864"
-        );
-        ensure!(
-            (1..=8).contains(&self.quic_data_lanes),
-            "quic_data_lanes must be between 1 and 8"
-        );
-        ensure!(
-            (1..=10_000).contains(&self.quic_initial_rtt_millis),
-            "quic_initial_rtt_millis must be between 1 and 10000"
-        );
-        ensure!(
-            (1_200..=1_452).contains(&self.quic_initial_mtu),
-            "quic_initial_mtu must be between 1200 and 1452"
-        );
-        ensure!(
-            (1_000..=600_000).contains(&self.quic_mtu_black_hole_cooldown_millis),
-            "quic_mtu_black_hole_cooldown_millis must be between 1000 and 600000"
-        );
-        ensure!(
-            (100..=60_000).contains(&self.quic_keep_alive_millis),
-            "quic_keep_alive_millis must be between 100 and 60000"
-        );
-        ensure!(
-            (64 * 1024..=256 * 1024 * 1024).contains(&self.quic_passthrough_window_bytes),
-            "quic_passthrough_window_bytes must be between 65536 and 268435456"
-        );
-        if let Some(mbps) = self.quic_passthrough_pacing_mbps {
-            ensure!(
-                (1..=100_000).contains(&mbps),
-                "quic_passthrough_pacing_mbps must be between 1 and 100000"
-            );
-        }
-        ensure!(
-            self.quic_adaptive_min_mbps > 0
-                && self.quic_adaptive_min_mbps <= self.quic_adaptive_initial_mbps
-                && self.quic_adaptive_initial_mbps <= self.quic_adaptive_max_mbps
-                && self.quic_adaptive_max_mbps <= 100_000,
-            "adaptive QUIC rates must satisfy 0 < min <= initial <= max <= 100000 Mbps"
-        );
-        ensure!(
-            (1..=5_000).contains(&self.quic_adaptive_loss_backoff_bps),
-            "quic_adaptive_loss_backoff_bps must be between 1 and 5000"
-        );
-        ensure!(
-            (1_200..=65_536).contains(&self.quic_pacing_quantum_bytes),
-            "quic_pacing_quantum_bytes must be between 1200 and 65536"
-        );
-        ensure!(
-            (2..=64).contains(&self.fec.data_shards),
-            "fec.data_shards must be between 2 and 64"
-        );
-        ensure!(
-            (1..=32).contains(&self.fec.recovery_shards),
-            "fec.recovery_shards must be between 1 and 32"
-        );
-        ensure!(
-            self.fec.block_timeout_millis > 0 && self.fec.block_timeout_millis <= 1_000,
-            "fec.block_timeout_millis must be between 1 and 1000"
-        );
-        ensure!(
-            self.fec.decoder_ttl_millis >= self.fec.block_timeout_millis
-                && self.fec.decoder_ttl_millis <= 60_000,
-            "fec.decoder_ttl_millis must be at least block_timeout_millis and at most 60000"
-        );
+        ensure!(self.tun_mtu >= 1280, "tun_mtu must be at least 1280");
+        self.autotune.validate()?;
+        self.path_migration.validate()?;
+        validate_interface_name(&self.node_interface)?;
         ensure!(
             (2..32_766).contains(&self.routing.rule_priority),
             "routing.rule_priority must be between 2 and 32765"
@@ -772,16 +895,21 @@ impl Config {
             "configured peers exceed mesh.max_peers"
         );
         ensure!(
-            self.observability.report_interval_secs > 0,
-            "observability.report_interval_secs must be greater than zero"
+            self.cover.profile_id != 0,
+            "cover.profile_id zero is reserved"
         );
         ensure!(
-            self.observability.status_file != self.observability.metrics_file,
-            "observability status_file and metrics_file must differ"
+            !self.cover.sni_pool.is_empty(),
+            "cover.sni_pool cannot be empty"
         );
+        let mut cover_names = HashSet::new();
+        for name in &self.cover.sni_pool {
+            crate::v2_runtime::validate_cover_sni(name)?;
+            ensure!(cover_names.insert(name), "duplicate cover SNI {name}");
+        }
         self.validate_bind_addresses()?;
         self.validate_node_info()?;
-        self.validate_attachment()?;
+        self.validate_dns()?;
 
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
@@ -798,10 +926,8 @@ impl Config {
             let private_link = self.link_for_peer(peer.endpoint_id).is_some();
             ensure!(
                 !private_link
-                    || (peer.direct_addresses.is_empty()
-                        && peer.relay_urls.is_empty()
-                        && peer.derp_public_key.is_none()),
-                "peer {} uses a private link and cannot also publish public/relay locators",
+                    || (peer.direct_addresses.is_empty() && peer.derp_public_key.is_none()),
+                "peer {} uses a private link and cannot also publish public/DERP locators",
                 peer.name
             );
             if let Some(key) = peer.derp_public_key {
@@ -810,18 +936,6 @@ impl Config {
                     "DERP public key {key} is assigned to multiple peers"
                 );
             }
-            for url in &peer.relay_urls {
-                url.parse::<RelayUrl>()
-                    .with_context(|| format!("invalid relay URL for peer {}", peer.name))?;
-            }
-            let mut peer_relay_urls = HashSet::new();
-            ensure!(
-                peer.relay_urls
-                    .iter()
-                    .all(|url| peer_relay_urls.insert(url)),
-                "peer {} contains duplicate relay_urls",
-                peer.name
-            );
             for address in &peer.direct_addresses {
                 ensure!(address.port() != 0, "peer {} has port zero", peer.name);
                 if let Some(prefix) = self.excluded_underlay_prefix(address.ip()) {
@@ -835,22 +949,9 @@ impl Config {
                     "direct address {address} is assigned to multiple peers"
                 );
             }
-            ensure!(
-                peer.relay_urls.is_empty() || peer.relay_urls.len() >= 2,
-                "peer {} requires at least two relay_urls for redundancy",
-                peer.name
-            );
         }
 
         self.validate_links(&ids)?;
-
-        ensure!(
-            !self.packet_policy.enforce_overlay_prefixes
-                || self.mesh.enabled
-                || self.peers.is_empty()
-                || !self.route_origins.is_empty(),
-            "packet source enforcement requires mesh discovery or at least one imported static route"
-        );
 
         let mut origin_ids = HashSet::new();
         let mut owned_prefixes: Vec<(EndpointId, IpNet)> = Vec::new();
@@ -880,29 +981,6 @@ impl Config {
             }
         }
 
-        for peer in &self.peers {
-            let mut allowed_sources = HashSet::new();
-            for prefix in &peer.allowed_source_prefixes {
-                ensure!(
-                    allowed_sources.insert(*prefix),
-                    "peer {} contains duplicate allowed_source_prefixes entry {prefix}",
-                    peer.name
-                );
-                ensure!(
-                    owned_prefixes.iter().any(|(_, owned)| owned == prefix),
-                    "peer {} allowed source {prefix} is not an exact remote route-origin prefix",
-                    peer.name
-                );
-            }
-            ensure!(
-                !self.packet_policy.enforce_overlay_prefixes
-                    || self.mesh.enabled
-                    || !peer.allowed_source_prefixes.is_empty(),
-                "peer {} requires mesh discovery or allowed_source_prefixes when packet policy is enabled",
-                peer.name
-            );
-        }
-
         for prefix in self.all_advertised_prefixes() {
             validate_overlay_prefix(prefix, self.routing.allow_default_routes)?;
             for (owner, remote) in &owned_prefixes {
@@ -924,14 +1002,8 @@ impl Config {
                 "default routes require routing.rule_priority greater than one"
             );
             ensure!(
-                !self.discovery_enabled,
-                "default routes require discovery_enabled = false"
-            );
-            ensure!(
-                self.relay.urls.is_empty()
-                    && self.relay.discovery_urls.is_empty()
-                    && !self.relay.derp_enabled(),
-                "default routes require relay.urls, relay.discovery_urls, and relay.servers to be empty"
+                !self.relay.derp_enabled(),
+                "default routes require relay.servers to be empty"
             );
             ensure!(
                 self.peers
@@ -969,13 +1041,11 @@ impl Config {
             );
         }
 
-        let mut families = HashSet::new();
+        ensure!(
+            self.bind_addresses.len() <= 1,
+            "V2 accepts one dual-stack bind address"
+        );
         for address in &self.bind_addresses {
-            let family = if address.is_ipv4() { 4 } else { 6 };
-            ensure!(
-                families.insert(family),
-                "only one bind_addresses entry is allowed per address family"
-            );
             if !address.ip().is_unspecified()
                 && let Some(prefix) = self.excluded_underlay_prefix(address.ip())
             {
@@ -1004,30 +1074,51 @@ impl Config {
         Ok(())
     }
 
-    fn validate_attachment(&self) -> Result<()> {
-        if self.attachment == AttachmentMode::None {
+    fn validate_dns(&self) -> Result<()> {
+        if !self.dns.enabled {
             ensure!(
-                self.node_addresses.is_empty() && self.advertised_prefixes.is_empty(),
-                "attachment = none cannot own node_addresses or advertised_prefixes"
+                self.dns.domain.is_none() && self.dns.reverse_prefixes.is_empty(),
+                "dns.domain and dns.reverse_prefixes require dns.enabled = true"
             );
+            return Ok(());
+        }
+        ensure!(
+            self.mesh.enabled,
+            "dns.enabled requires mesh.enabled = true"
+        );
+        ensure!(
+            !self.node_addresses.is_empty(),
+            "dns.enabled requires at least one node_addresses entry"
+        );
+        ensure!(self.node_info.is_some(), "dns.enabled requires [node_info]");
+        ensure!(self.dns.listen_port != 0, "dns.listen_port cannot be zero");
+        ensure!(
+            (1..=300).contains(&self.dns.ttl_secs),
+            "dns.ttl_secs must be between 1 and 300"
+        );
+        let domain = self
+            .dns
+            .domain
+            .as_deref()
+            .context("dns.enabled requires dns.domain")?;
+        validate_dns_domain(domain)?;
+        let mut prefixes = HashSet::new();
+        for prefix in &self.dns.reverse_prefixes {
+            validate_overlay_prefix(*prefix, false)?;
             ensure!(
-                self.routing.transit_enabled,
-                "attachment = none requires routing.transit_enabled = true"
+                prefixes.insert(*prefix),
+                "duplicate dns.reverse_prefixes entry {prefix}"
             );
         }
         Ok(())
     }
 
     fn validate_links(&self, peer_ids: &HashSet<EndpointId>) -> Result<()> {
-        let mut ids = HashSet::new();
         let mut names = HashSet::new();
         let mut peers = HashSet::new();
         let mut remotes = HashSet::new();
         for link in &self.links {
-            ensure!(!link.id.trim().is_empty(), "link id cannot be empty");
-            ensure!(link.id.len() <= 128, "link {} id is too long", link.name);
             ensure!(!link.name.trim().is_empty(), "link name cannot be empty");
-            ensure!(ids.insert(&link.id), "duplicate link id {}", link.id);
             ensure!(
                 names.insert(&link.name),
                 "duplicate link name {}",
@@ -1058,36 +1149,6 @@ impl Config {
                 "private link {} requires remote_addresses",
                 link.name
             );
-            ensure!(
-                hex::decode(&link.auth_key).is_ok_and(|key| key.len() == 32),
-                "link {} auth_key must be 32-byte hexadecimal",
-                link.name
-            );
-            if let Some(local) = link.local_bind {
-                ensure!(
-                    local.port() != 0,
-                    "link {} local_bind has port zero",
-                    link.name
-                );
-                ensure!(
-                    !link.allowed_local_prefixes.is_empty(),
-                    "link {} local_bind requires allowed_local_prefixes",
-                    link.name
-                );
-                ensure!(
-                    link.allowed_local_prefixes
-                        .iter()
-                        .any(|prefix| prefix.contains(&local.ip())),
-                    "link {} local_bind is outside allowed_local_prefixes",
-                    link.name
-                );
-                ensure!(
-                    self.bind_addresses.is_empty()
-                        || self.bind_addresses.iter().any(|address| address == &local),
-                    "link {} local_bind must match the endpoint bind address when bind_addresses is configured",
-                    link.name
-                );
-            }
             for remote in &link.remote_addresses {
                 ensure!(
                     remote.port() != 0,
@@ -1098,18 +1159,6 @@ impl Config {
                     remotes.insert(*remote),
                     "private remote address {remote} is assigned to multiple links"
                 );
-                ensure!(
-                    !link.allowed_remote_prefixes.is_empty(),
-                    "link {} requires allowed_remote_prefixes",
-                    link.name
-                );
-                ensure!(
-                    link.allowed_remote_prefixes
-                        .iter()
-                        .any(|prefix| prefix.contains(&remote.ip())),
-                    "link {} remote address {remote} is outside allowed_remote_prefixes",
-                    link.name
-                );
             }
         }
         Ok(())
@@ -1117,15 +1166,6 @@ impl Config {
 
     pub fn link_for_peer(&self, peer_id: EndpointId) -> Option<&LinkConfig> {
         self.links.iter().find(|link| link.peer_id == peer_id)
-    }
-
-    pub fn private_locator_prefixes(&self) -> impl Iterator<Item = IpNet> + '_ {
-        self.links.iter().flat_map(|link| {
-            link.allowed_local_prefixes
-                .iter()
-                .chain(&link.allowed_remote_prefixes)
-                .copied()
-        })
     }
 
     pub fn static_underlay_addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -1140,57 +1180,10 @@ impl Config {
     }
 
     pub fn endpoint_bind_addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
-        self.bind_addresses
-            .iter()
-            .copied()
-            .chain(self.links.iter().filter_map(|link| {
-                self.bind_addresses
-                    .is_empty()
-                    .then_some(link.local_bind)
-                    .flatten()
-            }))
+        self.bind_addresses.iter().copied()
     }
 
     fn validate_relay(&self) -> Result<()> {
-        if !self.relay.iroh_relay_enabled {
-            ensure!(
-                self.relay.urls.is_empty() && self.relay.discovery_urls.is_empty(),
-                "relay.urls and relay.discovery_urls require relay.iroh_relay_enabled = true"
-            );
-            ensure!(
-                self.peers.iter().all(|peer| peer.relay_urls.is_empty()),
-                "peer relay_urls require relay.iroh_relay_enabled = true"
-            );
-        }
-        if !self.relay.urls.is_empty() {
-            ensure!(
-                self.relay.urls.len() >= 2,
-                "relay.urls requires at least two URLs for redundancy"
-            );
-            let mut unique = HashSet::new();
-            for url in &self.relay.urls {
-                url.parse::<RelayUrl>()
-                    .context("invalid relay.urls entry")?;
-                ensure!(unique.insert(url), "duplicate relay URL {url}");
-            }
-        }
-
-        if !self.relay.discovery_urls.is_empty() {
-            ensure!(
-                self.relay.discovery_urls.len() >= 2,
-                "relay.discovery_urls requires at least two URLs to classify NAT mappings"
-            );
-            let mut unique = self.relay.urls.iter().collect::<HashSet<_>>();
-            for url in &self.relay.discovery_urls {
-                url.parse::<RelayUrl>()
-                    .context("invalid relay.discovery_urls entry")?;
-                ensure!(
-                    unique.insert(url),
-                    "duplicate iroh relay/discovery URL {url}"
-                );
-            }
-        }
-
         if !self.relay.derp_enabled() {
             return self.ensure_no_derp_peer_keys();
         }
@@ -1271,17 +1264,10 @@ impl Config {
             .chain(self.all_remote_prefixes())
     }
 
-    /// Whether Linux must forward packets from the FlowRouter TUN to a local
+    /// Whether Linux must forward packets from the V2 dataplane TUN to a local
     /// LAN/service interface. Overlay transit itself stays in userspace.
     pub fn requires_forwarding(&self) -> bool {
         !self.advertised_prefixes.is_empty()
-    }
-
-    pub fn inherited_peer_relays(&self) -> Result<Vec<RelayUrl>> {
-        self.relay
-            .iroh_urls()
-            .map(|url| url.parse().context("invalid relay.urls entry"))
-            .collect()
     }
 
     pub fn derp_servers(&self) -> Result<Vec<DerpServer>> {
@@ -1375,118 +1361,6 @@ fn is_default_tun_mtu(value: &u16) -> bool {
     *value == default_tun_mtu()
 }
 
-fn default_max_frame_size() -> u16 {
-    1400
-}
-
-fn is_default_max_frame_size(value: &u16) -> bool {
-    *value == default_max_frame_size()
-}
-
-pub const fn default_quic_send_buffer_bytes() -> usize {
-    128 * 1024
-}
-
-fn is_default_quic_send_buffer_bytes(value: &usize) -> bool {
-    *value == default_quic_send_buffer_bytes()
-}
-
-pub const fn default_quic_receive_buffer_bytes() -> usize {
-    8 * 1024 * 1024
-}
-
-fn is_default_quic_receive_buffer_bytes(value: &usize) -> bool {
-    *value == default_quic_receive_buffer_bytes()
-}
-
-pub const fn default_quic_data_lanes() -> usize {
-    2
-}
-
-fn is_default_quic_data_lanes(value: &usize) -> bool {
-    *value == default_quic_data_lanes()
-}
-
-pub const fn default_quic_initial_rtt_millis() -> u64 {
-    100
-}
-
-fn is_default_quic_initial_rtt_millis(value: &u64) -> bool {
-    *value == default_quic_initial_rtt_millis()
-}
-
-pub const fn default_quic_initial_mtu() -> u16 {
-    1_400
-}
-
-pub const fn default_quic_mtu_black_hole_cooldown_millis() -> u64 {
-    10_000
-}
-
-fn is_default_quic_mtu_black_hole_cooldown_millis(value: &u64) -> bool {
-    *value == default_quic_mtu_black_hole_cooldown_millis()
-}
-
-fn is_default_quic_initial_mtu(value: &u16) -> bool {
-    *value == default_quic_initial_mtu()
-}
-
-pub const fn default_quic_keep_alive_millis() -> u64 {
-    1_000
-}
-
-fn is_default_quic_keep_alive_millis(value: &u64) -> bool {
-    *value == default_quic_keep_alive_millis()
-}
-
-pub const fn default_quic_passthrough_window_bytes() -> u64 {
-    16 * 1024 * 1024
-}
-
-fn is_default_quic_passthrough_window_bytes(value: &u64) -> bool {
-    *value == default_quic_passthrough_window_bytes()
-}
-
-pub const fn default_quic_adaptive_initial_mbps() -> u64 {
-    850
-}
-
-fn is_default_quic_adaptive_initial_mbps(value: &u64) -> bool {
-    *value == default_quic_adaptive_initial_mbps()
-}
-
-pub const fn default_quic_adaptive_min_mbps() -> u64 {
-    100
-}
-
-fn is_default_quic_adaptive_min_mbps(value: &u64) -> bool {
-    *value == default_quic_adaptive_min_mbps()
-}
-
-pub const fn default_quic_adaptive_max_mbps() -> u64 {
-    950
-}
-
-fn is_default_quic_adaptive_max_mbps(value: &u64) -> bool {
-    *value == default_quic_adaptive_max_mbps()
-}
-
-pub const fn default_quic_adaptive_loss_backoff_bps() -> u16 {
-    50
-}
-
-fn is_default_quic_adaptive_loss_backoff_bps(value: &u16) -> bool {
-    *value == default_quic_adaptive_loss_backoff_bps()
-}
-
-pub const fn default_quic_pacing_quantum_bytes() -> u64 {
-    8 * 1024
-}
-
-fn is_default_quic_pacing_quantum_bytes(value: &u64) -> bool {
-    *value == default_quic_pacing_quantum_bytes()
-}
-
 fn default_node_interface() -> String {
     "ironet0".into()
 }
@@ -1511,30 +1385,6 @@ fn is_default_rule_priority(value: &u32) -> bool {
     *value == default_rule_priority()
 }
 
-fn default_status_file() -> PathBuf {
-    "/run/ironet/status.json".into()
-}
-
-fn is_default_status_file(value: &Path) -> bool {
-    value == default_status_file()
-}
-
-fn default_metrics_file() -> PathBuf {
-    "/run/ironet/metrics.prom".into()
-}
-
-fn is_default_metrics_file(value: &Path) -> bool {
-    value == default_metrics_file()
-}
-
-fn default_report_interval() -> u64 {
-    10
-}
-
-fn is_default_report_interval(value: &u64) -> bool {
-    *value == default_report_interval()
-}
-
 fn default_mesh_max_peers() -> usize {
     12
 }
@@ -1543,29 +1393,20 @@ fn is_default_mesh_max_peers(value: &usize) -> bool {
     *value == default_mesh_max_peers()
 }
 
-fn default_fec_data_shards() -> u8 {
-    8
+pub const fn default_dns_listen_port() -> u16 {
+    1053
 }
-fn is_default_fec_data_shards(value: &u8) -> bool {
-    *value == default_fec_data_shards()
+
+fn is_default_dns_listen_port(value: &u16) -> bool {
+    *value == default_dns_listen_port()
 }
-fn default_fec_recovery_shards() -> u8 {
-    2
+
+pub const fn default_dns_ttl_secs() -> u32 {
+    5
 }
-fn is_default_fec_recovery_shards(value: &u8) -> bool {
-    *value == default_fec_recovery_shards()
-}
-fn default_fec_block_timeout() -> u64 {
-    20
-}
-fn is_default_fec_block_timeout(value: &u64) -> bool {
-    *value == default_fec_block_timeout()
-}
-fn default_fec_decoder_ttl() -> u64 {
-    2_000
-}
-fn is_default_fec_decoder_ttl(value: &u64) -> bool {
-    *value == default_fec_decoder_ttl()
+
+fn is_default_dns_ttl_secs(value: &u32) -> bool {
+    *value == default_dns_ttl_secs()
 }
 
 fn validate_overlay_prefix(prefix: IpNet, allow_default_routes: bool) -> Result<()> {
@@ -1601,6 +1442,31 @@ fn validate_overlay_prefix(prefix: IpNet, allow_default_routes: bool) -> Result<
     Ok(())
 }
 
+fn validate_dns_domain(domain: &str) -> Result<()> {
+    let domain = domain.trim_end_matches('.');
+    ensure!(!domain.is_empty(), "dns.domain cannot be empty");
+    ensure!(domain.len() <= 253, "dns.domain cannot exceed 253 bytes");
+    ensure!(
+        domain.split('.').count() >= 2,
+        "dns.domain must contain at least two labels"
+    );
+    for label in domain.split('.') {
+        ensure!(!label.is_empty(), "dns.domain contains an empty label");
+        ensure!(label.len() <= 63, "dns.domain label exceeds 63 bytes");
+        ensure!(
+            !label.starts_with('-') && !label.ends_with('-'),
+            "dns.domain labels cannot start or end with '-'"
+        );
+        ensure!(
+            label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "dns.domain labels may only contain letters, digits and '-'"
+        );
+    }
+    Ok(())
+}
+
 fn prefixes_overlap(left: IpNet, right: IpNet) -> bool {
     left.addr().is_ipv4() == right.addr().is_ipv4()
         && (left.contains(&right.network()) || right.contains(&left.network()))
@@ -1608,665 +1474,417 @@ fn prefixes_overlap(left: IpNet, right: IpNet) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use iroh::SecretKey;
-
     use super::*;
 
     #[test]
-    fn udp_gso_policy_accepts_auto_and_legacy_booleans() {
-        let example: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        assert_eq!(
-            example.udp_segmentation_offload,
-            UdpSegmentationOffload::Auto
-        );
+    fn minimal_v2_config_uses_automatic_dataplane_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
 
-        let disabled = include_str!("../config/example.toml").replace(
-            "udp_segmentation_offload = \"auto\"",
-            "udp_segmentation_offload = false",
-        );
-        let disabled: Config = toml::from_str(&disabled).unwrap();
-        assert_eq!(
-            disabled.udp_segmentation_offload,
-            UdpSegmentationOffload::Disabled
-        );
-        let enabled = include_str!("../config/example.toml").replace(
-            "udp_segmentation_offload = \"auto\"",
-            "udp_segmentation_offload = true",
-        );
-        let enabled: Config = toml::from_str(&enabled).unwrap();
-        assert_eq!(
-            enabled.udp_segmentation_offload,
-            UdpSegmentationOffload::Enabled
-        );
-    }
-
-    #[test]
-    fn transit_node_info_does_not_require_an_attachment_address() {
-        let config = Config {
-            network_id: "example".into(),
-            identity_file: "identity.key".into(),
-            bind_addresses: Vec::new(),
-            excluded_underlay_prefixes: Vec::new(),
-            discovery_enabled: true,
-            attachment: AttachmentMode::Tun,
-            tun_mtu: 1280,
-            max_frame_size: 1400,
-            udp_segmentation_offload: UdpSegmentationOffload::Disabled,
-            quic_auto_tune: true,
-            quic_cipher_preference: QuicCipherPreference::default(),
-            quic_send_buffer_bytes: default_quic_send_buffer_bytes(),
-            quic_receive_buffer_bytes: default_quic_receive_buffer_bytes(),
-            quic_data_lanes: default_quic_data_lanes(),
-            quic_congestion_controller: QuicCongestionController::default(),
-            quic_initial_rtt_millis: default_quic_initial_rtt_millis(),
-            quic_initial_mtu: default_quic_initial_mtu(),
-            quic_mtu_discovery_enabled: false,
-            quic_mtu_black_hole_cooldown_millis: default_quic_mtu_black_hole_cooldown_millis(),
-            quic_keep_alive_millis: default_quic_keep_alive_millis(),
-            quic_passthrough_window_bytes: default_quic_passthrough_window_bytes(),
-            quic_passthrough_pacing_mbps: None,
-            quic_adaptive_initial_mbps: default_quic_adaptive_initial_mbps(),
-            quic_adaptive_min_mbps: default_quic_adaptive_min_mbps(),
-            quic_adaptive_max_mbps: default_quic_adaptive_max_mbps(),
-            quic_adaptive_loss_backoff_bps: default_quic_adaptive_loss_backoff_bps(),
-            quic_pacing_quantum_bytes: default_quic_pacing_quantum_bytes(),
-            node_interface: "ironet0".into(),
-            node_addresses: Vec::new(),
-            advertised_prefixes: Vec::new(),
-            node_info: Some(NodeInfo {
-                name: "branch-a".into(),
-                description: None,
-                metadata: BTreeMap::new(),
-            }),
-            path_selection: PathSelectionConfig::default(),
-            relay: RelayConfig::default(),
-            peers: Vec::new(),
-            links: Vec::new(),
-            route_origins: Vec::new(),
-            routing: RoutingConfig::default(),
-            mesh: MeshConfig::default(),
-            packet_policy: PacketPolicyConfig::default(),
-            fec: FecConfig::default(),
-            observability: ObservabilityConfig::default(),
-        };
-
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn node_address_uses_the_first_address_in_each_family() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.node_addresses = vec![
-            "21.0.0.9/32".parse().unwrap(),
-            "21::9/128".parse().unwrap(),
-            "21.0.0.1/32".parse().unwrap(),
-            "21::1/128".parse().unwrap(),
-        ];
-
-        assert_eq!(config.node_address(true), Some("21.0.0.9".parse().unwrap()));
-        assert_eq!(config.node_address(false), Some("21::9".parse().unwrap()));
-    }
-
-    #[test]
-    fn example_configuration_is_valid() {
-        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.relay, RelayConfig::default());
-        assert_eq!(config.path_selection.prefer, IpFamilyPreference::Ipv6);
-        assert!(!config.routing.transit_enabled);
-    }
-
-    #[test]
-    fn underlay_address_family_preference_is_user_selectable() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            path_selection: PathSelectionConfig,
-        }
-
-        let defaults: Wrapper = toml::from_str("").unwrap();
-        assert_eq!(defaults.path_selection.prefer, IpFamilyPreference::Ipv6);
-        let ipv4: Wrapper = toml::from_str("[path_selection]\nprefer = \"ipv4\"").unwrap();
-        assert_eq!(ipv4.path_selection.prefer, IpFamilyPreference::Ipv4);
-    }
-
-    #[test]
-    fn default_sections_and_resolved_routes_are_omitted_when_serializing() {
-        let remote = SecretKey::from_bytes(&[31; 32]).public();
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.node_info = None;
-        config.route_origins = vec![RouteOriginConfig {
-            endpoint_id: remote,
-            prefixes: vec!["10.31.0.0/16".parse().unwrap()],
-        }];
-        let encoded = toml::to_string_pretty(&config).unwrap();
-        assert!(!encoded.contains("route_origins"));
-        assert!(!encoded.contains("[routing]"));
-        assert!(!encoded.contains("[mesh]"));
-        assert!(!encoded.contains("[packet_policy]"));
-        assert!(!encoded.contains("[fec]"));
-        assert!(!encoded.contains("[observability]"));
-    }
-
-    #[tokio::test]
-    async fn sealed_config_loads_state_route_registry() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        let mut source: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        source.identity_file = dir.path().join("state/identity.key");
-        let contents = toml::to_string_pretty(&source).unwrap().into_bytes();
-        std::fs::write(&config_path, &contents).unwrap();
-        std::fs::write(
-            config_digest_path(&config_path),
-            format!("{}\n", blake3::hash(&contents).to_hex()),
+[cover]
+sni_pool = ["cdn.live.example"]
+profile_id = 7
+"#,
         )
         .unwrap();
-        let remote = SecretKey::from_bytes(&[32; 32]).public();
-        crate::routes::RouteRegistry {
-            version: 1,
-            routes: vec![RouteOriginConfig {
-                endpoint_id: remote,
-                prefixes: vec!["10.32.0.0/16".parse().unwrap()],
-            }],
-        }
-        .write(&source.route_registry_path())
-        .unwrap();
-
-        let config = Config::load(&config_path).await.unwrap();
-        assert_eq!(config.route_origins.len(), 1);
-        assert_eq!(
-            config.all_remote_prefixes().collect::<Vec<_>>(),
-            vec!["10.32.0.0/16".parse().unwrap()]
-        );
-    }
-
-    #[test]
-    fn omitted_relay_disables_derp_and_iroh_relays() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            relay: RelayConfig,
-        }
-
-        let wrapper: Wrapper = toml::from_str("").unwrap();
-        assert!(!wrapper.relay.iroh_relay_enabled);
-        assert!(wrapper.relay.urls.is_empty());
-        assert!(wrapper.relay.discovery_urls.is_empty());
-        assert!(wrapper.relay.servers.is_empty());
-    }
-
-    #[test]
-    fn qad_discovery_requires_two_unique_observation_urls() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.relay.iroh_relay_enabled = true;
-        config.relay.discovery_urls = vec!["https://qad-a.example.com".into()];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("at least two URLs")
-        );
-        config
-            .relay
-            .discovery_urls
-            .push("https://qad-b.example.com".into());
         config.validate().unwrap();
-        assert_eq!(config.inherited_peer_relays().unwrap().len(), 2);
-        config.relay.urls = vec![
-            "https://relay-a.example.com".into(),
-            "https://relay-b.example.com".into(),
-        ];
-        config.relay.discovery_urls[0] = "https://relay-a.example.com".into();
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate iroh relay/discovery URL")
-        );
+        assert_eq!(config.tun_mtu, u16::MAX);
+        assert_eq!(config.node_interface, "ironet0");
+        assert_eq!(config.cover.profile_id, 7);
+        assert_eq!(config.autotune, AutotuneConfig::default());
+        assert_eq!(config.path_migration, PathMigrationConfig::default());
     }
 
     #[test]
-    fn optional_local_egress_cap_is_validated() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        assert_eq!(config.routing.max_egress_bps(), None);
-        config.routing.max_egress_mbps = Some(80);
-        assert_eq!(config.routing.max_egress_bps(), Some(80_000_000));
-        config.routing.max_egress_mbps = Some(0);
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("routing.max_egress_mbps")
-        );
-    }
+    fn path_migration_guardrails_are_runtime_configurable_and_validated() {
+        let config: Config = toml::from_str(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
 
-    #[test]
-    fn mesh_peer_limit_is_a_hard_validated_bound() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.mesh.max_peers = 0;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("between 1 and 32")
-        );
-        config.mesh.max_peers = 33;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("between 1 and 32")
-        );
-
-        config.mesh.max_peers = 1;
-        let peer = SecretKey::from_bytes(&[12; 32]).public();
-        config.peers = vec![
-            PeerConfig {
-                name: "one".into(),
-                endpoint_id: peer,
-                transit_enabled: false,
-                direct_addresses: Vec::new(),
-                relay_urls: Vec::new(),
-                derp_public_key: None,
-                allowed_source_prefixes: Vec::new(),
-            },
-            PeerConfig {
-                name: "two".into(),
-                endpoint_id: SecretKey::from_bytes(&[13; 32]).public(),
-                transit_enabled: false,
-                direct_addresses: Vec::new(),
-                relay_urls: Vec::new(),
-                derp_public_key: None,
-                allowed_source_prefixes: Vec::new(),
-            },
-        ];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("configured peers exceed mesh.max_peers")
-        );
-    }
-
-    #[test]
-    fn transit_is_disabled_when_omitted() {
-        let routing: RoutingConfig = toml::from_str(
-            "isolate_overlay = true\nrule_priority = 10000\nallow_default_routes = false\n",
+[path_migration]
+pto_threshold = 6
+min_pto_silence_ms = 300
+min_silence_ms = 1200
+max_silence_ms = 7000
+recovery_probation_ms = 2500
+recovery_max_response_gap_ms = 1800
+recovery_min_responses = 4
+health_ttl_secs = 600
+rtt_switch_margin_ms = 8
+keep_alive_ms = 200
+idle_timeout_ms = 20000
+"#,
         )
         .unwrap();
-        assert!(!routing.transit_enabled);
-        assert!(routing.nat_enabled);
-    }
-
-    #[test]
-    fn advertised_prefix_nat_can_be_disabled_explicitly() {
-        let routing: RoutingConfig = toml::from_str("nat_enabled = false\n").unwrap();
-        assert!(!routing.nat_enabled);
-    }
-
-    #[test]
-    fn kernel_forwarding_is_required_only_for_local_lan_routes() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        assert!(config.requires_forwarding());
-
-        config.advertised_prefixes.clear();
-        assert!(!config.requires_forwarding());
-
-        config.routing.transit_enabled = true;
-        assert!(!config.requires_forwarding());
-    }
-
-    #[test]
-    fn attachment_none_is_a_transit_only_configuration() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.attachment = AttachmentMode::None;
-        config.node_addresses.clear();
-        config.advertised_prefixes.clear();
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires routing.transit_enabled")
-        );
-        config.routing.transit_enabled = true;
         config.validate().unwrap();
+        assert_eq!(config.path_migration.pto_threshold, 6);
+        assert_eq!(config.path_migration.idle_timeout_ms, 20_000);
+
+        let mut invalid = config;
+        invalid.path_migration.idle_timeout_ms = 1_000;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
-    fn pairwise_link_rejects_public_fallback_and_accepts_private_locator() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.node_info = None;
-        let endpoint_id = SecretKey::from_bytes(&[41; 32]).public();
-        config.peers.push(PeerConfig {
-            name: "private-b".into(),
-            endpoint_id,
-            transit_enabled: true,
-            direct_addresses: Vec::new(),
-            relay_urls: Vec::new(),
-            derp_public_key: None,
-            allowed_source_prefixes: Vec::new(),
-        });
-        config.links.push(LinkConfig {
-            id: "iepl-ab".into(),
-            name: "iepl-ab".into(),
-            peer_id: endpoint_id,
-            class: LinkClass::PrivateCircuit,
-            visibility: LinkVisibility::Pairwise,
-            dial: DialRole::Active,
-            exclusive: true,
-            fallback: false,
-            local_bind: Some("10.255.0.1:4000".parse().unwrap()),
-            remote_addresses: vec!["10.255.0.2:4000".parse().unwrap()],
-            allowed_local_prefixes: vec!["10.255.0.1/32".parse().unwrap()],
-            allowed_remote_prefixes: vec!["10.255.0.2/32".parse().unwrap()],
-            auth_key: "11".repeat(32),
-        });
+    fn autotune_is_typed_strict_and_requires_absolute_artifact_paths() {
+        let config: Config = toml::from_str(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+
+[autotune]
+mode = "on"
+objective = "throughput"
+memory = false
+policy = "/etc/ironet/policy.v2.wasm"
+shadow_policy = "/etc/ironet/policy.next.wasm"
+
+[autotune.wasm]
+require_signature = false
+digest_pins = ["blake3:abababababababababababababababababababababababababababababababab"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.autotune.mode, AutotuneMode::On);
+        assert_eq!(config.autotune.objective, AutotuneObjective::Throughput);
+        assert!(!config.autotune.memory);
+
+        let mut invalid = config.clone();
+        invalid.autotune.policy = "relative.wasm".to_owned();
+        assert!(invalid.validate().is_err());
+
+        let error = toml::from_str::<Config>(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+[autotune]
+manual_gain = 1.2
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn autotune_policy_accepts_native_builtin_and_signed_wasm_paths() {
+        let mut config: Config = toml::from_str(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+
+[autotune]
+policy = "native"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.autotune.policy, AUTOTUNE_POLICY_NATIVE);
+        assert!(!config.autotune.uses_wasm_artifact());
+
+        config.autotune.policy = AUTOTUNE_POLICY_BUILTIN.to_owned();
         config.validate().unwrap();
 
-        config.peers[0].direct_addresses = vec!["203.0.113.20:4000".parse().unwrap()];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("cannot also publish")
-        );
-    }
-
-    #[test]
-    fn derp_servers_enable_transport_and_require_peer_keys() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.relay = RelayConfig {
-            iroh_relay_enabled: false,
-            urls: Vec::new(),
-            discovery_urls: Vec::new(),
-            servers: vec![
-                "https://derp-a.example.com".into(),
-                "https://derp-b.example.com/derp".into(),
-            ],
-        };
-        let peer = PeerConfig {
-            name: "peer".into(),
-            endpoint_id: SecretKey::from_bytes(&[21; 32]).public(),
-            transit_enabled: false,
-            direct_addresses: Vec::new(),
-            relay_urls: Vec::new(),
-            derp_public_key: Some(DerpPublicKey::from_bytes([22; 32])),
-            allowed_source_prefixes: vec!["10.200.0.2/32".parse().unwrap()],
-        };
-        config.peers = vec![peer.clone()];
-        config.route_origins = vec![RouteOriginConfig {
-            endpoint_id: peer.endpoint_id,
-            prefixes: vec!["10.200.0.2/32".parse().unwrap()],
-        }];
+        // External policies are `.wasm` components gated by the trust store.
+        config.autotune.policy = "/etc/ironet/policy.wasm".to_owned();
+        config.autotune.wasm.require_signature = false;
+        config.autotune.wasm.digest_pins = vec![format!("blake3:{}", "ab".repeat(32))];
         config.validate().unwrap();
-        assert!(config.relay.derp_enabled());
-        let regions = config.derp_servers().unwrap();
-        assert_eq!(regions.len(), 2);
-        assert_ne!(regions[0].region_id, regions[1].region_id);
-        config.peers[0].derp_public_key = None;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires derp_public_key")
-        );
-    }
 
-    #[test]
-    fn derp_and_iroh_relays_can_be_configured_together() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        let peer = PeerConfig {
-            name: "peer".into(),
-            endpoint_id: SecretKey::from_bytes(&[23; 32]).public(),
-            transit_enabled: false,
-            direct_addresses: Vec::new(),
-            relay_urls: vec![
-                "https://peer-relay-a.example.com".into(),
-                "https://peer-relay-b.example.com".into(),
-            ],
-            derp_public_key: Some(DerpPublicKey::from_bytes([24; 32])),
-            allowed_source_prefixes: vec!["10.201.0.2/32".parse().unwrap()],
-        };
-        config.relay = RelayConfig {
-            iroh_relay_enabled: true,
-            urls: vec![
-                "https://relay-a.example.com".into(),
-                "https://relay-b.example.com".into(),
-            ],
-            discovery_urls: Vec::new(),
-            servers: vec!["https://derp.example.com".into()],
-        };
-        config.peers = vec![peer.clone()];
-        config.route_origins = vec![RouteOriginConfig {
-            endpoint_id: peer.endpoint_id,
-            prefixes: vec!["10.201.0.2/32".parse().unwrap()],
-        }];
-
-        config.validate().unwrap();
-        assert_eq!(config.inherited_peer_relays().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn iroh_relay_requires_explicit_opt_in() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.relay.urls = vec![
-            "https://relay-a.example.com".into(),
-            "https://relay-b.example.com".into(),
-        ];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("iroh_relay_enabled")
-        );
-    }
-
-    #[test]
-    fn relay_mode_is_not_a_supported_configuration_field() {
-        let error = toml::from_str::<RelayConfig>("mode = \"derp\"").unwrap_err();
-        assert!(error.to_string().contains("unknown field `mode`"));
-    }
-
-    #[test]
-    fn fec_configuration_rejects_unsafe_bounds() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.fec.data_shards = 1;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("data_shards")
-        );
-        config.fec.data_shards = 8;
-        config.fec.recovery_shards = 0;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("recovery_shards")
-        );
-        config.fec.recovery_shards = 2;
-        config.fec.decoder_ttl_millis = config.fec.block_timeout_millis - 1;
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("decoder_ttl_millis")
-        );
-    }
-
-    #[test]
-    fn default_route_requires_explicit_enablement() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.advertised_prefixes = vec!["0.0.0.0/0".parse().unwrap()];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("allow_default_routes")
-        );
-    }
-
-    #[test]
-    fn excluded_underlay_prefix_rejects_bind_and_peer_addresses() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.excluded_underlay_prefixes = vec!["200::/7".parse().unwrap()];
-        config.bind_addresses = vec!["[200:1234::1]:4000".parse().unwrap()];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("bind address")
-        );
-
-        config.bind_addresses.clear();
-        config.packet_policy.enforce_overlay_prefixes = false;
-        config.peers.push(PeerConfig {
-            name: "ygg-peer".into(),
-            endpoint_id: SecretKey::from_bytes(&[9; 32]).public(),
-            transit_enabled: false,
-            direct_addresses: vec!["[201:2345::1]:4000".parse().unwrap()],
-            relay_urls: Vec::new(),
-            derp_public_key: None,
-            allowed_source_prefixes: Vec::new(),
-        });
+        // External JSON artifacts were removed in Phase 6: a clear migration
+        // error, not a silent fallback.
+        config.autotune.policy = "/etc/ironet/policy.json".to_owned();
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("ygg-peer direct address"));
-        assert!(error.contains("200::/7"));
-    }
+        assert!(error.contains("JSON"), "{error}");
+        let mut shadow_json = config.clone();
+        shadow_json.autotune.policy = AUTOTUNE_POLICY_BUILTIN.to_owned();
+        shadow_json.autotune.shadow_policy = Some(PathBuf::from("/etc/ironet/next.json"));
+        let error = shadow_json.validate().unwrap_err().to_string();
+        assert!(error.contains("JSON"), "{error}");
 
-    #[test]
-    fn excluded_underlay_prefix_matches_both_address_families() {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.excluded_underlay_prefixes =
-            vec!["100.64.0.0/10".parse().unwrap(), "200::/7".parse().unwrap()];
-        assert_eq!(
-            config.excluded_underlay_prefix("100.96.0.1".parse().unwrap()),
-            Some("100.64.0.0/10".parse().unwrap())
-        );
-        assert_eq!(
-            config.excluded_underlay_prefix("203:abcd::1".parse().unwrap()),
-            Some("200::/7".parse().unwrap())
-        );
-        assert_eq!(
-            config.excluded_underlay_prefix("203.0.113.1".parse().unwrap()),
-            None
-        );
-    }
-
-    #[test]
-    fn legacy_forbidden_underlay_prefixes_loads_but_serializes_canonically() {
-        let source = format!(
-            "forbidden_underlay_prefixes = [\"100.64.0.0/10\"]\n{}",
-            include_str!("../config/example.toml")
-        );
-        let config: Config = toml::from_str(&source).unwrap();
-        assert_eq!(
-            config.excluded_underlay_prefixes,
-            vec!["100.64.0.0/10".parse().unwrap()]
-        );
-        let encoded = toml::to_string_pretty(&config).unwrap();
-        assert!(encoded.contains("excluded_underlay_prefixes"));
-        assert!(!encoded.contains("forbidden_underlay_prefixes"));
-    }
-
-    #[test]
-    fn packet_policy_requires_per_adjacency_sources() {
-        let peer = PeerConfig {
-            name: "peer".into(),
-            endpoint_id: SecretKey::from_bytes(&[8; 32]).public(),
-            transit_enabled: false,
-            direct_addresses: Vec::new(),
-            relay_urls: Vec::new(),
-            derp_public_key: None,
-            allowed_source_prefixes: Vec::new(),
-        };
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.mesh.enabled = false;
-        config.peers = vec![peer.clone()];
-        config.route_origins = vec![RouteOriginConfig {
-            endpoint_id: peer.endpoint_id,
-            prefixes: vec!["10.201.0.1/32".parse().unwrap()],
-        }];
+        config.autotune.policy = "NATIVE".to_owned();
+        let error = config.validate().unwrap_err().to_string();
         assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("allowed_source_prefixes")
+            error.contains("native, builtin or an absolute .wasm path"),
+            "{error}"
         );
-        config.peers[0].allowed_source_prefixes = vec!["10.202.0.1/32".parse().unwrap()];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not an exact remote route-origin prefix")
-        );
+        config.autotune.policy = String::new();
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn remote_prefix_ownership_cannot_overlap() {
-        let first = SecretKey::from_bytes(&[3; 32]).public();
-        let second = SecretKey::from_bytes(&[4; 32]).public();
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.route_origins = vec![
-            RouteOriginConfig {
-                endpoint_id: first,
-                prefixes: vec!["10.20.0.0/16".parse().unwrap()],
-            },
-            RouteOriginConfig {
-                endpoint_id: second,
-                prefixes: vec!["10.20.1.0/24".parse().unwrap()],
-            },
-        ];
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("overlaps")
-        );
-    }
-
-    #[tokio::test]
-    async fn detects_configuration_tampering() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.identity_file = dir.path().join("state/identity.key");
-        let contents = toml::to_string_pretty(&config).unwrap().into_bytes();
-        std::fs::write(&path, &contents).unwrap();
-        std::fs::write(
-            config_digest_path(&path),
-            format!("{}\n", blake3::hash(&contents).to_hex()),
+    fn autotune_wasm_defaults_follow_documented_budget() {
+        let config: Config = toml::from_str(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+"#,
         )
         .unwrap();
-        Config::load(&path).await.unwrap();
-        std::fs::write(&path, [contents.as_slice(), b"\n# changed\n"].concat()).unwrap();
+        config.validate().unwrap();
+        let wasm = &config.autotune.wasm;
+        assert_eq!(*wasm, AutotuneWasmConfig::default());
+        assert!(wasm.require_signature);
+        assert_eq!(wasm.maximum_module_bytes, 8_388_608);
+        assert_eq!(wasm.maximum_memory_bytes, 8_388_608);
+        assert_eq!(wasm.maximum_state_bytes, 65_536);
+        assert_eq!(wasm.deadline_millis, 10);
+        assert_eq!(wasm.state_flush_interval_secs, 60);
+        assert!(wasm.signers.is_empty());
+        assert!(wasm.digest_pins.is_empty());
+        // Defaults stay out of the serialized form so sealed files remain small.
         assert!(
-            Config::load(&path)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("integrity check failed")
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("[autotune.wasm]")
         );
+    }
+
+    const AUTOTUNE_WASM_EXAMPLE: &str = r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+
+[autotune]
+mode = "shadow"
+objective = "balanced"
+memory = true
+policy = "/etc/ironet/policy.wasm"
+shadow_policy = "/etc/ironet/policy.next.wasm"
+
+[autotune.wasm]
+require_signature = true
+maximum_module_bytes = 8388608
+maximum_memory_bytes = 8388608
+maximum_state_bytes = 65536
+deadline_millis = 10
+state_flush_interval_secs = 60
+
+[[autotune.wasm.signers]]
+signer_id = "ops-2026"
+public_key = "ed25519:AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ"
+minimum_policy_version = 3
+expires_at = "2027-01-01T00:00:00Z"
+
+[[autotune.wasm.signers]]
+signer_id = "ops-2025"
+public_key = "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+
+    fn wasm_example() -> Config {
+        let config: Config = toml::from_str(AUTOTUNE_WASM_EXAMPLE).unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    #[test]
+    fn autotune_wasm_full_example_parses_and_round_trips() {
+        let config = wasm_example();
+        assert!(config.autotune.uses_wasm_artifact());
+        let wasm = &config.autotune.wasm;
+        assert_eq!(wasm.signers.len(), 2);
+        assert_eq!(wasm.signers[0].signer_id, "ops-2026");
+        assert_eq!(wasm.signers[0].minimum_policy_version, 3);
+        assert_eq!(
+            wasm.signers[0].expires_at.as_deref(),
+            Some("2027-01-01T00:00:00Z")
+        );
+        assert_eq!(wasm.signers[1].minimum_policy_version, 0);
+        assert!(wasm.signers[1].expires_at.is_none());
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.autotune, config.autotune);
+
+        let error = toml::from_str::<Config>(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+[autotune.wasm]
+fuel = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn autotune_wasm_unsigned_mode_requires_digest_pins_for_wasm_paths() {
+        let mut config = wasm_example();
+        config.autotune.wasm.require_signature = false;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("digest_pins"), "{error}");
+
+        config.autotune.wasm.digest_pins = vec![format!("blake3:{}", "ab".repeat(32))];
+        config.validate().unwrap();
+
+        // JSON artifacts were removed: they no longer reach the trust-store
+        // logic at all because the path itself is a migration error.
+        let mut json = wasm_example();
+        json.autotune.policy = "/etc/ironet/policy.json".to_owned();
+        json.autotune.shadow_policy = None;
+        assert!(json.validate().is_err());
+
+        // A .wasm shadow policy alone is enough to require pins.
+        let mut shadow_only = wasm_example();
+        shadow_only.autotune.policy = AUTOTUNE_POLICY_BUILTIN.to_owned();
+        shadow_only.autotune.wasm.require_signature = false;
+        shadow_only.autotune.wasm.digest_pins = vec![format!("blake3:{}", "ab".repeat(32))];
+        shadow_only.validate().unwrap();
+        shadow_only.autotune.wasm.digest_pins.clear();
+        assert!(shadow_only.validate().is_err());
+    }
+
+    #[test]
+    fn autotune_wasm_signed_mode_requires_a_signer_for_wasm_paths() {
+        let mut config = wasm_example();
+        config.autotune.wasm.signers.clear();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("[[autotune.wasm.signers]]"), "{error}");
+    }
+
+    #[test]
+    fn autotune_wasm_public_key_format_is_validated() {
+        for bad in [
+            "AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ",
+            "rsa:AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ",
+            "ed25519:",
+            "ed25519:abcd",
+            "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefff",
+            "ed25519:AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYP1",
+        ] {
+            let mut config = wasm_example();
+            config.autotune.wasm.signers[0].public_key = bad.to_owned();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("public_key"), "{bad}: {error}");
+        }
+        let mut config = wasm_example();
+        config.autotune.wasm.signers[0].public_key =
+            "ed25519:aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq====".to_owned();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn autotune_wasm_digest_pin_format_is_validated() {
+        for bad in ["", "blake3:", "sha256:abcd", "blake3:abcd"] {
+            let mut config = wasm_example();
+            config.autotune.wasm.digest_pins = vec![bad.to_owned()];
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("digest_pins"), "{bad}: {error}");
+        }
+        let mut config = wasm_example();
+        config.autotune.wasm.digest_pins = vec![format!("blake3:{}", "Ab".repeat(32))];
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn autotune_wasm_deadline_is_bounded() {
+        for bad in [0, 1001] {
+            let mut config = wasm_example();
+            config.autotune.wasm.deadline_millis = bad;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("deadline_millis"), "{bad}: {error}");
+        }
+        for ok in [1, 1000] {
+            let mut config = wasm_example();
+            config.autotune.wasm.deadline_millis = ok;
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn autotune_wasm_state_bytes_are_capped_at_one_mebibyte() {
+        let mut config = wasm_example();
+        config.autotune.wasm.maximum_state_bytes = 1024 * 1024 + 1;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("maximum_state_bytes"), "{error}");
+        config.autotune.wasm.maximum_state_bytes = 1024 * 1024;
+        config.validate().unwrap();
+        config.autotune.wasm.maximum_state_bytes = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn autotune_wasm_flush_interval_must_be_positive() {
+        let mut config = wasm_example();
+        config.autotune.wasm.state_flush_interval_secs = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("state_flush_interval_secs"), "{error}");
+    }
+
+    #[test]
+    fn autotune_wasm_module_and_memory_budgets_must_be_non_zero() {
+        let mut config = wasm_example();
+        config.autotune.wasm.maximum_module_bytes = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("maximum_module_bytes"), "{error}");
+        let mut config = wasm_example();
+        config.autotune.wasm.maximum_memory_bytes = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("maximum_memory_bytes"), "{error}");
+    }
+
+    #[test]
+    fn autotune_wasm_signer_ids_are_non_empty_and_unique() {
+        let mut config = wasm_example();
+        config.autotune.wasm.signers[1].signer_id = "  ".to_owned();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("signer_id cannot be empty"), "{error}");
+
+        let mut config = wasm_example();
+        config.autotune.wasm.signers[1].signer_id = "ops-2026".to_owned();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate signer_id"), "{error}");
+    }
+
+    #[test]
+    fn autotune_wasm_signer_expiry_must_be_rfc3339() {
+        let mut config = wasm_example();
+        config.autotune.wasm.signers[0].expires_at = Some("2027-01-01".to_owned());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("expires_at"), "{error}");
+        config.autotune.wasm.signers[0].expires_at = Some("2027-01-01T00:00:00+08:00".to_owned());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn removed_v1_tuning_field_is_rejected() {
+        let error = toml::from_str::<Config>(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+quic_send_buffer_bytes = 131072
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+
+        let error = toml::from_str::<Config>(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+
+[observability]
+metrics_file = "/tmp/legacy.prom"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn obsolete_underlay_key_is_rejected() {
+        let error = toml::from_str::<Config>(
+            r#"
+network_id = "test-network"
+identity_file = "/tmp/ironet-v2.key"
+forbidden_underlay_prefixes = ["200::/7"]
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 }

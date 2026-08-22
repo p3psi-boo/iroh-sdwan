@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{net::UdpSocket, time};
+use tokio::{net::UdpSocket, sync::broadcast, time};
 use tracing::debug;
 
 use crate::{
@@ -40,6 +40,19 @@ struct Probe {
     destination: IpAddr,
     source_port: u16,
     hops_remaining: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TraceProbeTag {
+    pub request_id: u64,
+    pub target: IpAddr,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OverlayTraceOamEvent {
+    pub request_id: u64,
+    pub reporter_address: IpAddr,
+    pub reporter: NodeInfo,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -138,7 +151,7 @@ impl TraceResponder {
     /// Inspect an inbound raw IP packet before it enters the local TUN.
     ///
     /// Returns true when this node consumed a trace request. Requests with more
-    /// hops remaining are left untouched so FlowRouter can forward them.
+    /// hops remaining are left untouched so V2 dataplane can forward them.
     pub async fn handle_packet(&self, packet: &[u8]) -> Result<bool> {
         let Some(probe) = parse_probe(packet) else {
             return Ok(false);
@@ -190,6 +203,21 @@ pub async fn run_streaming(
     timeout: Duration,
     hop_sender: Option<tokio::sync::mpsc::Sender<TraceHop>>,
 ) -> Result<TraceResult> {
+    run_streaming_with_oam(config, target, max_hops, timeout, None, hop_sender).await
+}
+
+/// Run a trace while also accepting authenticated TTL-expired events emitted
+/// by the V2 route-label fast path. Transit nodes do not decode the inner UDP
+/// record, so their hop response arrives on the reliable OAM channel rather
+/// than as a forged inner-IP packet.
+pub(crate) async fn run_streaming_with_oam(
+    config: &Config,
+    target: IpAddr,
+    max_hops: u8,
+    timeout: Duration,
+    mut oam_events: Option<broadcast::Receiver<OverlayTraceOamEvent>>,
+    hop_sender: Option<tokio::sync::mpsc::Sender<TraceHop>>,
+) -> Result<TraceResult> {
     ensure!(
         !timeout.is_zero(),
         "trace timeout must be greater than zero"
@@ -218,7 +246,16 @@ pub async fn run_streaming(
     }
 
     for hop in 1..=max_hops {
-        match send_probe(source, target, hop, u64::from(hop), timeout).await? {
+        match send_probe_with_oam(
+            source,
+            target,
+            hop,
+            u64::from(hop),
+            timeout,
+            oam_events.as_mut(),
+        )
+        .await?
+        {
             Some((response, sender, elapsed_ms)) => {
                 let destination = response.destination;
                 let trace_hop = TraceHop {
@@ -251,7 +288,7 @@ pub async fn run_streaming(
     Ok(result)
 }
 
-/// Measure end-to-end reachability and RTT over the FlowRouter-selected
+/// Measure end-to-end reachability and RTT over the V2 dataplane-selected
 /// overlay path. This deliberately reuses the authenticated trace responder,
 /// so it does not depend on host ICMP policy and also works across transit
 /// nodes.
@@ -447,6 +484,17 @@ async fn send_probe(
     nonce: u64,
     timeout: Duration,
 ) -> Result<Option<(Response, SocketAddr, f64)>> {
+    send_probe_with_oam(source, target, hops, nonce, timeout, None).await
+}
+
+async fn send_probe_with_oam(
+    source: IpAddr,
+    target: IpAddr,
+    hops: u8,
+    nonce: u64,
+    timeout: Duration,
+    oam_events: Option<&mut broadcast::Receiver<OverlayTraceOamEvent>>,
+) -> Result<Option<(Response, SocketAddr, f64)>> {
     let socket = probe_socket(source, target, hops)?;
     let request_id = request_id(nonce);
     let request = encode_request(request_id);
@@ -455,9 +503,13 @@ async fn send_probe(
         .send_to(&request, SocketAddr::new(target, TRACE_PORT))
         .await
         .with_context(|| format!("failed sending overlay probe to {target}"))?;
-    Ok(receive_response(&socket, request_id, target, timeout)
-        .await?
-        .map(|(response, sender)| (response, sender, started.elapsed().as_secs_f64() * 1_000.0)))
+    Ok(
+        receive_response(&socket, request_id, target, timeout, oam_events)
+            .await?
+            .map(|(response, sender)| {
+                (response, sender, started.elapsed().as_secs_f64() * 1_000.0)
+            }),
+    )
 }
 
 fn summarize_ping(
@@ -500,6 +552,7 @@ async fn receive_response(
     request_id: u64,
     target: IpAddr,
     timeout: Duration,
+    mut oam_events: Option<&mut broadcast::Receiver<OverlayTraceOamEvent>>,
 ) -> Result<Option<(Response, SocketAddr)>> {
     let deadline = time::Instant::now() + timeout;
     let mut buffer = [0_u8; MAX_RESPONSE_LEN];
@@ -508,9 +561,38 @@ async fn receive_response(
         if remaining.is_zero() {
             return Ok(None);
         }
-        let received = match time::timeout(remaining, socket.recv_from(&mut buffer)).await {
-            Ok(received) => received.context("failed receiving trace response")?,
-            Err(_) => return Ok(None),
+        let received = if let Some(events) = oam_events.as_mut() {
+            tokio::select! {
+                received = socket.recv_from(&mut buffer) => {
+                    Some(received.context("failed receiving trace response")?)
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(event) if event.request_id == request_id => {
+                            let sender = SocketAddr::new(event.reporter_address, TRACE_PORT);
+                            return Ok(Some((Response {
+                                request_id,
+                                destination: false,
+                                node_info: event.reporter,
+                            }, sender)));
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            oam_events = None;
+                            continue;
+                        }
+                    }
+                }
+                _ = time::sleep(remaining) => return Ok(None),
+            }
+        } else {
+            match time::timeout(remaining, socket.recv_from(&mut buffer)).await {
+                Ok(received) => Some(received.context("failed receiving trace response")?),
+                Err(_) => return Ok(None),
+            }
+        };
+        let Some(received) = received else {
+            continue;
         };
         let (len, sender) = received;
         let Some(response) = decode_response(&buffer[..len]) else {
@@ -535,6 +617,14 @@ async fn receive_response(
             "ignored trace response for another request"
         );
     }
+}
+
+pub(crate) fn v2_trace_probe_tag(packet: &[u8]) -> Option<TraceProbeTag> {
+    let probe = parse_probe(packet)?;
+    Some(TraceProbeTag {
+        request_id: probe.request_id,
+        target: probe.destination,
+    })
 }
 
 fn print_hop(hop: u8, address: IpAddr, elapsed_ms: f64, node_info: &NodeInfo) {
@@ -892,6 +982,7 @@ mod tests {
             7,
             "127.0.0.1".parse().unwrap(),
             Duration::from_secs(1),
+            None,
         )
         .await
         .unwrap()
@@ -927,11 +1018,45 @@ mod tests {
             9,
             "127.0.0.1".parse().unwrap(),
             Duration::from_millis(10),
+            None,
         )
         .await
         .unwrap();
         assert!(received.is_none());
         send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_v2_oam_completes_a_transit_hop_without_udp_spoofing() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (events, mut event_rx) = broadcast::channel(4);
+        let mut metadata = BTreeMap::new();
+        metadata.insert("endpoint_id".into(), "transit-endpoint".into());
+        events
+            .send(OverlayTraceOamEvent {
+                request_id: 17,
+                reporter_address: "21.0.0.7".parse().unwrap(),
+                reporter: NodeInfo {
+                    name: "transit-endpoint".into(),
+                    description: Some("V2 overlay transit node".into()),
+                    metadata,
+                },
+            })
+            .unwrap();
+
+        let (response, sender) = receive_response(
+            &receiver,
+            17,
+            "21.0.0.9".parse().unwrap(),
+            Duration::from_secs(1),
+            Some(&mut event_rx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!response.destination);
+        assert_eq!(response.node_info.name, "transit-endpoint");
+        assert_eq!(sender.ip(), "21.0.0.7".parse::<IpAddr>().unwrap());
     }
 
     #[test]

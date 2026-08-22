@@ -476,7 +476,13 @@ fn spawn_reader(mut reader: DerpReader) -> (JoinHandle<()>, mpsc::Receiver<DerpR
 #[cfg(test)]
 mod tests {
     use crate::derp::DERP_TRANSPORT_ID;
-    use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
+    use crate::protocol::v2::session::{
+        ConnectionRole, SessionPolicyV2, WireLimitsV2, capability, negotiate_connection_v2,
+    };
+    use iroh::{
+        Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr,
+        endpoint::{ConnectOptions, TlsSessionPartition},
+    };
 
     use super::*;
 
@@ -545,7 +551,9 @@ mod tests {
         let right_derp = DerpIdentity::generate();
         let left_key = SecretKey::generate();
         let right_key = SecretKey::generate();
-        let alpn = b"ironet/derp-test/1".to_vec();
+        let left_id = left_key.public();
+        let right_id = right_key.public();
+        let alpn = b"h3".to_vec();
         let tls = super::super::client::tls_config().unwrap();
 
         let left_transport = DerpTransport::new(
@@ -590,15 +598,31 @@ mod tests {
         let right_task = tokio::spawn(async move {
             let incoming = right.accept().await.unwrap();
             let connection = incoming.accept().unwrap().await.unwrap();
+            let negotiated =
+                negotiate_connection_v2(&connection, &derp_v2_policy(right_id, left_id))
+                    .await
+                    .unwrap();
+            assert_eq!(negotiated.capabilities, capability::KNOWN);
             let received = connection.read_datagram().await.unwrap();
             connection.send_datagram_wait(received).await.unwrap();
             connection.closed().await;
             right.close().await;
         });
-        let connection = tokio::time::timeout(Duration::from_secs(30), left.connect(remote, &alpn))
+        let options = ConnectOptions::new()
+            .with_visible_server_name("live-edge.example".to_owned())
+            .with_tls_session_partition(TlsSessionPartition::new("derp-v2-test".to_owned(), 1, 1));
+        let connecting = left
+            .connect_with_opts(remote, &alpn, options)
+            .await
+            .unwrap();
+        let connection = tokio::time::timeout(Duration::from_secs(30), connecting)
             .await
             .unwrap()
             .unwrap();
+        let negotiated = negotiate_connection_v2(&connection, &derp_v2_policy(left_id, right_id))
+            .await
+            .unwrap();
+        assert_eq!(negotiated.capabilities, capability::KNOWN);
         connection
             .send_datagram_wait(Bytes::from_static(b"iroh-over-derp"))
             .await
@@ -629,5 +653,25 @@ mod tests {
         connection.close(0_u8.into(), b"done");
         left.close().await;
         right_task.await.unwrap();
+    }
+
+    fn derp_v2_policy(local_id: iroh::EndpointId, remote_id: iroh::EndpointId) -> SessionPolicyV2 {
+        SessionPolicyV2 {
+            network_id: "derp-v2-test".to_owned(),
+            local_id,
+            remote_id,
+            role: ConnectionRole::Data,
+            expected_remote_role: Some(ConnectionRole::Data),
+            capabilities: capability::KNOWN,
+            limits: WireLimitsV2 {
+                max_datagram_size: 1_382,
+                max_control_size: 1024 * 1024,
+                max_train_size: 64 * 1024,
+                max_record_size: u16::MAX as u32,
+                max_cells_per_train: 256,
+                max_active_trains: 1024,
+            },
+            cover_profile_id: 1,
+        }
     }
 }

@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/ironet-extension-sdk"]
+members = [
+    "crates/ironet-extension-sdk",
+    "crates/ironet-policy-abi",
+    "crates/ironet-policy-core",
+    "crates/ironet-policy-sdk",
+    "crates/ironet-policy-builtin",
+]
+exclude = ["crates/iroh-v2", "crates/noq-v2", "crates/noq-proto-v2", "fuzz"]
 default-members = ["."]
 resolver = "3"
 
@@ -7,8 +14,8 @@ resolver = "3"
 name = "ironet"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
-description = "Demand-aware Linux overlay network using iroh and a sharded multi-queue FlowRouter TUN"
+rust-version = "1.98"
+description = "Demand-aware Linux overlay network using QUIC and the Ironet Protocol V2 Cell/PacketTrain dataplane"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -19,12 +26,15 @@ bytes = "1.11.1"
 chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 crypto_box = { version = "0.9.1", features = ["rand_core", "std"] }
+ed25519-dalek = { version = "3.0.0", default-features = false }
 crossbeam-channel = "0.5.16"
 hex = "0.4.3"
 futures-util = "0.3.33"
 ipnet = { version = "2.12.1", features = ["serde"] }
 ironet-extension-sdk = { path = "crates/ironet-extension-sdk" }
-iroh = { version = "1.0.3", features = ["unstable-custom-transports", "unstable-net-report"] }
+ironet-policy-abi = { path = "crates/ironet-policy-abi" }
+ironet-policy-core = { path = "crates/ironet-policy-core" }
+iroh = { version = "1.0.3", path = "crates/iroh-v2", features = ["unstable-custom-transports", "unstable-net-report"] }
 iroh-base = "1.0.3"
 noq-proto = "1.1.1"
 n0-watcher = "1.0.0"
@@ -37,6 +47,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 socket2 = "0.6.1"
+smallvec = "1.15.1"
 tokio = { version = "1.53.1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7.19"
@@ -45,7 +56,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tun-rs = { version = "2.8.8", features = ["async_tokio"] }
 url = "2.5.8"
+wasmtime = { version = "48.0", default-features = false, features = ["runtime", "component-model", "std", "cranelift", "pulley"] }
 webpki-roots = "1.0.4"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,3 +67,12 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
+[patch.crates-io]
+noq = { path = "crates/noq-v2" }
+noq-proto = { path = "crates/noq-proto-v2" }

@@ -10,9 +10,12 @@ pub struct PacketInfo {
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
     pub length: usize,
+    /// Protocol-semantic packets that must retain latency service regardless
+    /// of flow age/rate: ICMP, TCP handshake/teardown, and payload-free ACKs.
+    pub latency_protected: bool,
 }
 
-/// Directional network flow identity used by the FlowRouter.  Ports are
+/// Directional network flow identity used by the V2 dataplane.  Ports are
 /// absent for protocols without a TCP/UDP-style header and for fragmented IP
 /// datagrams. Using the same address/protocol key for every fragment prevents
 /// the first and later fragments from selecting different route leases.
@@ -49,6 +52,43 @@ pub fn inspect_ip_packet(packet: &[u8]) -> Result<PacketInfo> {
         6 => validate_ipv6(packet),
         version => bail!("unsupported IP version {version}"),
     }
+}
+
+/// Return the IP TTL/Hop-Limit after validating the packet. V2 copies this
+/// value into its fixed routing shim so overlay transit can enforce logical IP
+/// hop semantics without opening PacketTrain records.
+pub fn ip_hop_limit(packet: &[u8]) -> Result<u8> {
+    inspect_ip_packet(packet)?;
+    Ok(ip_hop_limit_validated(packet))
+}
+
+pub(crate) fn ip_hop_limit_validated(packet: &[u8]) -> u8 {
+    match packet[0] >> 4 {
+        4 => packet[8],
+        6 => packet[7],
+        _ => unreachable!("packet version was validated"),
+    }
+}
+
+/// Return `(ICMP type, echo sequence)` for a validated-looking IPv4 echo
+/// packet. This is used only by the opt-in latency probe trace target and is
+/// intentionally allocation-free on the dataplane path.
+pub(crate) fn icmpv4_echo_probe(packet: &[u8]) -> Option<(u8, u16)> {
+    if packet.len() < 28 || packet[0] >> 4 != 4 || packet[9] != 1 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || packet.len() < header_len + 8 {
+        return None;
+    }
+    let kind = packet[header_len];
+    if !matches!(kind, 0 | 8) {
+        return None;
+    }
+    Some((
+        kind,
+        u16::from_be_bytes([packet[header_len + 6], packet[header_len + 7]]),
+    ))
 }
 
 /// Decrement the network hop limit before forwarding a packet entirely in
@@ -102,6 +142,12 @@ fn validate_ipv4(packet: &[u8]) -> Result<PacketInfo> {
     } else {
         (None, None)
     };
+    let latency_protected = latency_protected_transport(
+        packet,
+        header_len,
+        protocol,
+        fragment_offset == 0 && !more_fragments,
+    );
     Ok(PacketInfo {
         source: source.into(),
         destination: destination.into(),
@@ -109,6 +155,7 @@ fn validate_ipv4(packet: &[u8]) -> Result<PacketInfo> {
         source_port,
         destination_port,
         length: total_len,
+        latency_protected,
     })
 }
 
@@ -126,6 +173,8 @@ fn validate_ipv6(packet: &[u8]) -> Result<PacketInfo> {
     } else {
         (None, None)
     };
+    let latency_protected =
+        latency_protected_transport(packet, transport_offset, protocol, unfragmented);
     Ok(PacketInfo {
         source: source.into(),
         destination: destination.into(),
@@ -133,7 +182,28 @@ fn validate_ipv6(packet: &[u8]) -> Result<PacketInfo> {
         source_port,
         destination_port,
         length: total_len,
+        latency_protected,
     })
+}
+
+fn latency_protected_transport(
+    packet: &[u8],
+    transport_offset: usize,
+    protocol: u8,
+    unfragmented: bool,
+) -> bool {
+    if matches!(protocol, 1 | 58) {
+        return true;
+    }
+    if protocol != 6 || !unfragmented || packet.len() < transport_offset.saturating_add(20) {
+        return false;
+    }
+    let flags = packet[transport_offset + 13];
+    if flags & (0x01 | 0x02 | 0x04) != 0 {
+        return true;
+    }
+    let header_len = usize::from(packet[transport_offset + 12] >> 4) * 4;
+    header_len >= 20 && transport_offset.saturating_add(header_len) == packet.len()
 }
 
 fn transport_ports(packet: &[u8], offset: usize, protocol: u8) -> (Option<u16>, Option<u16>) {
@@ -148,7 +218,7 @@ fn transport_ports(packet: &[u8], offset: usize, protocol: u8) -> (Option<u16>, 
 
 /// Locate the upper-layer header while bounding extension-header traversal.
 /// ESP and unknown extension types intentionally terminate parsing: the
-/// FlowRouter can still group them by addresses and protocol without looking
+/// V2 dataplane can still group them by addresses and protocol without looking
 /// through encrypted or unsupported headers.
 fn ipv6_transport_header(packet: &[u8]) -> Result<(u8, usize, bool)> {
     let mut next = packet[6];
@@ -174,7 +244,7 @@ fn ipv6_transport_header(packet: &[u8]) -> Result<(u8, usize, bool)> {
             }
             // An atomic fragment (offset zero, M=0) is safe to inspect. For a
             // genuinely fragmented datagram suppress ports on every fragment
-            // so all of them share one FlowRouter key and route lease.
+            // so all of them share one V2 dataplane key and route lease.
             44 => {
                 ensure!(packet.len() >= offset + 8, "truncated IPv6 fragment header");
                 next = packet[offset];
@@ -206,7 +276,9 @@ mod tests {
         let mut packet = [0_u8; 20];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        packet[8] = 37;
         validate_ip_packet(&packet).unwrap();
+        assert_eq!(ip_hop_limit(&packet).unwrap(), 37);
     }
 
     #[test]
@@ -228,6 +300,49 @@ mod tests {
             FlowKey::from(info).source,
             "10.0.0.1".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn tcp_control_and_payload_free_ack_are_latency_protected_by_semantics() {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        packet[9] = 6;
+        packet[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        packet[32] = 5 << 4;
+        packet[33] = 0x10;
+        assert!(inspect_ip_packet(&packet).unwrap().latency_protected);
+
+        packet.push(1);
+        packet[2..4].copy_from_slice(&41_u16.to_be_bytes());
+        assert!(!inspect_ip_packet(&packet).unwrap().latency_protected);
+
+        packet[33] = 0x02;
+        assert!(inspect_ip_packet(&packet).unwrap().latency_protected);
+    }
+
+    #[test]
+    fn packet_size_does_not_make_tcp_data_latency_protected() {
+        let mut packet = vec![0_u8; 32 * 1024];
+        let packet_len = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[9] = 6;
+        packet[32] = 5 << 4;
+        packet[33] = 0x18;
+        let info = inspect_ip_packet(&packet).unwrap();
+        assert!(!info.latency_protected);
+        assert_eq!(info.length, packet.len());
+    }
+
+    #[test]
+    fn icmp_is_always_latency_protected() {
+        let mut packet = [0_u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        packet[9] = 1;
+        assert!(inspect_ip_packet(&packet).unwrap().latency_protected);
     }
 
     #[test]

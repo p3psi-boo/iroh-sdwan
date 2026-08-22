@@ -21,9 +21,9 @@ use ratatui::{
 use crate::{
     config::{Config, RouteOriginConfig},
     control, display,
-    mesh::MeshNodeStatus,
-    observability::{PeerStatus, RouteCapacityStatus, RuntimeStatus},
     routes::{self, RouteRegistry},
+    status::MeshNodeStatus,
+    status::{PeerStatus, RuntimeStatus},
     trace::{PingResult, TraceResult},
 };
 
@@ -74,7 +74,6 @@ struct DeclaredRoute {
     prefix: IpNet,
     declared: bool,
     accepted: bool,
-    quarantined: bool,
     ownership_conflict: bool,
     expires_unix_secs: Option<u64>,
 }
@@ -85,7 +84,7 @@ impl DeclaredRoute {
     }
 
     fn state(&self) -> &'static str {
-        if self.quarantined || self.ownership_conflict {
+        if self.ownership_conflict {
             "CONFLICT"
         } else if self.accepted && self.declared {
             "ACCEPTED"
@@ -130,7 +129,7 @@ enum SortMode {
     Traffic,
     Rtt,
     Queue,
-    Loss,
+    Drops,
 }
 
 impl SortMode {
@@ -139,8 +138,8 @@ impl SortMode {
             Self::Name => Self::Traffic,
             Self::Traffic => Self::Rtt,
             Self::Rtt => Self::Queue,
-            Self::Queue => Self::Loss,
-            Self::Loss => Self::Name,
+            Self::Queue => Self::Drops,
+            Self::Drops => Self::Name,
         }
     }
 
@@ -150,7 +149,7 @@ impl SortMode {
             Self::Traffic => "traffic",
             Self::Rtt => "rtt",
             Self::Queue => "queue",
-            Self::Loss => "loss",
+            Self::Drops => "drops",
         }
     }
 }
@@ -159,8 +158,8 @@ impl SortMode {
 struct PeerRate {
     tx_bps: u64,
     rx_bps: u64,
-    latency_pps: u64,
-    bulk_pps: u64,
+    latency_bps: u64,
+    bulk_bps: u64,
     drop_ps: u64,
     error_ps: u64,
 }
@@ -170,14 +169,13 @@ struct PreviousPeer {
     sampled_at: Instant,
     tx_bytes: u64,
     rx_bytes: u64,
-    flow_latency_packets: u64,
-    flow_bulk_packets: u64,
+    latency_service_bytes: u64,
+    bulk_service_bytes: u64,
     drops: u64,
     errors: u64,
     connected: bool,
     selected_path_transport: String,
     selected_path_remote: String,
-    path_switches: u64,
 }
 
 impl PreviousPeer {
@@ -186,14 +184,13 @@ impl PreviousPeer {
             sampled_at,
             tx_bytes: peer.tx_bytes,
             rx_bytes: peer.rx_bytes,
-            flow_latency_packets: peer.flow_latency_packets,
-            flow_bulk_packets: peer.flow_bulk_packets,
+            latency_service_bytes: peer.latency_service_bytes,
+            bulk_service_bytes: peer.bulk_service_bytes,
             drops: total_drops(peer),
             errors: total_errors(peer),
             connected: peer.connected,
             selected_path_transport: peer.selected_path_transport.clone(),
             selected_path_remote: peer.selected_path_remote.clone(),
-            path_switches: peer.path_switches,
         }
     }
 }
@@ -297,10 +294,6 @@ impl Dashboard {
             return;
         };
         let previous_ready = previous.ready;
-        let previous_quarantined = previous.mesh.quarantined_entries;
-        let previous_probe_failures = previous.capacity_probe_failures;
-        let previous_flow_switches = previous.flow_router.route_switches;
-        let previous_no_route_drops = previous.flow_router.no_route_drops;
         if previous_ready != status.ready {
             self.push_event(
                 if status.ready {
@@ -309,50 +302,6 @@ impl Dashboard {
                     Color::Red
                 },
                 format!("runtime ready {} -> {}", previous_ready, status.ready),
-            );
-        }
-        if status.mesh.quarantined_entries > previous_quarantined {
-            self.push_event(
-                Color::Red,
-                format!(
-                    "mesh quarantine {} -> {}",
-                    previous_quarantined, status.mesh.quarantined_entries
-                ),
-            );
-        }
-        if status.capacity_probe_failures > previous_probe_failures {
-            self.push_event(
-                Color::Yellow,
-                format!(
-                    "capacity probe failures +{}",
-                    status
-                        .capacity_probe_failures
-                        .saturating_sub(previous_probe_failures)
-                ),
-            );
-        }
-        if status.flow_router.route_switches > previous_flow_switches {
-            self.push_event(
-                Color::Cyan,
-                format!(
-                    "FlowRouter route switches +{}",
-                    status
-                        .flow_router
-                        .route_switches
-                        .saturating_sub(previous_flow_switches)
-                ),
-            );
-        }
-        if status.flow_router.no_route_drops > previous_no_route_drops {
-            self.push_event(
-                Color::Red,
-                format!(
-                    "FlowRouter no-route drops +{}",
-                    status
-                        .flow_router
-                        .no_route_drops
-                        .saturating_sub(previous_no_route_drops)
-                ),
             );
         }
     }
@@ -368,8 +317,7 @@ impl Dashboard {
                 format!("peer {} connected={}", peer.name, peer.connected),
             );
         }
-        if previous.path_switches != peer.path_switches
-            || previous.selected_path_transport != peer.selected_path_transport
+        if previous.selected_path_transport != peer.selected_path_transport
             || previous.selected_path_remote != peer.selected_path_remote
         {
             self.push_event(
@@ -428,12 +376,16 @@ impl Dashboard {
                     .cmp(&left.path_rtt_micros)
                     .then_with(|| left.name.cmp(&right.name)),
                 SortMode::Queue => right
-                    .queue_bytes
-                    .cmp(&left.queue_bytes)
+                    .packet_train_queue_bytes
+                    .saturating_add(right.latency_queue_bytes)
+                    .cmp(
+                        &left
+                            .packet_train_queue_bytes
+                            .saturating_add(left.latency_queue_bytes),
+                    )
                     .then_with(|| left.name.cmp(&right.name)),
-                SortMode::Loss => right
-                    .path_loss_ppm
-                    .cmp(&left.path_loss_ppm)
+                SortMode::Drops => total_drops(right)
+                    .cmp(&total_drops(left))
                     .then_with(|| left.name.cmp(&right.name)),
             });
         }
@@ -459,6 +411,15 @@ impl Dashboard {
             .flattened()
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let mut declaration_owners = HashMap::<IpNet, HashSet<EndpointId>>::new();
+        for node in &status.mesh.nodes {
+            let Ok(owner) = node.endpoint_id.parse::<EndpointId>() else {
+                continue;
+            };
+            for prefix in &node.prefixes {
+                declaration_owners.entry(*prefix).or_default().insert(owner);
+            }
+        }
         let mut seen = HashSet::new();
         let mut routes = Vec::new();
 
@@ -466,11 +427,8 @@ impl Dashboard {
             let Ok(owner) = node.endpoint_id.parse::<EndpointId>() else {
                 continue;
             };
-            let owner_name = node
-                .node_info
-                .as_ref()
-                .map(|info| info.name.clone())
-                .or_else(|| peer_name(status, owner).map(str::to_owned))
+            let owner_name = peer_name(status, owner)
+                .map(str::to_owned)
                 .unwrap_or_else(|| short(&node.endpoint_id, 16));
             for prefix in &node.prefixes {
                 let accepted_owner = accepted_by_prefix.get(prefix).copied();
@@ -480,8 +438,10 @@ impl Dashboard {
                     prefix: *prefix,
                     declared: true,
                     accepted: accepted_owner == Some(owner),
-                    quarantined: node.quarantined,
-                    ownership_conflict: accepted_owner.is_some_and(|accepted| accepted != owner),
+                    ownership_conflict: accepted_owner.is_some_and(|accepted| accepted != owner)
+                        || declaration_owners
+                            .get(prefix)
+                            .is_some_and(|owners| owners.len() > 1),
                     expires_unix_secs: Some(node.expires_unix_secs),
                 });
                 seen.insert((owner, *prefix));
@@ -500,7 +460,6 @@ impl Dashboard {
                 prefix,
                 declared: false,
                 accepted: true,
-                quarantined: false,
                 ownership_conflict: false,
                 expires_unix_secs: None,
             });
@@ -1041,13 +1000,6 @@ async fn accept_selected_route(
         dashboard.operation_message = Some(format!("{} is already accepted.", route.prefix));
         return;
     }
-    if route.quarantined {
-        dashboard.operation_message = Some(format!(
-            "{} is quarantined because its declaration conflicts with another node.",
-            route.prefix
-        ));
-        return;
-    }
     if route.ownership_conflict {
         dashboard.operation_message = Some(format!(
             "{} is already accepted from a different owner.",
@@ -1251,9 +1203,7 @@ fn render_diagnostic_nodes(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashbo
     let rows = nodes.iter().enumerate().map(|(index, node)| {
         let target =
             diagnostic_target(node).map_or_else(|| "-".into(), |address| address.to_string());
-        let state = if node.quarantined {
-            "QUARANTINED"
-        } else if node.expires_unix_secs <= unix_now() {
+        let state = if node.expires_unix_secs <= unix_now() {
             "EXPIRED"
         } else {
             "READY"
@@ -1384,12 +1334,12 @@ fn render_routes(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
     });
     let pending = routes
         .iter()
-        .filter(|route| route.declared && !route.accepted && !route.quarantined)
+        .filter(|route| route.declared && !route.accepted && !route.ownership_conflict)
         .count();
     let accepted = routes.iter().filter(|route| route.accepted).count();
     let conflicts = routes
         .iter()
-        .filter(|route| route.quarantined || route.ownership_conflict)
+        .filter(|route| route.ownership_conflict)
         .count();
     let table = Table::new(
         rows,
@@ -1428,7 +1378,7 @@ fn render_route_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard)
     };
     let action = if route.accepted {
         "[x] remove accepted route (press twice)"
-    } else if route.quarantined || route.ownership_conflict {
+    } else if route.ownership_conflict {
         "Conflict blocks acceptance. Resolve the ownership conflict first."
     } else {
         "[a] accept declared route"
@@ -1533,7 +1483,14 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         return;
     };
     let total = dashboard.total_history.back().copied().unwrap_or(0);
-    let queues: u64 = status.peers.iter().map(|peer| peer.queue_bytes).sum();
+    let queues: u64 = status
+        .peers
+        .iter()
+        .map(|peer| {
+            peer.packet_train_queue_bytes
+                .saturating_add(peer.latency_queue_bytes)
+        })
+        .sum();
     let drops: u64 = dashboard.rates.values().map(|rate| rate.drop_ps).sum();
     let errors: u64 = dashboard.rates.values().map(|rate| rate.error_ps).sum();
     let missing = status.routes.iter().filter(|route| !route.present).count();
@@ -1555,39 +1512,23 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
                 Style::new().fg(Color::Red).bold()
             },
         ),
-        Span::raw("   PROBE "),
+        Span::raw("   GW "),
         Span::styled(
             format!(
-                "{} fail={} table={}/{}",
-                if status.capacity_probe_in_flight {
-                    "active"
+                "nat={} transit={} prefixes={}",
+                if status.gateway.subnet_nat_enabled {
+                    "on"
                 } else {
-                    "idle"
+                    "off"
                 },
-                status.capacity_probe_failures,
-                status.capacity_table_entries,
-                status.capacity_table_limit
+                if status.gateway.transit_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                status.gateway.advertised_prefixes.len()
             ),
-            Style::new().fg(if status.capacity_probe_failures == 0 {
-                Color::Green
-            } else {
-                Color::Yellow
-            }),
-        ),
-        Span::raw("   FLOWS "),
-        Span::styled(
-            format!(
-                "{}/{} sw={} noroute={}",
-                status.flow_router.active_flows,
-                status.flow_router.max_flows,
-                status.flow_router.route_switches,
-                status.flow_router.no_route_drops,
-            ),
-            Style::new().fg(if status.flow_router.no_route_drops == 0 {
-                Color::Green
-            } else {
-                Color::Yellow
-            }),
+            Style::new().fg(Color::Cyan),
         ),
     ]);
     frame.render_widget(Paragraph::new(text).block(Block::bordered()), area);
@@ -1620,14 +1561,20 @@ fn render_peers(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
             Cell::from(if peer.connected { "up" } else { "DOWN" }),
             Cell::from(short(nonempty(&peer.selected_path_transport, "unknown"), 7)),
             Cell::from(format_micros(peer.path_rtt_micros)),
-            Cell::from(format_micros(peer.path_jitter_micros)),
-            Cell::from(format_loss(peer.path_loss_ppm)),
-            Cell::from(human_bytes(peer.queue_bytes)),
+            Cell::from(human_bytes(
+                peer.packet_train_queue_bytes
+                    .saturating_add(peer.latency_queue_bytes),
+            )),
             Cell::from(human_rate(rate.tx_bps)),
             Cell::from(human_rate(rate.rx_bps)),
-            Cell::from(format!("{}/{}", rate.latency_pps, rate.bulk_pps)),
+            Cell::from(format!(
+                "{}/{}",
+                human_rate(rate.latency_bps),
+                human_rate(rate.bulk_bps)
+            )),
+            Cell::from(format!("{:.2}", peer.utility_total)),
+            Cell::from(short(nonempty(&peer.bbr_preset, "-"), 10)),
             Cell::from(rate.drop_ps.to_string()),
-            Cell::from(peer.path_switches.to_string()),
         ])
         .style(style)
     });
@@ -1637,13 +1584,12 @@ fn render_peers(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(7),
         Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Length(10),
-        Constraint::Length(11),
+        Constraint::Length(19),
         Constraint::Length(7),
+        Constraint::Length(10),
         Constraint::Length(7),
     ];
     let title = format!(
@@ -1659,8 +1605,8 @@ fn render_peers(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
     let table = Table::new(rows, widths)
         .header(
             Row::new([
-                "", "PEER", "STATE", "PATH", "RTT", "JITTER", "LOSS", "QUEUE", "TX/s", "RX/s",
-                "LAT/BULK", "DROP/s", "SWITCH",
+                "", "PEER", "STATE", "PATH", "RTT", "QUEUE", "TX/s", "RX/s", "LAT/BULK", "U",
+                "BBR", "DROP/s",
             ])
             .style(Style::new().fg(Color::Cyan).bold()),
         )
@@ -1709,8 +1655,6 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         return;
     }
 
-    let capacity = best_capacity(&peer.capacities);
-    let cap = detailed_capacity(capacity);
     let text = vec![
         Line::from(format!(
             "endpoint={}  remote={}",
@@ -1718,37 +1662,85 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
             nonempty(&peer.selected_path_remote, "unknown")
         )),
         Line::from(format!(
-            "tx={} rx={}  latency={}pps bulk={}pps  queue={} packets={} priority_age={}",
+            "tx={} rx={}  latency={} bulk={}  queue={}",
             human_rate(rate.tx_bps),
             human_rate(rate.rx_bps),
-            rate.latency_pps,
-            rate.bulk_pps,
-            human_bytes(peer.queue_bytes),
-            peer.queue_packets,
-            format_micros(peer.queue_max_age_micros),
+            human_rate(rate.latency_bps),
+            human_rate(rate.bulk_bps),
+            human_bytes(peer_queue_bytes(peer)),
         )),
         Line::from(format!(
-            "queue split: priority={}/{} bulk={}/{} active={} quic={} preemptions={}",
-            human_bytes(peer.priority_queue_bytes),
-            peer.priority_queue_packets,
-            human_bytes(peer.bulk_queue_bytes),
-            peer.bulk_queue_packets,
-            human_bytes(peer.active_tx_bytes),
-            human_bytes(peer.quic_send_buffer_used_bytes),
+            "queue split: latency={} train={} rx_budget={} preemptions={}",
+            human_bytes(peer.latency_queue_bytes),
+            human_bytes(peer.packet_train_queue_bytes),
+            human_bytes(peer.receive_buffer_bytes),
             peer.bulk_preemptions,
         )),
-        Line::from(cap),
         Line::from(format!(
-            "mtu={} frame={} cwnd={} open_paths={} path_lost={} mtu_reframes={}",
+            "mtu={} cwnd={} open_paths={} pmtu_drops={}/{}",
             peer.path_mtu,
-            peer.effective_frame_size,
             human_bytes(peer.path_cwnd_bytes),
             peer.open_paths,
-            peer.path_lost_packets,
-            peer.mtu_reframes,
+            peer.pmtu_drop_datagrams,
+            human_bytes(peer.pmtu_drop_bytes),
         )),
-        Line::from(format!("errors: {}", error_detail(peer))),
+        Line::from(format!("drops/errors: {}", error_detail(peer))),
+        Line::from(format!(
+            "autotune: mode={} policy={} source={} U={:.3} reason={} bbr={} fec={} train={} rollbacks={}",
+            nonempty(&peer.learner_mode, "unknown"),
+            nonempty(&peer.policy_id, "unknown"),
+            nonempty(&peer.policy_source, "unknown"),
+            peer.utility_total,
+            nonempty(&peer.tune_reason, "unknown"),
+            nonempty(&peer.bbr_preset, "unknown"),
+            nonempty(&peer.fec_geometry, "unknown"),
+            human_bytes(peer.train_target_bytes),
+            peer.learner_rollbacks,
+        )),
+        Line::from(format!(
+            "shadow: policy={} preset={} predicted_advantage={:.3}",
+            nonempty(&peer.shadow_policy_id, "off"),
+            nonempty(&peer.shadow_preset, "-"),
+            peer.shadow_advantage,
+        )),
+        Line::from(format!(
+            "backend: {} {} abi={} health={} state={}B call={}us faults={} clamps={} [{}]",
+            nonempty(&peer.policy_backend, "-"),
+            nonempty(&peer.policy_version, "-"),
+            nonempty(&peer.abi_version, "-"),
+            nonempty(&peer.policy_health, "-"),
+            peer.state_bytes,
+            peer.last_call_micros,
+            peer.faults_total,
+            peer.clamped_fields_total,
+            nonempty(&peer.last_clamp_reasons, "-"),
+        )),
+        Line::from(format!(
+            "module: digest={} signer={} gen={} fuel={} timeouts={} quarantines={}",
+            nonempty(&short(&peer.policy_module_digest, 18), "-"),
+            nonempty(&peer.policy_signer_id, "-"),
+            peer.policy_module_generation,
+            peer.policy_fuel_consumed,
+            peer.policy_timeouts_total,
+            peer.policy_quarantines_total,
+        )),
+        Line::from(format!(
+            "egress: requested={}/s assigned={}/s",
+            human_bytes(peer.egress_requested_bytes_per_second),
+            human_bytes(peer.egress_assigned_bytes_per_second),
+        )),
         Line::from(format!("fec: {}", fec_detail(peer))),
+        Line::from(format!(
+            "wire: trains={} cells={} payload={} wire={} cover={}/{} control={}/{}",
+            peer.trains_built,
+            peer.cells_built,
+            human_bytes(peer.cell_payload_tx_bytes),
+            human_bytes(peer.data_cell_tx_bytes),
+            human_bytes(peer.cover_tx_bytes),
+            human_bytes(peer.cover_rx_bytes),
+            human_bytes(peer.control_tx_bytes),
+            human_bytes(peer.control_rx_bytes),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(text)
@@ -1765,8 +1757,6 @@ fn render_compact_detail(
     rate: PeerRate,
     title: &str,
 ) {
-    let capacity = best_capacity(&peer.capacities);
-    let (capacity_text, capacity_style) = compact_capacity(capacity);
     let (health_text, health_style) = peer_health(peer, rate);
     let text = vec![
         Line::from(vec![
@@ -1778,21 +1768,24 @@ fn render_compact_detail(
             Span::styled(
                 format!(
                     "{} / {} pkt",
-                    human_bytes(peer.queue_bytes),
-                    peer.queue_packets
+                    human_bytes(peer_queue_bytes(peer)),
+                    peer.trains_built
                 ),
-                pressure_style(peer.queue_bytes),
+                pressure_style(peer_queue_bytes(peer)),
             ),
         ]),
-        Line::from(vec![
-            Span::raw(format!(
-                "RTT {} ±{}   Loss {}   ",
-                format_micros(peer.path_rtt_micros),
-                format_micros(peer.path_jitter_micros),
-                format_loss(peer.path_loss_ppm),
-            )),
-            Span::styled(capacity_text, capacity_style),
-        ]),
+        Line::from(format!(
+            "RTT {}   PMTU {}   cwnd {}",
+            format_micros(peer.path_rtt_micros),
+            peer.path_mtu,
+            human_bytes(peer.path_cwnd_bytes),
+        )),
+        Line::from(format!(
+            "U {:.2}   BBR {}   FEC {}",
+            peer.utility_total,
+            nonempty(&peer.bbr_preset, "-"),
+            nonempty(&peer.fec_geometry, "-")
+        )),
         Line::from(Span::styled(health_text, health_style)),
     ];
     frame.render_widget(
@@ -1801,45 +1794,6 @@ fn render_compact_detail(
             .wrap(Wrap { trim: true }),
         area,
     );
-}
-
-fn compact_capacity(capacity: Option<&RouteCapacityStatus>) -> (String, Style) {
-    capacity.map_or_else(
-        || ("Capacity unknown".into(), Style::new().fg(Color::DarkGray)),
-        |route| {
-            let health = f64::from(route.health_per_mille) / 10.0;
-            (
-                format!(
-                    "Capacity {} · {:.0}%",
-                    display::bits_per_second(route.effective_capacity_bps),
-                    health
-                ),
-                capacity_health_style(route.health_per_mille),
-            )
-        },
-    )
-}
-
-fn detailed_capacity(capacity: Option<&RouteCapacityStatus>) -> String {
-    capacity.map_or_else(
-        || "capacity unknown".to_string(),
-        |route| {
-            format!(
-                "capacity={} health={:.1}% age={} source={} probe={}",
-                display::bits_per_second(route.effective_capacity_bps),
-                f64::from(route.health_per_mille) / 10.0,
-                route
-                    .sample_age_millis
-                    .map_or_else(|| "?".into(), display::millis),
-                route.sample_source.as_deref().unwrap_or("none"),
-                if route.probe_in_flight {
-                    "active"
-                } else {
-                    "idle"
-                }
-            )
-        },
-    )
 }
 
 fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
@@ -1859,21 +1813,15 @@ fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
             style = Style::new().fg(Color::Yellow).bold();
         }
     }
-    if peer.path_loss_ppm >= 1_000 {
-        messages.push(format!("loss {}", format_loss(peer.path_loss_ppm)));
-        if rate.error_ps == 0 {
-            style = Style::new().fg(Color::Yellow).bold();
-        }
-    }
-    if peer.queue_bytes >= 4 * 1024 * 1024 {
-        messages.push(format!("queue {}", human_bytes(peer.queue_bytes)));
+    if peer_queue_bytes(peer) >= 4 * 1024 * 1024 {
+        messages.push(format!("queue {}", human_bytes(peer_queue_bytes(peer))));
         if rate.error_ps == 0 {
             style = Style::new().fg(Color::Yellow).bold();
         }
     }
     if messages.is_empty() {
-        let fec = if peer.fec_recovered_shards > 0 {
-            format!(" · FEC recovered {}", peer.fec_recovered_shards)
+        let fec = if peer.fec_recovered_cells > 0 {
+            format!(" · FEC recovered {}", peer.fec_recovered_cells)
         } else {
             String::new()
         };
@@ -1883,27 +1831,16 @@ fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
     }
 }
 
-fn capacity_health_style(health_per_mille: u16) -> Style {
-    if health_per_mille >= 900 {
-        Style::new().fg(Color::Green)
-    } else if health_per_mille >= 700 {
-        Style::new().fg(Color::Yellow)
-    } else {
-        Style::new().fg(Color::Red).bold()
-    }
-}
-
 fn error_detail(peer: &PeerStatus) -> String {
     let mut errors = Vec::new();
     for (label, count) in [
         ("conn", peer.connection_errors),
-        ("send", peer.send_errors),
-        ("invalid", peer.invalid_packets),
-        ("policy", peer.policy_drops),
-        ("frame", peer.frame_drops),
-        ("queue", peer.queue_drops),
-        ("expired", peer.queue_expired_drops),
-        ("reassembly", peer.reassembly_evictions),
+        ("protocol", peer.protocol_datagram_errors),
+        ("route", peer.route_gate_drops),
+        ("admission", peer.tun_admission_drop_records),
+        ("reassembly", peer.reassembly_pressure_evictions),
+        ("pmtu", peer.pmtu_drop_datagrams),
+        ("repair-stale", peer.repair_stale_responses),
     ] {
         if count > 0 {
             errors.push(format!("{label}={count}"));
@@ -1918,25 +1855,28 @@ fn error_detail(peer: &PeerStatus) -> String {
 
 fn fec_detail(peer: &PeerStatus) -> String {
     let mut fields = Vec::new();
-    if peer.fec_active {
-        fields.push(format!(
-            "profile={}+{}@{}ms",
-            peer.fec_data_shards, peer.fec_recovery_shards, peer.fec_block_timeout_millis
-        ));
-    }
     for (label, count) in [
-        ("tx", peer.fec_tx_recovery_shards),
-        ("rx", peer.fec_rx_recovery_shards),
-        ("recovered", peer.fec_recovered_shards),
-        ("unprotected", peer.fec_unprotected_shards),
-        ("expired", peer.fec_expired_blocks),
+        ("tx", peer.fec_tx_cells),
+        ("rx", peer.fec_rx_cells),
+        ("recovered", peer.fec_recovered_cells),
+        ("wasted", peer.fec_wasted_cells),
+        ("unprotected", peer.fec_unprotected_tail_cells),
+        ("expired", peer.fec_expired_stripes),
     ] {
         if count > 0 {
             fields.push(format!("{label}={count}"));
         }
     }
-    if peer.fec_overhead_bytes > 0 {
-        fields.push(format!("overhead={}", human_bytes(peer.fec_overhead_bytes)));
+    if peer.fec_tx_bytes > 0 {
+        fields.push(format!("wire={}", human_bytes(peer.fec_tx_bytes)));
+    }
+    if peer.repair_completed_requests > 0 {
+        fields.push(format!(
+            "repair={}/{} max={}",
+            peer.repair_received_cells,
+            peer.repair_requested_cells,
+            format_micros(peer.repair_latency_max_micros)
+        ));
     }
     if fields.is_empty() {
         "none".into()
@@ -2040,14 +1980,14 @@ fn peer_rate(peer: &PeerStatus, previous: &PreviousPeer, now: Instant) -> PeerRa
     PeerRate {
         tx_bps: per_second(peer.tx_bytes.saturating_sub(previous.tx_bytes), elapsed),
         rx_bps: per_second(peer.rx_bytes.saturating_sub(previous.rx_bytes), elapsed),
-        latency_pps: per_second(
-            peer.flow_latency_packets
-                .saturating_sub(previous.flow_latency_packets),
+        latency_bps: per_second(
+            peer.latency_service_bytes
+                .saturating_sub(previous.latency_service_bytes),
             elapsed,
         ),
-        bulk_pps: per_second(
-            peer.flow_bulk_packets
-                .saturating_sub(previous.flow_bulk_packets),
+        bulk_bps: per_second(
+            peer.bulk_service_bytes
+                .saturating_sub(previous.bulk_service_bytes),
             elapsed,
         ),
         drop_ps: per_second(total_drops(peer).saturating_sub(previous.drops), elapsed),
@@ -2063,24 +2003,21 @@ fn per_second(delta: u64, elapsed: Duration) -> u64 {
 }
 
 fn total_drops(peer: &PeerStatus) -> u64 {
-    peer.invalid_packets
-        .saturating_add(peer.policy_drops)
-        .saturating_add(peer.frame_drops)
-        .saturating_add(peer.queue_drops)
-        .saturating_add(peer.queue_expired_drops)
-        .saturating_add(peer.reassembly_evictions)
+    peer.route_gate_drops
+        .saturating_add(peer.tun_admission_drop_records)
+        .saturating_add(peer.reassembly_pressure_evictions)
+        .saturating_add(peer.pmtu_drop_datagrams)
 }
 
 fn total_errors(peer: &PeerStatus) -> u64 {
     peer.connection_errors
-        .saturating_add(peer.send_errors)
-        .saturating_add(peer.trace_errors)
+        .saturating_add(peer.protocol_datagram_errors)
+        .saturating_add(peer.repair_stale_responses)
 }
 
-fn best_capacity(capacities: &[RouteCapacityStatus]) -> Option<&RouteCapacityStatus> {
-    capacities
-        .iter()
-        .max_by_key(|capacity| capacity.effective_capacity_bps)
+fn peer_queue_bytes(peer: &PeerStatus) -> u64 {
+    peer.packet_train_queue_bytes
+        .saturating_add(peer.latency_queue_bytes)
 }
 
 fn peer_name(status: &RuntimeStatus, endpoint_id: EndpointId) -> Option<&str> {
@@ -2093,23 +2030,15 @@ fn peer_name(status: &RuntimeStatus, endpoint_id: EndpointId) -> Option<&str> {
 }
 
 fn node_name(node: &MeshNodeStatus) -> &str {
-    node.node_info
-        .as_ref()
-        .map_or(node.endpoint_id.as_str(), |info| info.name.as_str())
+    node.endpoint_id.as_str()
 }
 
 fn diagnostic_target(node: &MeshNodeStatus) -> Option<IpAddr> {
-    node.prefixes
-        .iter()
-        .find(|prefix| match prefix {
-            IpNet::V4(prefix) => prefix.prefix_len() == 32,
-            IpNet::V6(prefix) => prefix.prefix_len() == 128,
-        })
-        .map(IpNet::addr)
+    node.node_addresses.first().map(IpNet::addr)
 }
 
 fn route_review_rank(route: &DeclaredRoute) -> u8 {
-    if route.quarantined || route.ownership_conflict {
+    if route.ownership_conflict {
         0
     } else if route.declared && !route.accepted {
         1
@@ -2155,14 +2084,6 @@ fn format_micros(micros: u64) -> String {
 
 fn format_optional_ms(milliseconds: Option<f64>) -> String {
     milliseconds.map_or_else(|| "?".into(), |value| format!("{value:.2}ms"))
-}
-
-fn format_loss(ppm: u64) -> String {
-    if ppm == 0 {
-        "0%".into()
-    } else {
-        format!("{:.2}%", ppm as f64 / 10_000.0)
-    }
 }
 
 fn human_duration(seconds: u64) -> String {
@@ -2234,38 +2155,30 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use crate::mesh::{MeshNodeStatus, MeshStatus};
+    use crate::status::{MeshNodeStatus, MeshStatus};
     use iroh::SecretKey;
 
     use super::*;
 
     fn peer(tx_bytes: u64, bulk: u64) -> PeerStatus {
-        serde_json::from_value(serde_json::json!({
-            "name": "peer-a",
-            "endpoint_id": "endpoint-a",
-            "interface": "ironet0",
-            "connected": true,
-            "connection_events": 1,
-            "tx_packets": 10,
-            "tx_bytes": tx_bytes,
-            "flow_bulk_packets": bulk,
-            "priority_queue_packets": 2,
-            "priority_queue_bytes": 512,
-            "bulk_queue_packets": 3,
-            "bulk_queue_bytes": 4096,
-            "active_tx_bytes": 1200,
-            "quic_send_buffer_used_bytes": 2400,
-            "bulk_preemptions": 7,
-            "rx_packets": 4,
-            "rx_bytes": 500,
-            "tx_fragments": 0,
-            "rx_fragments": 0,
-            "invalid_packets": 0,
-            "policy_drops": 0,
-            "frame_drops": 0,
-            "send_errors": 0
-        }))
-        .unwrap()
+        PeerStatus {
+            name: "peer-a".into(),
+            endpoint_id: "endpoint-a".into(),
+            interface: "ironet0".into(),
+            protocol_major: 2,
+            connected: true,
+            connection_events: 1,
+            tx_packets: 10,
+            tx_bytes,
+            bulk_service_bytes: bulk,
+            latency_queue_bytes: 512,
+            packet_train_queue_bytes: 4_096,
+            receive_buffer_bytes: 2_400,
+            bulk_preemptions: 7,
+            rx_packets: 4,
+            rx_bytes: 500,
+            ..PeerStatus::default()
+        }
     }
 
     #[test]
@@ -2274,22 +2187,19 @@ mod tests {
         let previous = PreviousPeer::from_peer(&peer(1_000, 1), start);
         let rate = peer_rate(&peer(3_000, 5), &previous, start + Duration::from_secs(2));
         assert_eq!(rate.tx_bps, 1_000);
-        assert_eq!(rate.bulk_pps, 2);
+        assert_eq!(rate.bulk_bps, 2);
 
         let reset = peer_rate(&peer(5, 0), &previous, start + Duration::from_secs(2));
         assert_eq!(reset.tx_bps, 0);
-        assert_eq!(reset.bulk_pps, 0);
+        assert_eq!(reset.bulk_bps, 0);
     }
 
     #[test]
-    fn peer_fixture_exposes_queue_isolation_detail() {
+    fn peer_fixture_exposes_v2_queue_isolation_detail() {
         let peer = peer(1_000, 1);
-        assert_eq!(peer.priority_queue_packets, 2);
-        assert_eq!(peer.priority_queue_bytes, 512);
-        assert_eq!(peer.bulk_queue_packets, 3);
-        assert_eq!(peer.bulk_queue_bytes, 4_096);
-        assert_eq!(peer.active_tx_bytes, 1_200);
-        assert_eq!(peer.quic_send_buffer_used_bytes, 2_400);
+        assert_eq!(peer.latency_queue_bytes, 512);
+        assert_eq!(peer.packet_train_queue_bytes, 4_096);
+        assert_eq!(peer.receive_buffer_bytes, 2_400);
         assert_eq!(peer.bulk_preemptions, 7);
     }
 
@@ -2299,7 +2209,6 @@ mod tests {
         assert_eq!(human_bytes(1_500), "1.5KB");
         assert_eq!(human_rate(2_000_000), "2.0MB/s");
         assert_eq!(format_micros(12_500), "12.5ms");
-        assert_eq!(format_loss(10_000), "1.00%");
     }
 
     #[test]
@@ -2323,18 +2232,15 @@ mod tests {
             sequence: 1,
             expires_unix_secs: unix_now() + 60,
             direct_addresses: Vec::new(),
-            assisted_addresses: Vec::new(),
-            relay_urls: Vec::new(),
+            node_addresses: vec!["21.0.0.40/32".parse().unwrap()],
             prefixes: vec![
                 "10.40.0.0/16".parse().unwrap(),
                 "21.0.0.40/32".parse().unwrap(),
             ],
-            node_info: None,
             transit_enabled: false,
-            quarantined: false,
         };
         assert_eq!(diagnostic_target(&node), Some("21.0.0.40".parse().unwrap()));
-        node.prefixes = vec!["10.40.0.0/16".parse().unwrap()];
+        node.node_addresses.clear();
         assert_eq!(diagnostic_target(&node), None);
     }
 
@@ -2348,10 +2254,10 @@ mod tests {
         assert_eq!(fec_detail(&healthy), "none");
 
         let mut impaired = peer(1_000, 1);
-        impaired.send_errors = 3;
-        impaired.queue_drops = 4;
-        impaired.fec_recovered_shards = 5;
-        impaired.fec_overhead_bytes = 1_500;
+        impaired.connection_errors = 3;
+        impaired.tun_admission_drop_records = 4;
+        impaired.fec_recovered_cells = 5;
+        impaired.fec_tx_bytes = 1_500;
         let (summary, style) = peer_health(
             &impaired,
             PeerRate {
@@ -2361,8 +2267,8 @@ mod tests {
         );
         assert_eq!(summary, "! errors 2/s");
         assert_eq!(style.fg, Some(Color::Red));
-        assert_eq!(error_detail(&impaired), "send=3 queue=4");
-        assert_eq!(fec_detail(&impaired), "recovered=5 overhead=1.5KB");
+        assert_eq!(error_detail(&impaired), "conn=3 admission=4");
+        assert_eq!(fec_detail(&impaired), "recovered=5 wire=1.5KB");
     }
 
     #[test]
@@ -2387,7 +2293,6 @@ mod tests {
                 mesh: MeshStatus {
                     enabled: true,
                     directory_entries: 2,
-                    quarantined_entries: 1,
                     max_total_peers: 12,
                     nodes: vec![
                         MeshNodeStatus {
@@ -2395,24 +2300,18 @@ mod tests {
                             sequence: 1,
                             expires_unix_secs: unix_now() + 60,
                             direct_addresses: Vec::new(),
-                            assisted_addresses: Vec::new(),
-                            relay_urls: Vec::new(),
-                            prefixes: vec![accepted, pending],
-                            node_info: None,
+                            node_addresses: Vec::new(),
+                            prefixes: vec![accepted, pending, conflicting],
                             transit_enabled: false,
-                            quarantined: false,
                         },
                         MeshNodeStatus {
                             endpoint_id: second.to_string(),
                             sequence: 1,
                             expires_unix_secs: unix_now() + 60,
                             direct_addresses: Vec::new(),
-                            assisted_addresses: Vec::new(),
-                            relay_urls: Vec::new(),
+                            node_addresses: Vec::new(),
                             prefixes: vec![conflicting],
-                            node_info: None,
                             transit_enabled: false,
-                            quarantined: true,
                         },
                     ],
                 },
@@ -2429,7 +2328,7 @@ mod tests {
         };
 
         let routes = dashboard.declared_routes();
-        assert_eq!(routes.len(), 4);
+        assert_eq!(routes.len(), 5);
         assert_eq!(
             routes
                 .iter()
@@ -2457,7 +2356,7 @@ mod tests {
         assert_eq!(
             routes
                 .iter()
-                .find(|route| route.prefix == conflicting)
+                .find(|route| route.prefix == conflicting && route.owner == second)
                 .unwrap()
                 .state(),
             "CONFLICT"

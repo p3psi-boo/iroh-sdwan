@@ -3,9 +3,13 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
-for suite in docker-product docker docker-v1 docker-private-link docker-lan docker-flowrouter docker-fec docker-mesh docker-relay docker-derp docker-wan docker-mtu docker-congestion docker-soak; do
-  echo "==> running network-namespace suite: $suite"
-  "$ROOT/tests/netns/run.sh" "$suite"
+"$ROOT/scripts/check-v2-only.sh"
+
+# Protocol V2 has no inherited protocol-generation suites. Product lifecycle
+# and the repeatable QUIC Initial/SNI capture are the published container gates.
+for suite in docker-product docker-v2-sni; do
+  echo "==> running V2 suite: $suite"
+  "$ROOT/tests/$suite/run.sh"
 done
 
-echo "all network-namespace integration suites passed"
+echo "all Ironet Protocol V2 integration suites passed"

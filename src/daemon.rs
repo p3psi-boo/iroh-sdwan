@@ -13,13 +13,13 @@ use crate::{
     config::Config,
     control::{self, DaemonCommand, ReloadAck, RpcError},
     identity,
-    observability::RuntimeState,
-    runtime,
+    v2_runtime::{self, V2RuntimeConfig, V2RuntimeState},
 };
 
 #[derive(Clone)]
 struct Generation {
     config: Config,
+    runtime_config: V2RuntimeConfig,
     secret_key: SecretKey,
 }
 
@@ -38,7 +38,13 @@ impl Generation {
         let config = Config::load(config_path).await?;
         let secret_key = identity::load(&config.identity_file)?;
         config.validate_local_id(secret_key.public())?;
-        Ok(Self { config, secret_key })
+        let runtime_config = V2RuntimeConfig::from_product_config(&config)
+            .context("configuration is not valid for the V2-only dataplane")?;
+        Ok(Self {
+            config,
+            runtime_config,
+            secret_key,
+        })
     }
 }
 
@@ -49,7 +55,7 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
     let listener = control::bind(&socket_path).await?;
     let (command_tx, command_rx) = mpsc::channel(16);
     let (active_config_tx, active_config_rx) = watch::channel(initial.config.clone());
-    let (runtime_state_tx, runtime_state_rx) = watch::channel::<Option<Arc<RuntimeState>>>(None);
+    let (runtime_state_tx, runtime_state_rx) = watch::channel::<Option<Arc<V2RuntimeState>>>(None);
     let events = Arc::new(control::EventLog::default());
     let mut supervisor = tokio::spawn(supervise(
         config_path,
@@ -68,7 +74,7 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
         events,
     ));
 
-    let result = tokio::select! {
+    let mut result = tokio::select! {
         result = &mut supervisor => {
             control_server.abort();
             flatten_task("daemon supervisor", result)
@@ -89,6 +95,12 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
             }
         }
     };
+    if let Err(error) = v2_runtime::cleanup_v2_nat_all() {
+        warn!(%error, "failed cleaning final V2 NAT generation");
+        if result.is_ok() {
+            result = Err(error.context("cleaning final V2 NAT generation"));
+        }
+    }
     match tokio::fs::remove_file(&socket_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -104,11 +116,12 @@ async fn supervise(
     mut current: Generation,
     active_config: watch::Sender<Config>,
     mut commands: mpsc::Receiver<DaemonCommand>,
-    runtime_state: watch::Sender<Option<Arc<RuntimeState>>>,
+    runtime_state: watch::Sender<Option<Arc<V2RuntimeState>>>,
     events: Arc<control::EventLog>,
 ) -> Result<()> {
     let mut generation = 1_u64;
     let mut pending_reload: Option<PendingReload> = None;
+    let mut recovering = false;
     loop {
         let starting_generation = generation + u64::from(pending_reload.is_some());
         let endpoint_id = current.secret_key.public();
@@ -116,11 +129,9 @@ async fn supervise(
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let mut shutdown_tx = Some(shutdown_tx);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let config = current.config.clone();
-        let secret_key = current.secret_key.clone();
-        let mut runtime_task = tokio::spawn(runtime::run_with_shutdown_ready_and_state(
-            config,
-            secret_key,
+        let runtime_config = current.runtime_config.clone();
+        let mut runtime_task = tokio::spawn(v2_runtime::run_with_shutdown_and_state(
+            runtime_config,
             async move {
                 shutdown_rx
                     .await
@@ -157,8 +168,19 @@ async fn supervise(
                 tokio::time::sleep(RESTART_SETTLE_DELAY).await;
                 continue;
             }
+            if recovering {
+                warn!(
+                    generation = starting_generation,
+                    %error,
+                    "data-plane recovery attempt failed; retrying"
+                );
+                tokio::time::sleep(RESTART_SETTLE_DELAY).await;
+                continue;
+            }
             return Err(error);
         }
+
+        recovering = false;
 
         active_config.send_replace(current.config.clone());
         if let Some(pending) = pending_reload.take() {
@@ -206,7 +228,19 @@ async fn supervise(
         'active: loop {
             tokio::select! {
                 result = &mut runtime_task => {
-                    return Err(runtime_result("data plane", result));
+                    let error = runtime_result("data plane", result);
+                    // A V2 adjacency is an ephemeral QUIC session. A peer's
+                    // rolling reload, NAT rebinding, or path migration can
+                    // retire that session without making the daemon or its
+                    // control plane invalid. Rebuild the generation instead
+                    // of turning one remote restart into a mesh-wide daemon
+                    // failure.
+                    warn!(generation, %error, "data plane stopped; rebuilding generation");
+                    runtime_state.send_replace(None);
+                    generation = generation.saturating_add(1);
+                    recovering = true;
+                    tokio::time::sleep(RESTART_SETTLE_DELAY).await;
+                    break 'active;
                 }
                 signal = shutdown_signal() => {
                     signal?;

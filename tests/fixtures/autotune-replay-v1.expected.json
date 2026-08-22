@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "policy_id": "bandit-vivace@1",
+  "policy_digest": "557c102ccc0b85a1b3c749912ca6c5568b51abfe12543728a0f37db8ab36b7c3",
+  "objective": "balanced",
+  "seed": 7,
+  "samples": 8,
+  "contexts": {
+    "r2-b1-l2-datagram": 8
+  },
+  "proposed_presets": {
+    "long-fat": 1,
+    "lossy-radio": 7
+  },
+  "preset_switches": 1,
+  "exploring_samples": 1,
+  "mean_utility": 3.8159443097524504,
+  "mean_predicted_advantage": -0.4769930387190563,
+  "final_action": {
+    "preset": "long-fat",
+    "up_gain_milli": 1250,
+    "headroom_milli": 150,
+    "cwnd_gain_milli": 3000,
+    "pacing_cap_bytes_per_second": 0,
+    "train_target_bytes": 65536,
+    "bulk_quantum_cells": 4,
+    "fec": {
+      "data_cells": 8,
+      "parity_cells": 1
+    },
+    "cover_profile": "live-broadcast",
+    "cover_overhead_per_mille": 0
+  },
+  "trace_digest": "4b91bf7fff2ddce119299bbe14808463717d1594fa5cb93ea1119758b916d570"
+}

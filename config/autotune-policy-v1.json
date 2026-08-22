@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "id": "bandit-vivace@1",
+  "algorithm": "bandit-vivace",
+  "built_at": "2026-08-20T00:00:00Z",
+  "trained_on": [
+    "builtin-conservative-baseline"
+  ],
+  "contexts": {
+    "rtt_millis": [
+      10,
+      40,
+      120
+    ],
+    "rate_mbps": [
+      10,
+      100,
+      500
+    ],
+    "loss_ppm": [
+      1000,
+      10000,
+      30000
+    ]
+  },
+  "presets": [
+    {
+      "name": "shared-conservative",
+      "proposal": {
+        "preset": "shared-conservative",
+        "up_gain_milli": 1150,
+        "headroom_milli": 250,
+        "cwnd_gain_milli": 2000,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {}
+    },
+    {
+      "name": "private-aggressive",
+      "proposal": {
+        "preset": "private-aggressive",
+        "up_gain_milli": 1350,
+        "headroom_milli": 100,
+        "cwnd_gain_milli": 2500,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {
+        "fec_data_cells": 0,
+        "fec_parity_cells": 0,
+        "train_target_bytes": 65536,
+        "bulk_quantum_cells": 4,
+        "cover_overhead_per_mille": 0
+      }
+    },
+    {
+      "name": "lossy-radio",
+      "proposal": {
+        "preset": "lossy-radio",
+        "up_gain_milli": 1250,
+        "headroom_milli": 150,
+        "cwnd_gain_milli": 2500,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {
+        "fec_data_cells": 8,
+        "fec_parity_cells": 2,
+        "train_target_bytes": 32768,
+        "bulk_quantum_cells": 2,
+        "cover_overhead_per_mille": 0
+      }
+    },
+    {
+      "name": "policer",
+      "proposal": {
+        "preset": "policer",
+        "up_gain_milli": 1100,
+        "headroom_milli": 250,
+        "cwnd_gain_milli": 2000,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": true
+      },
+      "action": {
+        "fec_data_cells": 8,
+        "fec_parity_cells": 1,
+        "train_target_bytes": 16384,
+        "bulk_quantum_cells": 1,
+        "cover_overhead_per_mille": 0
+      }
+    },
+    {
+      "name": "long-fat",
+      "proposal": {
+        "preset": "long-fat",
+        "up_gain_milli": 1250,
+        "headroom_milli": 150,
+        "cwnd_gain_milli": 3000,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {
+        "fec_data_cells": 8,
+        "fec_parity_cells": 1,
+        "train_target_bytes": 65536,
+        "bulk_quantum_cells": 4,
+        "cover_overhead_per_mille": 0
+      }
+    },
+    {
+      "name": "relay-reliable",
+      "proposal": {
+        "preset": "relay-reliable",
+        "up_gain_milli": 1100,
+        "headroom_milli": 300,
+        "cwnd_gain_milli": 1500,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {
+        "fec_data_cells": 0,
+        "fec_parity_cells": 0,
+        "train_target_bytes": 32768,
+        "bulk_quantum_cells": 2,
+        "cover_overhead_per_mille": 0
+      }
+    },
+    {
+      "name": "low-rtt-host",
+      "proposal": {
+        "preset": "low-rtt-host",
+        "up_gain_milli": 1350,
+        "headroom_milli": 100,
+        "cwnd_gain_milli": 2500,
+        "pacing_cap_bytes_per_second": 0,
+        "loss_is_congestion": false
+      },
+      "action": {
+        "fec_data_cells": 0,
+        "fec_parity_cells": 0,
+        "train_target_bytes": 65536,
+        "bulk_quantum_cells": 4,
+        "cover_overhead_per_mille": 0
+      }
+    }
+  ],
+  "priors": {},
+  "weights": {
+    "balanced": {
+      "throughput": 1.0,
+      "queue_delay": 0.8,
+      "latency_sojourn": 0.8,
+      "residual_loss": 1.0,
+      "jitter": 0.3,
+      "cpu": 0.3,
+      "wire_overhead": 0.4,
+      "memory": 0.1
+    },
+    "latency": {
+      "throughput": 0.6,
+      "queue_delay": 1.5,
+      "latency_sojourn": 1.5,
+      "residual_loss": 1.0,
+      "jitter": 0.3,
+      "cpu": 0.3,
+      "wire_overhead": 0.4,
+      "memory": 0.1
+    },
+    "throughput": {
+      "throughput": 1.5,
+      "queue_delay": 0.4,
+      "latency_sojourn": 0.2,
+      "residual_loss": 1.0,
+      "jitter": 0.3,
+      "cpu": 0.3,
+      "wire_overhead": 0.4,
+      "memory": 0.1
+    }
+  },
+  "exploration": {
+    "minimum_dwell_millis": 10000,
+    "minimum_rtt_rounds": 8,
+    "minimum_samples": 8,
+    "maximum_cpu_per_mille": 900,
+    "rollback_regression_per_mille": 100
+  },
+  "digest": "557c102ccc0b85a1b3c749912ca6c5568b51abfe12543728a0f37db8ab36b7c3"
+}

@@ -28,7 +28,7 @@ FROM debian:trixie-slim
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates conntrack iperf3 iproute2 iptables iputils-ping jq netcat-openbsd passwd procps python3 systemd \
+       bind9-dnsutils ca-certificates conntrack iperf3 iproute2 iptables iputils-ping jq netcat-openbsd passwd procps python3 systemd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/ironet /usr/local/bin/ironet

@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::{
     config::Config,
     extensions::{self, ExtensionState},
-    observability::{PeerStatus, RuntimeStatus, read_status},
+    status::{PeerStatus, RuntimeStatus},
     trace::{self, PingResult, PingSample, TraceHop, TraceResult},
 };
 use ironet_extension_sdk::{
@@ -279,7 +279,7 @@ pub async fn serve(
     socket_path: PathBuf,
     active_config: watch::Receiver<Config>,
     command_tx: mpsc::Sender<DaemonCommand>,
-    runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+    runtime_state: watch::Receiver<Option<Arc<crate::v2_runtime::V2RuntimeState>>>,
     events: Arc<EventLog>,
 ) -> Result<()> {
     let owner_uid = tokio::fs::metadata(&socket_path)
@@ -341,7 +341,7 @@ async fn handle_connection(
     owner_uid: u32,
     active_config: watch::Receiver<Config>,
     command_tx: mpsc::Sender<DaemonCommand>,
-    runtime_state: watch::Receiver<Option<Arc<crate::observability::RuntimeState>>>,
+    runtime_state: watch::Receiver<Option<Arc<crate::v2_runtime::V2RuntimeState>>>,
     events: Arc<EventLog>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -579,28 +579,48 @@ async fn handle_connection(
             }
         }
         Method::Status => {
-            let config = active_config.borrow().clone();
-            match load_status(&config).await {
-                Ok(status) => send_result(&mut writer, request.id, &status).await?,
-                Err(error) => {
+            let state = runtime_state.borrow().clone();
+            match state {
+                Some(state) => match state.live_snapshot().await {
+                    Ok(status) => send_result(&mut writer, request.id, &status).await?,
+                    Err(error) => {
+                        send_error(
+                            &mut writer,
+                            request.id,
+                            RpcError::new("status_unavailable", error.to_string()),
+                        )
+                        .await?
+                    }
+                },
+                None => {
                     send_error(
                         &mut writer,
                         request.id,
-                        RpcError::new("status_unavailable", error.to_string()),
+                        RpcError::new("runtime_unavailable", "data plane is not active"),
                     )
                     .await?
                 }
             }
         }
         Method::Peers => {
-            let config = active_config.borrow().clone();
-            match load_status(&config).await {
-                Ok(status) => send_result(&mut writer, request.id, &status.peers).await?,
-                Err(error) => {
+            let state = runtime_state.borrow().clone();
+            match state {
+                Some(state) => match state.live_snapshot().await {
+                    Ok(status) => send_result(&mut writer, request.id, &status.peers).await?,
+                    Err(error) => {
+                        send_error(
+                            &mut writer,
+                            request.id,
+                            RpcError::new("status_unavailable", error.to_string()),
+                        )
+                        .await?
+                    }
+                },
+                None => {
                     send_error(
                         &mut writer,
                         request.id,
-                        RpcError::new("status_unavailable", error.to_string()),
+                        RpcError::new("runtime_unavailable", "data plane is not active"),
                     )
                     .await?
                 }
@@ -608,23 +628,34 @@ async fn handle_connection(
         }
         Method::Health => {
             let config = active_config.borrow().clone();
-            match load_status(&config).await {
-                Ok(status) => match ensure_healthy(&config, &status) {
-                    Ok(()) => send_result(&mut writer, request.id, &status).await?,
+            let state = runtime_state.borrow().clone();
+            match state {
+                Some(state) => match state.live_snapshot().await {
+                    Ok(status) => match ensure_healthy(&config, &status) {
+                        Ok(()) => send_result(&mut writer, request.id, &status).await?,
+                        Err(error) => {
+                            send_error(
+                                &mut writer,
+                                request.id,
+                                RpcError::new("unhealthy", error.to_string()),
+                            )
+                            .await?
+                        }
+                    },
                     Err(error) => {
                         send_error(
                             &mut writer,
                             request.id,
-                            RpcError::new("unhealthy", error.to_string()),
+                            RpcError::new("status_unavailable", error.to_string()),
                         )
                         .await?
                     }
                 },
-                Err(error) => {
+                None => {
                     send_error(
                         &mut writer,
                         request.id,
-                        RpcError::new("status_unavailable", error.to_string()),
+                        RpcError::new("runtime_unavailable", "data plane is not active"),
                     )
                     .await?
                 }
@@ -716,9 +747,21 @@ async fn handle_connection(
                 return Ok(());
             }
             let config = active_config.borrow().clone();
+            let oam_events = runtime_state
+                .borrow()
+                .as_ref()
+                .map(|state| state.subscribe_trace_events());
             let (hop_tx, mut hop_rx) = mpsc::channel(1);
             let trace_task = tokio::spawn(async move {
-                trace::run_streaming(&config, target, max_hops, timeout, Some(hop_tx)).await
+                trace::run_streaming_with_oam(
+                    &config,
+                    target,
+                    max_hops,
+                    timeout,
+                    oam_events,
+                    Some(hop_tx),
+                )
+                .await
             });
             while let Some(hop) = hop_rx.recv().await {
                 send_message(
@@ -895,20 +938,8 @@ fn validate_extension_candidate(config: &Config, state: &ExtensionState) -> Resu
     candidate.validate()
 }
 
-async fn load_status(config: &Config) -> Result<RuntimeStatus> {
-    read_status(&config.observability.status_file).await
-}
-
 pub fn ensure_healthy(config: &Config, status: &RuntimeStatus) -> Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let maximum_age = config.observability.report_interval_secs * 3 + 5;
-    ensure!(
-        now.saturating_sub(status.updated_unix) <= maximum_age,
-        "runtime status is stale"
-    );
+    let _ = config;
     ensure!(status.ready, "runtime is not ready");
     Ok(())
 }
@@ -1262,22 +1293,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        capacity::RouteEstimateTable,
-        capacity_probe::ProbeStatusSnapshot,
-        flow_router::FlowRouterConfig,
-        mesh::MeshStatus,
-        observability::{CapacityObservability, FlowRouterCounters, RuntimeState},
-    };
+    use crate::v2_runtime::{V2RuntimeConfig, V2RuntimeState};
     use iroh::SecretKey;
-    use std::sync::RwLock;
-    use std::{collections::HashMap, os::unix::fs::PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncWriteExt, BufReader};
 
     fn test_config(directory: &Path) -> Config {
-        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
-        config.observability.status_file = directory.join("status.json");
-        config
+        let _ = directory;
+        toml::from_str(include_str!("../config/example.toml")).unwrap()
     }
 
     #[tokio::test]
@@ -1364,7 +1387,7 @@ mod tests {
         ));
 
         let error = status(&socket).await.unwrap_err();
-        assert!(error.to_string().contains("daemon status_unavailable"));
+        assert!(error.to_string().contains("daemon runtime_unavailable"));
         server.abort();
     }
 
@@ -1478,41 +1501,18 @@ mod tests {
         let socket = directory.path().join("control.sock");
         let listener = bind(&socket).await.unwrap();
         let config = test_config(directory.path());
-        let status = RuntimeStatus {
-            ready: true,
-            endpoint_id: "endpoint".into(),
-            started_unix: 1,
-            updated_unix: 2,
-            uptime_seconds: 1,
-            routes_ready: true,
-            routes: Vec::new(),
-            peers: Vec::new(),
-            network: Default::default(),
-            mesh: MeshStatus::default(),
-            capacities: Vec::new(),
-            capacity_table_entries: 0,
-            capacity_table_limit: 4_096,
-            capacity_probe_in_flight: false,
-            capacity_probe_budget_bytes: 256 * 1024,
-            capacity_probe_attempts: 0,
-            capacity_probe_failures: 0,
-            capacity_probe_bytes: 0,
-            flow_router: Default::default(),
-        };
-        tokio::fs::write(
-            &config.observability.status_file,
-            serde_json::to_vec(&status).unwrap(),
-        )
-        .await
-        .unwrap();
+        let endpoint_id = SecretKey::from_bytes(&[12; 32]).public();
+        let runtime_config = V2RuntimeConfig::from_product_config(&config).unwrap();
+        let runtime_state = Arc::new(V2RuntimeState::new(&runtime_config, endpoint_id));
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_active_tx, active_rx) = watch::channel(config);
+        let (_state_tx, state_rx) = watch::channel(Some(runtime_state));
         let server = tokio::spawn(serve(
             listener,
             socket.clone(),
             active_rx,
             command_tx,
-            watch::channel(None).1,
+            state_rx,
             Arc::new(EventLog::default()),
         ));
 
@@ -1521,28 +1521,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_snapshot_reads_in_memory_runtime_state() {
+    async fn live_snapshot_reads_v2_runtime_state() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("control.sock");
         let listener = bind(&socket).await.unwrap();
         let config = test_config(directory.path());
-        let runtime_state = Arc::new(RuntimeState::new(
-            SecretKey::from_bytes(&[11; 32]).public(),
-            100,
-            Vec::new(),
-            Arc::new(RwLock::new(HashMap::new())),
-            None,
-            CapacityObservability::new(
-                Arc::new(RwLock::new(RouteEstimateTable::default())),
-                Arc::new(RwLock::new(ProbeStatusSnapshot::default())),
-                None,
-            ),
-            Arc::new(FlowRouterCounters::default()),
-        ));
-        runtime_state
-            .flow_router_for_test()
-            .active_flows
-            .store(42, std::sync::atomic::Ordering::Relaxed);
+        let endpoint_id = SecretKey::from_bytes(&[11; 32]).public();
+        let runtime_config = V2RuntimeConfig::from_product_config(&config).unwrap();
+        let runtime_state = Arc::new(V2RuntimeState::new(&runtime_config, endpoint_id));
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_active_tx, active_rx) = watch::channel(config);
         let (_state_tx, state_rx) = watch::channel(Some(runtime_state));
@@ -1556,11 +1542,7 @@ mod tests {
         ));
 
         let status = snapshot(&socket).await.unwrap();
-        assert_eq!(status.flow_router.active_flows, 42);
-        assert_eq!(
-            status.flow_router.max_flows,
-            FlowRouterConfig::default().max_flows as u64
-        );
+        assert_eq!(status.endpoint_id, endpoint_id.to_string());
         server.abort();
     }
 
@@ -1634,7 +1616,7 @@ mod tests {
             .expect("request should resume after a slot is released")
             .unwrap()
             .unwrap_err();
-        assert!(error.to_string().contains("status_unavailable"));
+        assert!(error.to_string().contains("runtime_unavailable"));
         drop(idle);
         server.abort();
     }

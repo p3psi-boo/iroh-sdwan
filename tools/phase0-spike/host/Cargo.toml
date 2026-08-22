@@ -1,0 +1,23 @@
+[package]
+name = "phase0-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Minimal feature set: no default features, no async, no cache, no wat, no gc, no threads.
+wasmtime = { version = "43.0.0", default-features = false, features = ["runtime", "component-model", "std"] }
+
+[features]
+default = []
+# Marker feature: allows Engine with target pulley64 (interpreter). Without `cranelift`
+# only `Component::deserialize*` of precompiled artifacts is available.
+pulley = ["wasmtime/pulley"]
+# Cranelift compiler: enables Component::new / Engine::precompile_component.
+cranelift = ["wasmtime/cranelift"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

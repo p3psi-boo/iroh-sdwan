@@ -13,15 +13,30 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 use iroh::EndpointId;
 use ironet::{
-    address::network_alpn,
     config::Config,
     control::{self, DEFAULT_CONTROL_SOCKET},
     deployment,
     derp::{identity::DerpIdentity, probe_server, tls_config},
-    display, identity, logging,
-    observability::{PeerStatus, RuntimeStatus},
-    product,
+    display, identity, logging, product,
+    protocol::v2::{
+        learner::LearnerModeV2,
+        policy::{
+            api::PolicyBackend,
+            package::{
+                self as policy_package, PackageLimits, PolicyManifestV1, PolicyPackage, TrustBasis,
+            },
+            runtime::{PolicyEngine, PolicyLoader},
+            signature::{
+                PolicyPublicKey, PolicySigningKey, TrustStoreV1, TrustedSigner, encode_digest,
+                parse_digest,
+            },
+        },
+        policy_tick::PolicySlotV1,
+        replay::{ReplayTapSampleV2, TickReplayReportV2, replay_ticks},
+        utility::Objective,
+    },
     routes::RouteRegistry,
+    status::{PeerStatus, RuntimeStatus},
     trace::{self, PingResult},
     tui,
 };
@@ -101,7 +116,7 @@ enum Command {
     /// assigns an overlay address, and starts the service unless `--no-start` is set.
     /// With no invite argument on an interactive terminal, the command prompts for it.
     #[command(
-        after_help = "Examples:\n  ironet join 'ironet://join/v1/...'\n  ironet join --invite-file invite.txt\n  cat invite.txt | ironet join --invite-file - --output json"
+        after_help = "Examples:\n  ironet join 'ironet://join/v2/...'\n  ironet join --invite-file invite.txt\n  cat invite.txt | ironet join --invite-file - --output json"
     )]
     Join {
         /// Invite URL; omit it to use `--invite-file` or the interactive prompt.
@@ -198,8 +213,8 @@ enum Command {
     },
     /// Show the latest status published by the daemon.
     ///
-    /// Status includes readiness, uptime, installed routes, peer connections, network
-    /// discovery, path capacity, and packet forwarding counters.
+    /// Status includes readiness, uptime, installed routes, peer connections, live QUIC
+    /// path state, and V2 Cell/PacketTrain/FEC/Repair counters.
     Status {
         /// Select the output format.
         #[arg(short, long, visible_alias = "format", value_enum, default_value_t)]
@@ -208,6 +223,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export the live V2 runtime snapshot in Prometheus text format.
+    ///
+    /// Every metric is derived from the same in-memory snapshot as `status` and
+    /// uses the `ironet_v2_` namespace; no V1 metric aliases are emitted.
+    Metrics,
     /// Open a terminal view of status, peers, routes, and diagnostics.
     ///
     /// The view reads daemon state repeatedly and does not change the configuration.
@@ -276,6 +296,154 @@ enum Command {
         #[command(subcommand)]
         command: RouteCommand,
     },
+    /// Generate signing keys and inspect, sign, or verify WASM policy packages.
+    ///
+    /// A policy package is a WebAssembly component carrying an `ironet.manifest.v1`
+    /// custom section and, once signed, a trailing `ironet.signature.v1` section
+    /// (Ed25519 over the BLAKE3 digest of the preceding bytes).
+    #[command(
+        after_help = "Examples:\n  ironet policy keygen --output signer.key\n  ironet policy sign --key signer.key unsigned.wasm --output policy.wasm\n  ironet policy inspect policy.wasm\n  ironet policy verify policy.wasm --signer-pubkey ed25519:...\n  ironet policy verify policy.wasm            # trust store from the sealed configuration"
+    )]
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Generate an Ed25519 signing key and print its signer id and public key.
+    ///
+    /// The secret key is written with mode 0600; the public key is written next to it
+    /// as `PATH.pub`.
+    Keygen {
+        /// Destination for the secret key.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Signer id to print; defaults to the first 8 bytes of BLAKE3(public key).
+        #[arg(long, value_name = "ID")]
+        signer_id: Option<String>,
+    },
+    /// Show manifest, signer, digest, section table and file size.
+    Inspect {
+        /// Policy package (`.wasm`).
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a package against the sealed trust store or an explicit key/pin.
+    ///
+    /// Without `--signer-pubkey`/`--digest-pin` the `[autotune.wasm]` trust store of the
+    /// configuration file (`--config`) is used.
+    Verify {
+        /// Policy package (`.wasm`).
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Accept signatures from this `ed25519:<hex|base32>` public key (repeatable).
+        #[arg(long, value_name = "KEY")]
+        signer_pubkey: Vec<String>,
+        /// Accept an unsigned package with this `blake3:<hex>` digest (repeatable).
+        #[arg(long, value_name = "DIGEST")]
+        digest_pin: Vec<String>,
+    },
+    /// Sign a package; an existing signature is replaced.
+    Sign {
+        /// Secret key file written by `keygen`.
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+        /// Unsigned (or previously signed) package.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Destination for the signed package.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Signer id recorded in the signature; defaults to the key's signer id.
+        #[arg(long, value_name = "ID")]
+        signer_id: Option<String>,
+        /// Attach (or replace) the manifest from this JSON file before signing.
+        #[arg(long, value_name = "MANIFEST_JSON")]
+        manifest: Option<PathBuf>,
+    },
+    /// Replay a policy over a recorded autotune tap fixture, offline and
+    /// deterministic, through the production PolicyBackend/guardrail pipeline.
+    ///
+    /// POLICY is `builtin`, `native`, or an absolute path to a `.wasm`
+    /// package. `builtin` runs the embedded builtin.wasm component through
+    /// the verified loader; an external `.wasm` package is verified against
+    /// the sealed trust store of `--config`, or against
+    /// `--signer-pubkey`/`--digest-pin`.
+    Replay {
+        /// `builtin`, `native`, or an absolute `.wasm` path.
+        #[arg(value_name = "POLICY")]
+        policy: String,
+        /// Tap fixture: JSON array, profile summary, or JSONL; '-' reads stdin.
+        #[arg(value_name = "FIXTURE")]
+        fixture: PathBuf,
+        /// Side selected from a profile summary's autotune_tap object.
+        #[arg(long, default_value = "a")]
+        side: String,
+        /// Utility objective the host applies to the policy output.
+        #[arg(long, value_enum, default_value_t = ReplayObjective::Balanced)]
+        objective: ReplayObjective,
+        /// Learner mode the policy runs in (`shadow` matches the checked-in
+        /// golden fixtures).
+        #[arg(long, value_enum, default_value_t = ReplayMode::Shadow)]
+        mode: ReplayMode,
+        /// Fixed deterministic seed for the policy pipeline.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Compare the run against a previously written report; exits non-zero
+        /// on the first diverging sample (deterministic assert).
+        #[arg(long, value_name = "REPORT_JSON")]
+        golden: Option<PathBuf>,
+        /// Report path; '-' writes stdout.
+        #[arg(long, default_value = "-")]
+        output: PathBuf,
+        /// Accept `.wasm` signatures from this `ed25519:<hex|base32>` public
+        /// key instead of the sealed trust store (repeatable).
+        #[arg(long, value_name = "KEY")]
+        signer_pubkey: Vec<String>,
+        /// Accept an unsigned `.wasm` package with this `blake3:<hex>` digest
+        /// (repeatable).
+        #[arg(long, value_name = "DIGEST")]
+        digest_pin: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReplayObjective {
+    Balanced,
+    Throughput,
+    Latency,
+}
+
+impl From<ReplayObjective> for ironet::protocol::v2::utility::Objective {
+    fn from(value: ReplayObjective) -> Self {
+        match value {
+            ReplayObjective::Balanced => Self::Balanced,
+            ReplayObjective::Throughput => Self::Throughput,
+            ReplayObjective::Latency => Self::Latency,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReplayMode {
+    Off,
+    Shadow,
+    On,
+}
+
+impl From<ReplayMode> for ironet::protocol::v2::learner::LearnerModeV2 {
+    fn from(value: ReplayMode) -> Self {
+        match value {
+            ReplayMode::Off => Self::Off,
+            ReplayMode::Shadow => Self::Shadow,
+            ReplayMode::On => Self::On,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,9 +472,15 @@ enum NetworkCommand {
         /// Add a Tailscale DERP server URL; repeat the option for multiple servers.
         #[arg(long = "derp-server", value_name = "URL")]
         derp_servers: Vec<String>,
-        /// Bind a fixed UDP address; repeat the option for multiple addresses.
+        /// Bind one dual-stack UDP address.
         #[arg(long = "listen", value_name = "IP:PORT")]
-        bind_addresses: Vec<SocketAddr>,
+        bind_address: Option<SocketAddr>,
+        /// Override the embedded DNS suffix generated for this network.
+        #[arg(long, value_name = "DOMAIN", conflicts_with = "no_dns")]
+        dns_domain: Option<String>,
+        /// Disable embedded authoritative DNS and host resolver integration.
+        #[arg(long)]
+        no_dns: bool,
         /// Reuse an identity retained by `network leave --keep-identity`.
         #[arg(long)]
         reuse_identity: bool,
@@ -556,7 +730,9 @@ async fn main() -> Result<()> {
         Some(Command::Network { command }) => {
             network_command(&config, &socket, &state_dir, command).await
         }
-        Some(Command::Invite { command }) => invite_command(&config, &state_dir, command).await,
+        Some(Command::Invite { command }) => {
+            invite_command(&config, &socket, &state_dir, command).await
+        }
         Some(Command::Join {
             invite,
             invite_file,
@@ -615,6 +791,7 @@ async fn main() -> Result<()> {
         Some(Command::Status { output, json }) => {
             status(&socket, if json { OutputFormat::Json } else { output }).await
         }
+        Some(Command::Metrics) => metrics(&socket).await,
         Some(Command::Tui { interval_ms }) => {
             tui::run(&config, &socket, Duration::from_millis(interval_ms)).await
         }
@@ -640,6 +817,7 @@ async fn main() -> Result<()> {
         }) => restore_identity(&source, &identity_file),
         Some(Command::Doctor) => doctor(&config).await,
         Some(Command::Route { command }) => route(&config, &socket, command).await,
+        Some(Command::Policy { command }) => policy_command(&config, command).await,
     }
 }
 
@@ -709,7 +887,9 @@ async fn network_command(
             address_pool,
             ipv6_address_pool,
             derp_servers,
-            bind_addresses,
+            bind_address,
+            dns_domain,
+            no_dns,
             reuse_identity,
             no_start,
             output,
@@ -723,7 +903,9 @@ async fn network_command(
                     address_pool,
                     ipv6_address_pool,
                     derp_servers,
-                    bind_addresses,
+                    bind_address,
+                    dns_domain,
+                    no_dns,
                     reuse_identity,
                 },
             )
@@ -770,7 +952,12 @@ async fn network_command(
     }
 }
 
-async fn invite_command(config: &Path, state_dir: &Path, command: InviteCommand) -> Result<()> {
+async fn invite_command(
+    config: &Path,
+    socket: &Path,
+    state_dir: &Path,
+    command: InviteCommand,
+) -> Result<()> {
     match command {
         InviteCommand::Create {
             expires,
@@ -781,6 +968,7 @@ async fn invite_command(config: &Path, state_dir: &Path, command: InviteCommand)
             let lifetime = product::parse_duration(&expires)?;
             let invite =
                 product::create_invite(config, state_dir, Some(lifetime), addresses, node_id)?;
+            let _ = reload_if_running(socket).await?;
             match output {
                 OutputFormat::Human => {
                     println!("{}", invite.token);
@@ -835,9 +1023,8 @@ async fn invite_command(config: &Path, state_dir: &Path, command: InviteCommand)
         }
         InviteCommand::Revoke { id, output } => {
             let changed = product::revoke_invite(state_dir, &id)?;
-            // Admission reads the authority registry for every new handshake, so invite
-            // changes take effect immediately without restarting the data plane.
-            print_change(output, "invite", &id, changed, true)
+            let applied = reload_if_running(socket).await?;
+            print_change(output, "invite", &id, changed, applied)
         }
     }
 }
@@ -1009,6 +1196,10 @@ fn print_network_summary(
                 println!("Network:  {}", summary.network);
                 println!("Node:     {}", summary.node);
                 println!("Addresses: {}", summary.addresses.join(", "));
+                println!(
+                    "DNS:      {}",
+                    summary.dns_domain.as_deref().unwrap_or("disabled")
+                );
                 println!("Endpoint: {}", summary.endpoint_id);
                 return Ok(());
             } else if summary.created {
@@ -1021,6 +1212,9 @@ fn print_network_summary(
                 "✓ Assigned overlay addresses {}",
                 summary.addresses.join(", ")
             );
+            if let Some(domain) = &summary.dns_domain {
+                println!("✓ Enabled embedded DNS for {domain}");
+            }
             match started {
                 Some(true) => println!("✓ ironet is running"),
                 Some(false) => println!("State created; service start was skipped"),
@@ -1388,6 +1582,442 @@ async fn reload_routes(socket_path: &Path, defer: bool) -> Result<RouteReload> {
     Ok(RouteReload::Reloaded(ack.generation))
 }
 
+async fn policy_command(config_path: &Path, command: PolicyCommand) -> Result<()> {
+    match command {
+        PolicyCommand::Keygen { output, signer_id } => policy_keygen(&output, signer_id),
+        PolicyCommand::Inspect { file, json } => policy_inspect(&file, json),
+        PolicyCommand::Verify {
+            file,
+            signer_pubkey,
+            digest_pin,
+        } => policy_verify(config_path, &file, &signer_pubkey, &digest_pin).await,
+        PolicyCommand::Sign {
+            key,
+            file,
+            output,
+            signer_id,
+            manifest,
+        } => policy_sign(&key, &file, &output, signer_id, manifest.as_deref()),
+        PolicyCommand::Replay {
+            policy,
+            fixture,
+            side,
+            objective,
+            mode,
+            seed,
+            golden,
+            output,
+            signer_pubkey,
+            digest_pin,
+        } => {
+            policy_replay(
+                config_path,
+                &policy,
+                &fixture,
+                &side,
+                objective.into(),
+                mode.into(),
+                seed,
+                golden.as_deref(),
+                &output,
+                &signer_pubkey,
+                &digest_pin,
+            )
+            .await
+        }
+    }
+}
+
+fn policy_keygen(output: &Path, signer_id: Option<String>) -> Result<()> {
+    ensure!(
+        !output.exists(),
+        "refusing to overwrite existing key {}",
+        output.display()
+    );
+    let key = PolicySigningKey::generate()?;
+    key.write_file(output)?;
+    let public = key.public();
+    let public_path = companion_path(output, ".pub");
+    deployment::atomic_write(
+        &public_path,
+        format!("{}\n", public.encode()).as_bytes(),
+        0o644,
+    )?;
+    let signer_id = signer_id.unwrap_or_else(|| public.default_signer_id());
+    println!("signer_id = {signer_id}");
+    println!("public_key = {public}");
+    println!("key_file = {}", output.display());
+    println!("public_key_file = {}", public_path.display());
+    Ok(())
+}
+
+fn companion_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn read_policy_package(file: &Path, limits: PackageLimits) -> Result<PolicyPackage> {
+    let bytes =
+        std::fs::read(file).with_context(|| format!("failed reading {}", file.display()))?;
+    PolicyPackage::parse(&bytes, limits)
+        .with_context(|| format!("{} is not a valid policy package", file.display()))
+}
+
+fn policy_inspect(file: &Path, json: bool) -> Result<()> {
+    let package = read_policy_package(file, PackageLimits::default())?;
+    if json {
+        let value = serde_json::json!({
+            "file": file.display().to_string(),
+            "file_len": package.file_len,
+            "body_len": package.body_len,
+            "digest": package.digest_string(),
+            "signed": package.signature.is_some(),
+            "signer_id": package.signature.as_ref().map(|signature| signature.signer_id.clone()),
+            "signature": package.signature,
+            "manifest": package.manifest,
+            "sections": package.sections,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let manifest = &package.manifest;
+    println!("file = {}", file.display());
+    println!("size = {} bytes", package.file_len);
+    println!("signed_prefix = {} bytes", package.body_len);
+    println!("digest = {}", package.digest_string());
+    match &package.signature {
+        Some(signature) => {
+            println!("signed = true");
+            println!("signer_id = {}", signature.signer_id);
+            println!("signature_format = {}", signature.signature_format);
+            println!("signature_digest = {}", signature.digest);
+            println!("signature = {}", signature.signature);
+        }
+        None => println!("signed = false"),
+    }
+    println!("policy_id = {}", manifest.policy_id);
+    println!("policy_version = {}", manifest.policy_version);
+    println!("format_version = {}", manifest.format_version);
+    println!("abi_world = {}", manifest.abi_world);
+    println!(
+        "extensions_supported = [{}]",
+        join_numbers(&manifest.extensions_supported)
+    );
+    println!("state_schema = {}", manifest.state_schema);
+    println!(
+        "state_schema_accepts = [{}]",
+        join_numbers(&manifest.state_schema_accepts)
+    );
+    println!("capabilities = [{}]", manifest.capabilities.join(", "));
+    println!("minimum_host_version = {}", manifest.minimum_host_version);
+    println!("maximum_state_bytes = {}", manifest.maximum_state_bytes);
+    println!(
+        "requested_memory_bytes = {}",
+        manifest.requested_memory_bytes
+    );
+    println!("requested_fuel = {}", manifest.requested_fuel);
+    println!("built_at = {}", manifest.built_at);
+    println!("source_revision = {}", manifest.source_revision);
+    println!("sections:");
+    for (index, section) in package.sections.iter().enumerate() {
+        println!(
+            "  #{index} id={} kind={} name={:?} offset={} len={} payload_len={}",
+            section.id,
+            section.kind(),
+            section.name.as_deref().unwrap_or("-"),
+            section.offset,
+            section.len,
+            section.payload_len
+        );
+    }
+    Ok(())
+}
+
+fn join_numbers<T: ToString>(values: &[T]) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn policy_verify(
+    config_path: &Path,
+    file: &Path,
+    signer_pubkeys: &[String],
+    digest_pins: &[String],
+) -> Result<()> {
+    let (limits, mut trust, trust_source) = if signer_pubkeys.is_empty() && digest_pins.is_empty() {
+        let config = Config::load(config_path).await?;
+        let trust = TrustStoreV1::from_config(&config.autotune.wasm).with_context(|| {
+            format!(
+                "invalid [autotune.wasm] trust store in {}",
+                config_path.display()
+            )
+        })?;
+        (
+            PackageLimits::from_config(&config.autotune.wasm),
+            trust,
+            format!("config {}", config_path.display()),
+        )
+    } else {
+        let mut trust = TrustStoreV1::default();
+        trust.require_signature = !signer_pubkeys.is_empty();
+        for pin in digest_pins {
+            trust.add_digest_pin(parse_digest(pin)?);
+        }
+        (PackageLimits::default(), trust, "command line".to_owned())
+    };
+    let package = read_policy_package(file, limits)?;
+    // Explicit keys match whichever signer id the package claims, so that
+    // `--signer-pubkey` answers "was this signed by that key?".
+    let claimed_signer = package
+        .signature
+        .as_ref()
+        .map(|signature| signature.signer_id.clone());
+    for text in signer_pubkeys {
+        let mut signer = TrustedSigner::new(PolicyPublicKey::parse(text)?);
+        if let Some(signer_id) = &claimed_signer {
+            signer = signer.with_signer_id(signer_id.clone());
+        }
+        if trust.signer(&signer.signer_id).is_none() {
+            trust.add_signer(signer)?;
+        }
+    }
+    match package.verify(&trust, chrono::Utc::now()) {
+        Ok(verified) => {
+            println!("verify = ok");
+            println!(
+                "trust = {}",
+                match verified.trust {
+                    TrustBasis::Signer => "signer",
+                    TrustBasis::DigestPin => "digest_pin",
+                }
+            );
+            println!("trust_source = {trust_source}");
+            println!(
+                "signer_id = {}",
+                verified.signer_id.as_deref().unwrap_or("-")
+            );
+            println!("digest = {}", verified.digest_string());
+            println!("policy_id = {}", verified.manifest.policy_id);
+            println!("policy_version = {}", verified.manifest.policy_version);
+            Ok(())
+        }
+        Err(error) => {
+            println!("verify = failed");
+            println!("trust_source = {trust_source}");
+            println!("digest = {}", package.digest_string());
+            println!("signer_id = {}", claimed_signer.as_deref().unwrap_or("-"));
+            println!("reason = {error}");
+            Err(anyhow::Error::new(error)
+                .context(format!("{} failed verification", file.display())))
+        }
+    }
+}
+
+fn policy_sign(
+    key_path: &Path,
+    file: &Path,
+    output: &Path,
+    signer_id: Option<String>,
+    manifest_path: Option<&Path>,
+) -> Result<()> {
+    let key = PolicySigningKey::read_file(key_path)?;
+    let limits = PackageLimits::default();
+    let mut bytes =
+        std::fs::read(file).with_context(|| format!("failed reading {}", file.display()))?;
+    if let Some(manifest_path) = manifest_path {
+        let manifest_json = std::fs::read(manifest_path)
+            .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+        let manifest = PolicyManifestV1::from_json(&manifest_json)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        bytes = policy_package::attach_manifest(&bytes, &manifest, limits)?;
+    }
+    let signer_id = signer_id.unwrap_or_else(|| key.public().default_signer_id());
+    let signed = policy_package::sign(&bytes, &key, &signer_id, limits)?;
+    deployment::atomic_write(output, &signed, 0o644)
+        .with_context(|| format!("failed writing {}", output.display()))?;
+    let package = PolicyPackage::parse(&signed, limits)?;
+    println!("signed = {}", output.display());
+    println!("signer_id = {signer_id}");
+    println!("public_key = {}", key.public());
+    println!("digest = {}", package.digest_string());
+    println!("policy_id = {}", package.manifest.policy_id);
+    println!("policy_version = {}", package.manifest.policy_version);
+    println!("size = {} bytes", signed.len());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn policy_replay(
+    config_path: &Path,
+    policy: &str,
+    fixture: &Path,
+    side: &str,
+    objective: Objective,
+    mode: LearnerModeV2,
+    seed: u64,
+    golden: Option<&Path>,
+    output: &Path,
+    signer_pubkeys: &[String],
+    digest_pins: &[String],
+) -> Result<()> {
+    let input = read_replay_source(fixture)?;
+    let samples = decode_replay_samples(&input, side)?;
+    let (slot, weights) = match policy {
+        ironet::config::AUTOTUNE_POLICY_NATIVE => {
+            // Host-side conservative rules, no learner (plan Phase 6).
+            (PolicySlotV1::native_rules(), objective.weights())
+        }
+        ironet::config::AUTOTUNE_POLICY_BUILTIN => {
+            // The same component the daemon runs: the embedded builtin.wasm
+            // through the verified loader, trusted by its digest sidecar.
+            let backend = PolicyLoader::new(PolicyEngine::try_new()?)
+                .load_builtin(&ironet::config::AutotuneWasmConfig::default())
+                .context("loading the embedded builtin policy component")?;
+            let digest = backend
+                .identity()
+                .digest
+                .map(|digest| encode_digest(&digest))
+                .unwrap_or_default();
+            (
+                PolicySlotV1::new(Box::new(backend), None, digest),
+                objective.weights(),
+            )
+        }
+        selection if selection.to_ascii_lowercase().ends_with(".wasm") => {
+            let path = Path::new(selection);
+            ensure!(
+                path.is_absolute(),
+                "policy path must be absolute: {}",
+                path.display()
+            );
+            let (config, trust) = if signer_pubkeys.is_empty() && digest_pins.is_empty() {
+                let config = Config::load(config_path).await?;
+                let trust =
+                    TrustStoreV1::from_config(&config.autotune.wasm).with_context(|| {
+                        format!(
+                            "invalid [autotune.wasm] trust store in {}",
+                            config_path.display()
+                        )
+                    })?;
+                (config.autotune.wasm, trust)
+            } else {
+                let mut trust = TrustStoreV1::default();
+                trust.require_signature = !signer_pubkeys.is_empty();
+                for pin in digest_pins {
+                    trust.add_digest_pin(parse_digest(pin)?);
+                }
+                for text in signer_pubkeys {
+                    trust.add_signer(TrustedSigner::new(PolicyPublicKey::parse(text)?))?;
+                }
+                let config = ironet::config::AutotuneWasmConfig {
+                    require_signature: trust.require_signature,
+                    ..ironet::config::AutotuneWasmConfig::default()
+                };
+                (config, trust)
+            };
+            let backend = PolicyLoader::new(PolicyEngine::try_new()?)
+                .load_from_path(path, &config, &trust, chrono::Utc::now())
+                .with_context(|| format!("loading WASM policy {}", path.display()))?;
+            let digest = backend
+                .identity()
+                .digest
+                .map(|digest| encode_digest(&digest))
+                .unwrap_or_default();
+            (
+                PolicySlotV1::new(Box::new(backend), None, digest),
+                objective.weights(),
+            )
+        }
+        selection => {
+            let path = Path::new(selection);
+            ensure!(
+                path.is_absolute(),
+                "policy path must be absolute: {}",
+                path.display()
+            );
+            anyhow::bail!(
+                "policy {} is not a .wasm component: external JSON policy artifacts were removed in Phase 6; deploy a signed .wasm component",
+                path.display()
+            );
+        }
+    };
+    let report = replay_ticks(&samples, slot, weights, objective, mode, seed)?;
+    if let Some(golden_path) = golden {
+        let expected: TickReplayReportV2 = serde_json::from_str(&read_replay_source(golden_path)?)
+            .with_context(|| format!("decoding golden report {}", golden_path.display()))?;
+        if expected != report {
+            let divergence = report
+                .trace
+                .iter()
+                .zip(&expected.trace)
+                .position(|(actual, expected)| actual != expected)
+                .map(|index| format!("first diverging sample: {index}"));
+            anyhow::bail!(
+                "replay diverged from {} ({}; actual trace_digest {}, expected {})",
+                golden_path.display(),
+                divergence.as_deref().unwrap_or("report header differs"),
+                report.trace_digest,
+                expected.trace_digest
+            );
+        }
+        println!(
+            "golden = match ({} samples, trace_digest {})",
+            report.samples, report.trace_digest
+        );
+    }
+    let mut encoded = serde_json::to_vec_pretty(&report)?;
+    encoded.push(b'\n');
+    write_replay_output(output, &encoded)
+}
+
+fn read_replay_source(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        Ok(input)
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    }
+}
+
+fn decode_replay_samples(input: &str, side: &str) -> Result<Vec<ReplayTapSampleV2>> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        let selected = if let Some(samples) = value.as_array() {
+            serde_json::Value::Array(samples.clone())
+        } else if let Some(samples) = value.get("samples") {
+            samples.clone()
+        } else if let Some(samples) = value.get("autotune_tap").and_then(|tap| tap.get(side)) {
+            samples.clone()
+        } else {
+            serde_json::Value::Array(vec![value])
+        };
+        return serde_json::from_value(selected).context("decoding replay samples");
+    }
+
+    input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line)
+                .with_context(|| format!("decoding JSONL replay sample on line {}", index + 1))
+        })
+        .collect()
+}
+
+fn write_replay_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path == Path::new("-") {
+        std::io::stdout().write_all(bytes)?;
+    } else {
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 async fn backup_identity(config_path: &Path, output: &Path) -> Result<()> {
     let config = Config::load(config_path).await?;
     identity::backup(&config.identity_file, output)?;
@@ -1433,6 +2063,12 @@ async fn status(socket_path: &Path, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+async fn metrics(socket_path: &Path) -> Result<()> {
+    let status = control::status(socket_path).await?;
+    print!("{}", ironet::status::render_prometheus(&status));
+    Ok(())
+}
+
 fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<String> {
     match output {
         OutputFormat::Json => return Ok(format!("{}\n", serde_json::to_string_pretty(status)?)),
@@ -1462,115 +2098,47 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<String>
         display::duration(Duration::from_secs(status.uptime_seconds))
     )?;
     writeln!(rendered, "routes_ready: {}", status.routes_ready)?;
-    writeln!(
-        rendered,
-        "network: udp4={} udp6={} mapping_varies4={} mapping_varies6={} global4={} global6={} nat64={} candidates={}",
-        status.network.udp_ipv4,
-        status.network.udp_ipv6,
-        status
-            .network
-            .mapping_varies_by_destination_ipv4
-            .map_or("unknown".into(), |value| value.to_string()),
-        status
-            .network
-            .mapping_varies_by_destination_ipv6
-            .map_or("unknown".into(), |value| value.to_string()),
-        status
-            .network
-            .global_ipv4
-            .map_or("none".into(), |value| value.to_string()),
-        status
-            .network
-            .global_ipv6
-            .map_or("none".into(), |value| value.to_string()),
-        status.network.nat64_prefix.map_or("none".into(), |prefix| {
-            format!("{}/{}", prefix.network, prefix.prefix_len)
-        }),
-        status.network.candidates.len(),
-    )?;
-    for candidate in &status.network.candidates {
+    if let Some(dns) = &status.dns {
         writeln!(
             rendered,
-            "network_candidate: kind={} address={}",
-            single_line(&candidate.kind),
-            candidate.address
+            "dns: domain={} listen={} generation={} nodes={} conflicting_labels={} queries={}",
+            single_line(&dns.domain),
+            dns.listen_addr,
+            dns.catalog_generation,
+            dns.nodes,
+            dns.conflicting_labels,
+            dns.queries,
         )?;
+    } else {
+        writeln!(rendered, "dns: disabled")?;
     }
     writeln!(
         rendered,
-        "capacity: table={}/{} probe_in_flight={} probe_budget={} probe_attempts={} probe_failures={} probe_transferred={}",
-        status.capacity_table_entries,
-        status.capacity_table_limit,
-        status.capacity_probe_in_flight,
-        display::bytes(status.capacity_probe_budget_bytes as u64),
-        status.capacity_probe_attempts,
-        status.capacity_probe_failures,
-        display::bytes(status.capacity_probe_bytes),
+        "mesh: enabled={} directory={} max_peers={}",
+        status.mesh.enabled, status.mesh.directory_entries, status.mesh.max_total_peers
     )?;
     writeln!(
         rendered,
-        "flow_router: active_flows={}/{} decisions={} route_switches={} no_route_drops={}",
-        status.flow_router.active_flows,
-        status.flow_router.max_flows,
-        status.flow_router.decisions,
-        status.flow_router.route_switches,
-        status.flow_router.no_route_drops,
+        "gateway: transit={} subnet_nat={} advertised_prefixes={}",
+        status.gateway.transit_enabled,
+        status.gateway.subnet_nat_enabled,
+        status.gateway.advertised_prefixes.len()
     )?;
-    writeln!(
-        rendered,
-        "mesh: enabled={} directory={} quarantined={} max_peers={}",
-        status.mesh.enabled,
-        status.mesh.directory_entries,
-        status.mesh.quarantined_entries,
-        status.mesh.max_total_peers
-    )?;
+    for prefix in &status.gateway.advertised_prefixes {
+        writeln!(rendered, "advertised_prefix: {prefix}")?;
+    }
     for node in &status.mesh.nodes {
         writeln!(
             rendered,
-            "mesh_node {}: name={} direct={} relays={} prefixes={} transit={} quarantined={}",
+            "mesh_node {}: direct={} prefixes={} transit={}",
             single_line(&node.endpoint_id),
-            node.node_info
-                .as_ref()
-                .map(|info| single_line(&info.name))
-                .unwrap_or_else(|| "unknown".into()),
             node.direct_addresses.len(),
-            node.relay_urls.len(),
             node.prefixes.len(),
-            node.transit_enabled,
-            node.quarantined
+            node.transit_enabled
         )?;
     }
     for route in status.routes.iter().filter(|route| !route.present) {
         writeln!(rendered, "missing_route: {}", single_line(&route.prefix))?;
-    }
-    for capacity in &status.capacities {
-        writeln!(
-            rendered,
-            "capacity destination={} first_hop={} effective_rate={} measured_rate={} health={} freshness={} source={} age={} rtt={} switches={} probe_in_flight={} probe_next_due={} probe_attempts={} probe_failures={}",
-            single_line(&capacity.destination),
-            single_line(&capacity.first_hop),
-            display::bits_per_second(capacity.effective_capacity_bps),
-            capacity
-                .measured_capacity_bps
-                .map(display::bits_per_second)
-                .unwrap_or_else(|| "unknown".into()),
-            capacity.health_per_mille,
-            single_line(&capacity.freshness),
-            capacity.sample_source.as_deref().unwrap_or("none"),
-            capacity
-                .sample_age_millis
-                .map_or_else(|| "unknown".into(), display::millis),
-            capacity
-                .rtt_ewma_micros
-                .map_or_else(|| "unknown".into(), display::micros),
-            capacity.route_switches,
-            capacity.probe_in_flight,
-            capacity
-                .probe_next_due_millis
-                .map_or_else(|| "unknown".into(), display::millis),
-            capacity.probe_attempts,
-            capacity.probe_failures,
-        )?;
     }
     for peer in &status.peers {
         writeln!(rendered, "{}", format_peer_human(peer))?;
@@ -1604,21 +2172,6 @@ fn render_peers(peers: &[PeerStatus], output: OutputFormat) -> Result<String> {
             )?;
             for peer in peers {
                 writeln!(rendered, "{}", format_peer_human(peer))?;
-                for capacity in &peer.capacities {
-                    writeln!(
-                        rendered,
-                        "  route destination={} effective_rate={} health={} freshness={} source={} age={} switches={}",
-                        single_line(&capacity.destination),
-                        display::bits_per_second(capacity.effective_capacity_bps),
-                        capacity.health_per_mille,
-                        single_line(&capacity.freshness),
-                        capacity.sample_source.as_deref().unwrap_or("none"),
-                        capacity
-                            .sample_age_millis
-                            .map_or_else(|| "unknown".into(), display::millis),
-                        capacity.route_switches,
-                    )?;
-                }
             }
             Ok(rendered)
         }
@@ -1627,10 +2180,11 @@ fn render_peers(peers: &[PeerStatus], output: OutputFormat) -> Result<String> {
 
 fn format_peer_human(peer: &PeerStatus) -> String {
     format!(
-        "peer {}: endpoint_id={} interface={} connected={} path={}:{} rtt={} jitter={} loss={} fec={} queue={} tx_packets={} tx={} rx_packets={} rx={} policy_drops={} connection_errors={} send_errors={}",
+        "peer {}: endpoint_id={} interface={} protocol={} connected={} path={}:{} rtt={} pmtu={} cwnd={} queue={} tx_records={} tx={} rx_records={} rx={} trains={} cells={} fec_tx_cells={} fec_tx={} fec_rx_cells={} recovered={} repair={}/{} cover={}/{} drops={} errors={}",
         single_line(&peer.name),
         single_line(&peer.endpoint_id),
         single_line(&peer.interface),
+        peer.protocol_major,
         peer.connected,
         if peer.selected_path_transport.is_empty() {
             "unknown".into()
@@ -1643,24 +2197,33 @@ fn format_peer_human(peer: &PeerStatus) -> String {
             single_line(&peer.selected_path_remote)
         },
         human_micros(peer.path_rtt_micros),
-        human_micros(peer.path_jitter_micros),
-        format_loss(peer.path_loss_ppm),
-        if peer.fec_active {
-            format!(
-                "{}+{}@{}ms",
-                peer.fec_data_shards, peer.fec_recovery_shards, peer.fec_block_timeout_millis
-            )
-        } else {
-            "off".into()
-        },
-        display::bytes(peer.queue_bytes),
+        peer.path_mtu,
+        display::bytes(peer.path_cwnd_bytes),
+        display::bytes(
+            peer.packet_train_queue_bytes
+                .saturating_add(peer.latency_queue_bytes)
+        ),
         peer.tx_packets,
         display::bytes(peer.tx_bytes),
         peer.rx_packets,
         display::bytes(peer.rx_bytes),
-        peer.policy_drops,
-        peer.connection_errors,
-        peer.send_errors
+        peer.trains_built,
+        peer.cells_built,
+        peer.fec_tx_cells,
+        display::bytes(peer.fec_tx_bytes),
+        peer.fec_rx_cells,
+        peer.fec_recovered_cells,
+        peer.repair_received_cells,
+        peer.repair_requested_cells,
+        display::bytes(peer.cover_tx_bytes),
+        display::bytes(peer.cover_rx_bytes),
+        peer.route_gate_drops
+            .saturating_add(peer.tun_admission_drop_records)
+            .saturating_add(peer.reassembly_pressure_evictions)
+            .saturating_add(peer.pmtu_drop_datagrams),
+        peer.connection_errors
+            .saturating_add(peer.protocol_datagram_errors)
+            .saturating_add(peer.repair_stale_responses),
     )
 }
 
@@ -1670,10 +2233,6 @@ fn human_micros(value: u64) -> String {
     } else {
         display::micros(value)
     }
-}
-
-fn format_loss(ppm: u64) -> String {
-    format!("{:.2}%", ppm as f64 / 10_000.0)
 }
 
 async fn ping(
@@ -1738,19 +2297,19 @@ async fn validate(config_path: &Path) -> Result<()> {
     println!("route_file = {}", config.route_registry_path().display());
     println!("transit_enabled = {}", config.routing.transit_enabled);
     println!("nat_enabled = {}", config.routing.nat_enabled);
-    println!(
-        "preferred_ip_family = {}",
-        match config.path_selection.prefer {
-            ironet::config::IpFamilyPreference::Ipv4 => "ipv4",
-            ironet::config::IpFamilyPreference::Ipv6 => "ipv6",
-        }
-    );
-    println!("iroh_relay_enabled = {}", config.relay.iroh_relay_enabled);
+    println!("path_selection = automatic");
+    println!("derp_enabled = {}", config.relay.derp_enabled());
+    println!("dns_enabled = {}", config.dns.enabled);
+    if let Some(domain) = &config.dns.domain {
+        println!("dns_domain = {domain}");
+    }
     Ok(())
 }
 
 async fn doctor(config_path: &Path) -> Result<()> {
     let (config, endpoint_id) = deployment::validate(config_path).await?;
+    ironet::v2_runtime::V2RuntimeConfig::from_product_config(&config)
+        .context("configuration is not valid for the V2-only dataplane")?;
     ensure!(cfg!(target_os = "linux"), "runtime requires Linux");
     let tun = std::fs::metadata("/dev/net/tun").context("/dev/net/tun is missing")?;
     ensure!(
@@ -1873,9 +2432,12 @@ async fn doctor(config_path: &Path) -> Result<()> {
         }
     }
     println!("doctor: ok");
+    println!("protocol = 2");
+    println!("quic_alpn = h3");
     println!("endpoint_id = {endpoint_id}");
     println!("peers = {}", config.peers.len());
     println!("overlay_table = {}", config.routing.table);
+    println!("dns_enabled = {}", config.dns.enabled);
     Ok(())
 }
 
@@ -1900,16 +2462,20 @@ async fn inspect(config_path: &Path) -> Result<()> {
     println!("transit_enabled: {}", config.routing.transit_enabled);
     println!("mesh_enabled: {}", config.mesh.enabled);
     println!("mesh_max_peers: {}", config.mesh.max_peers);
+    println!("dns_enabled: {}", config.dns.enabled);
+    if let Some(domain) = &config.dns.domain {
+        println!("dns_domain: {domain}");
+        println!("dns_listen_port: {}", config.dns.listen_port);
+        println!("accept_dns: {}", config.dns.accept_dns);
+    }
     if let Some(max_egress_mbps) = config.routing.max_egress_mbps {
         println!(
             "max_egress: {}",
             display::bits_per_second(max_egress_mbps.saturating_mul(1_000_000))
         );
     }
-    println!(
-        "alpn: {}",
-        String::from_utf8_lossy(&network_alpn(&config.network_id))
-    );
+    println!("protocol: 2");
+    println!("quic_alpn: h3");
     println!("node_interface: {}", config.node_interface);
     let derp_servers = config.derp_servers()?;
     if !derp_servers.is_empty() {
@@ -1957,7 +2523,9 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use ironet::{
-        config::NodeInfo, mesh::MeshStatus, observability::RouteStatus, trace::PingSample,
+        config::NodeInfo,
+        status::{GatewayStatus, MeshStatus, RouteStatus},
+        trace::PingSample,
     };
 
     fn assert_command_help_is_complete(command: &clap::Command) {
@@ -1980,24 +2548,21 @@ mod tests {
     }
 
     fn sample_peer() -> PeerStatus {
-        serde_json::from_value(serde_json::json!({
-            "name": "bad\nname",
-            "endpoint_id": "endpoint",
-            "interface": "ironet0",
-            "connected": true,
-            "connection_events": 1,
-            "tx_packets": 2,
-            "tx_bytes": 3,
-            "rx_packets": 4,
-            "rx_bytes": 5,
-            "tx_fragments": 6,
-            "rx_fragments": 7,
-            "invalid_packets": 0,
-            "policy_drops": 8,
-            "frame_drops": 0,
-            "send_errors": 9
-        }))
-        .unwrap()
+        PeerStatus {
+            name: "bad\nname".into(),
+            endpoint_id: "endpoint".into(),
+            interface: "ironet0".into(),
+            protocol_major: 2,
+            connected: true,
+            connection_events: 1,
+            tx_packets: 2,
+            tx_bytes: 3,
+            rx_packets: 4,
+            rx_bytes: 5,
+            route_gate_drops: 8,
+            protocol_datagram_errors: 9,
+            ..PeerStatus::default()
+        }
     }
 
     fn sample_ping() -> PingResult {
@@ -2107,7 +2672,7 @@ mod tests {
         let join = Cli::try_parse_from([
             "ironet",
             "join",
-            "ironet://join/v1/00",
+            "ironet://join/v2/00",
             "--node-name",
             "edge-b",
             "--no-start",
@@ -2287,7 +2852,7 @@ mod tests {
         let human = render_peers(std::slice::from_ref(&peer), OutputFormat::Human).unwrap();
         assert_eq!(
             human,
-            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=ironet0 connected=true path=unknown:unknown rtt=unknown jitter=unknown loss=0.00% fec=off queue=0B tx_packets=2 tx=3B rx_packets=4 rx=5B policy_drops=8 connection_errors=0 send_errors=9\n"
+            "peers: total=1 connected=1\npeer bad name: endpoint_id=endpoint interface=ironet0 protocol=2 connected=true path=unknown:unknown rtt=unknown pmtu=0 cwnd=0B queue=0B tx_records=2 tx=3B rx_records=4 rx=5B trains=0 cells=0 fec_tx_cells=0 fec_tx=0B fec_rx_cells=0 recovered=0 repair=0/0 cover=0B/0B drops=8 errors=9\n"
         );
         assert!(!human.contains("bad\nname"));
 
@@ -2336,17 +2901,11 @@ mod tests {
                 present: false,
             }],
             peers: vec![sample_peer()],
-            network: Default::default(),
             mesh: MeshStatus::default(),
-            capacities: Vec::new(),
-            capacity_table_entries: 0,
-            capacity_table_limit: 4_096,
-            capacity_probe_in_flight: false,
-            capacity_probe_budget_bytes: 256 * 1024,
-            capacity_probe_attempts: 0,
-            capacity_probe_failures: 0,
-            capacity_probe_bytes: 0,
-            flow_router: Default::default(),
+            gateway: GatewayStatus::default(),
+            tun_admission_drop_records: 0,
+            tun_admission_drop_bytes: 0,
+            dns: None,
         };
         let human = render_status(&status, OutputFormat::Human).unwrap();
         let expected_prefix = format!(

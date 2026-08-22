@@ -1,5 +1,6 @@
 # Rust 构建产物
 /target/
+/crates/*/target/
 **/*.rs.bk
 
 # 打包与本地测试产物
@@ -18,3 +19,7 @@
 *.profraw
 *.profdata
 /coverage/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+__pycache__/

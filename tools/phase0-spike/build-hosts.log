@@ -1,0 +1,20 @@
+warning: Git tree '/home/bubu/sdwan' is dirty
+ironet dev shell
+  rustc:  rustc 1.91.0 (f8297e351 2025-10-28)
+=== config: pulley (spike profile: lto=fat, cgu=1, panic=abort)
+   Compiling phase0-host v0.1.0 (/tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/host)
+    Finished `release` profile [optimized] target(s) in 50.92s
+cold_build_wall_seconds[pulley]=50.94 user=131.79 sys=13.40 maxrss_kib=819444
+-rwxr-xr-x 1 bubu users 3039728 Aug 21 06:21 /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin/host-pulley
+-rwxr-xr-x 1 bubu users 1225080 Aug 21 06:21 /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin/host-pulley.stripped
+=== config: cranelift (spike profile: lto=fat, cgu=1, panic=abort)
+   Compiling phase0-host v0.1.0 (/tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/host)
+    Finished `release` profile [optimized] target(s) in 2m 18s
+cold_build_wall_seconds[cranelift]=138.39 user=334.33 sys=20.86 maxrss_kib=1383856
+/nix/store/advlbxfc5cg0jswl7zv40h2lzlxiksr6-binutils-2.46/bin/strip: /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin/stenO4Fk[.text]: No space left on device
+-rwxr-xr-x 1 bubu users 12962288 Aug 21 06:23 /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin/host-cranelift
+-rwxr-xr-x 1 bubu users 12962288 Aug 21 06:23 /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin/host-cranelift.stripped
+=== config: cranelift,pulley (spike profile: lto=fat, cgu=1, panic=abort)
+error: could not compile `cranelift-codegen` (lib) due to 1 previous error
+Command exited with non-zero status 101
+cold_build_wall_seconds[cranelift,pulley]=74.72 user=272.25 sys=20.03 maxrss_kib=1381620

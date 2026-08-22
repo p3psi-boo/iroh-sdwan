@@ -1,0 +1,19 @@
+[package]
+name = "ironet-policy-builtin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Built-in Ironet policy guest packaged as a WebAssembly component"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ironet-policy-core = { path = "../ironet-policy-core" }
+ironet-policy-sdk = { path = "../ironet-policy-sdk" }
+ironet-policy-abi = { path = "../ironet-policy-abi" }
+
+[[example]]
+name = "spec-metadata"
+path = "examples/spec-metadata.rs"

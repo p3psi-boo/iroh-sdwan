@@ -1,0 +1,12 @@
+build: features: cranelift=false pulley=true
+mode: load file: /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/results/guest-native.cwasm target: host 
+engine_new: 21.377µs
+input_file_bytes: 49368
+compile_or_load_time: 135.284µs
+instantiate: p50=3.812µs p99=10.707µs max=41.606µs
+first_call: 21.838µs out_len=32
+call(1000 iters, input 1024 B): p50=2.731µs p90=3.229µs p99=4.011µs max=4.912µs
+fuel_per_call: min=7379 p50=7379 p99=7379 max=7379
+checksum: 2341000
+rss_kib: start=2432 after_load=3228 end=3368
+out0_hex: 41814e316f9748409b791206528aa63f92634a288bee02400700000040000000

@@ -1,157 +1,128 @@
-# ironet 内部维护的网络准入密钥。正常部署使用 `network create` 和邀请加入，
-# 不要将其提交到公开配置仓库。
+# Ironet Protocol V2 configuration. Transport queues, PacketTrain geometry,
+# pacing, PMTU, FEC/Repair, RX batching, cover budget and lane count remain
+# automatic runtime decisions. Operational path-migration guardrails have an
+# optional advanced section below, so changing them never requires a rebuild.
 network_id = "REPLACE_WITH_RANDOM_NETWORK_ID"
 identity_file = "/var/lib/ironet/identity.key"
-# 可选的固定 iroh UDP 监听地址，适用于静态直连地址部署。
-# bind_addresses = ["0.0.0.0:4000"]
-# 当直连底层路径任一端点落入这些前缀时拒绝该路径。
-# Yggdrasil 使用 200::/7；配置非 Ygg 路径或 relay 后可取消下一行注释。
-# forbidden_underlay_prefixes = ["200::/7"]
-# 所有 peer 都有固定直连地址且不需要外部发现时，设为 false。
-discovery_enabled = true
-# `none` 不创建 TUN，也不执行 ip route/sysctl；适用于无 CAP_NET_ADMIN 的
-# LXC/Docker/VPS 纯中转节点。该模式必须启用 routing.transit_enabled，且不能
-# 配置 node_addresses/advertised_prefixes。默认值为 `tun`。
-attachment = "tun"
-# 这是虚拟接口自动调整的上限，不是启动 MTU 或底层 MTU。接口从 1280
-# 起步，只会在持续稳定的 LAN 路径上升高；遇到 WAN RTT、丢包或队列过期时
-# 回到 1280。
+
+# V2 owns one dual-stack UDP socket. Omit it to bind [::]:4000.
+# bind_addresses = ["[::]:443"]
+
+# Direct underlay endpoints inside these prefixes are rejected. For example,
+# this excludes Yggdrasil while retaining public carrier IPv6.
+excluded_underlay_prefixes = ["200::/7"]
+
 tun_mtu = 65535
-# 自动帧大小的安全上限。QUIC 从 1400 字节 UDP 负载开始；检测到 MTU 黑洞时，
-# 自动回退到 1200 字节的安全下限。
-max_frame_size = 1400
-# QUIC 数据面的运行时调优项；修改配置并 reload 即可，无需重新编译。
-udp_segmentation_offload = "auto"
-# 默认基准测试本机 ring 的 ChaCha20-Poly1305 与 AES-256-GCM 实现；也可固定为
-# "chacha20" 或 "aes256gcm" 作为运维覆盖。
-quic_cipher_preference = "auto"
-quic_send_buffer_bytes = 131072
-quic_receive_buffer_bytes = 8388608
-# 单 lane 是稳定默认值；多 lane 仅在验证过的并行路径上显式开启。
-quic_data_lanes = 1
-quic_congestion_controller = "cubic"
-quic_initial_rtt_millis = 100
-quic_initial_mtu = 1400
-# 开启后，误判 MTU 黑洞回退到 1200 时会自动重新探测。
-quic_mtu_discovery_enabled = false
-quic_mtu_black_hole_cooldown_millis = 10000
-quic_keep_alive_millis = 1000
-quic_passthrough_window_bytes = 16777216
-# quic_passthrough_pacing_mbps = 900
-quic_adaptive_initial_mbps = 850
-quic_adaptive_min_mbps = 100
-quic_adaptive_max_mbps = 950
-quic_adaptive_loss_backoff_bps = 50
-quic_pacing_quantum_bytes = 8192
 node_interface = "ironet0"
+node_addresses = ["21.0.0.1/32", "21::1/128"]
+advertised_prefixes = ["192.168.10.0/24"]
 
-# 配置到 ironet0 虚拟接口的稳定节点/管理地址。
-node_addresses = [
-  "21.0.0.1/32",
-  "21::1/128",
-]
-
-# 由当前路由器发布的 LAN 或服务前缀。
-advertised_prefixes = [
-  "192.168.10.0/24",
-]
-
-# 容量按（目的所有者，首跳）测量；节点不声明上下行带宽。
-# 内置覆盖 trace 协议返回的元数据。trace 自动使用 node_addresses 中每个
-# 地址族的第一个地址；CLI 会输出任意元数据。
 [node_info]
 name = "branch-a"
-description = "Example branch router"
+description = "Example V2 branch router"
 
 [node_info.metadata]
 site = "example-site"
 
-# IPv4、IPv6 直连路径会同时建立并持续测量；一次只激活其中一条。
-# 偏好仅在健康度、丢包和 RTT 接近时生效，明显更好的另一地址族仍会被选择。
-[path_selection]
-prefer = "ipv6"
-
+# Tailscale DERP custom transports. Omit the section for direct-only paths.
 [relay]
-# 默认禁止 iroh relay；直连 UDP、DERP 和已连接覆盖节点中转不受影响。
-iroh_relay_enabled = false
-# discovery_enabled = true 时继续发布 host、UPnP/PCP/NAT-PMP 和 peer 观察到的
-# NAT 候选；iroh relay 关闭不影响直连和连接内的候选交换。
-# discovery_urls = ["https://qad-1.example.net", "https://qad-2.example.net"]
-# DERP 服务器列表为空时不建立 DERP 自定义传输。
 # servers = ["https://derp-1.example.net/derp", "https://derp-2.example.net/derp"]
-# 显式开启后才能配置自建 iroh relay URL；至少两个，并可与 DERP 并行。
-# urls = ["https://relay-1.example.net", "https://relay-2.example.net"]
+
+# Public QUIC ClientHello profile. EndpointId and membership are authenticated
+# only inside the TLS-exporter-bound V2 SessionHello.
+[cover]
+sni_pool = ["media.example"]
+profile_id = 1
 
 [routing]
 isolate_overlay = true
-# 允许在覆盖 peer 之间转发。它不控制 peer 访问本节点，
-# 也不控制 peer 访问本节点发布的 LAN/服务前缀。
 transit_enabled = false
 rule_priority = 10000
 table = 211
 allow_default_routes = false
-# 默认对来自覆盖网络、发往本节点 advertised_prefixes 的流量做源 NAT。
 nat_enabled = true
-# 可选的仅本机策略上限，不会通过 Presence 传播。
 # max_egress_mbps = 80
 
-# 从配置的引导 peer 学到的签名 Presence 会填充节点目录。已配置和自动
-# 建立的活动邻接总数不超过 max_peers；其余条目仅保留为低成本目录记录，
-# 并按直连可达性、RTT EWMA、丢包、稳定性和路径多样性筛选。
+# Adaptive transport control is automatic. Shadow is the conservative default
+# until the learned policy has passed the deployment's profile gates.
+[autotune]
+# mode = "shadow"          # off | shadow | on
+# objective = "balanced"  # balanced | throughput | latency
+# memory = true
+# policy = "builtin"      # native | builtin | absolute .wasm path
+#                         #   native  = host conservative fallback (no learner)
+#                         #   builtin = builtin.wasm embedded in this binary,
+#                         #             executed by the WASM runtime (default)
+#                         #   path    = external signed .wasm component;
+#                         #             external JSON artifacts were removed
+# shadow_policy = "/etc/ironet/policy.candidate.wasm"
+
+# WASM policy trust store and resource budget. Only consulted when policy or
+# shadow_policy names a .wasm component; the whole section is covered by the
+# configuration seal, so signers, pins and paths cannot be changed by a guest.
+# Values shown are the defaults.
+# [autotune.wasm]
+# require_signature = true         # production default; false requires digest_pins
+# maximum_module_bytes = 8388608   # 8 MiB component file
+# maximum_memory_bytes = 8388608   # 8 MiB guest linear memory
+# maximum_state_bytes = 65536      # 64 KiB per-peer state, at most 1 MiB
+# deadline_millis = 10             # single decide() wall deadline, 1..=1000
+# state_flush_interval_secs = 60   # periodic state flush; also on switch/exit
+
+# Trusted signers; several entries allow key rotation. Revoke by deleting the
+# entry and re-sealing the configuration.
+# [[autotune.wasm.signers]]
+# signer_id = "ops-2026"
+# public_key = "ed25519:BASE32-OR-HEX-32-BYTE-KEY"
+# minimum_policy_version = 3       # rollback floor, default 0
+# expires_at = "2027-01-01T00:00:00Z"   # optional RFC 3339
+
+# Development alternative when require_signature = false: exact component
+# digests. A module's self-reported key never establishes trust.
+# digest_pins = ["blake3:<64 hex chars>"]
+
+# Advanced path-migration guardrails. Omit this section in normal deployments:
+# live deadlines are still derived automatically from measured RTT and ACK/PTO
+# progress; failback additionally requires successful on-path PATH_RESPONSEs.
+# Values shown here are defaults and may change without recompiling Ironet.
+# [path_migration]
+# pto_threshold = 4
+# min_pto_silence_ms = 250
+# min_silence_ms = 1000
+# max_silence_ms = 5000
+# recovery_probation_ms = 2000
+# recovery_max_response_gap_ms = 2000
+# recovery_min_responses = 3
+# health_ttl_secs = 300
+# rtt_switch_margin_ms = 5
+# keep_alive_ms = 250
+# idle_timeout_ms = 15000
+
 [mesh]
 enabled = true
 max_peers = 12
 
-[packet_policy]
-enforce_overlay_prefixes = true
-
-# 可选的系统化 Reed-Solomon 数据报保护。即使本端发送 FEC 已关闭，
-# 接收端也可以解析该封装。
-[fec]
+[dns]
 enabled = false
-data_shards = 8
-recovery_shards = 2
-block_timeout_millis = 20
-decoder_ttl_millis = 2000
+# domain = "n-REPLACE_WITH_NETWORK_ID.ironet.internal"
+# listen_port = 1053
+# short_names = true
+# accept_dns = true
+# ttl_secs = 5
+# reverse_prefixes = ["21.0.0.0/24", "21::/64"]
 
-[observability]
-status_file = "/run/ironet/status.json"
-metrics_file = "/run/ironet/metrics.prom"
-report_interval_secs = 10
-
-# 只添加引导/固定邻居（例如一个或两个公共节点）。其他成员通过签名
-# Presence gossip 学习，并可能自动成为受限数量的直连 mesh 邻居。
-#
 # [[peers]]
 # name = "branch-b"
-# endpoint_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
-# mesh 开启时，签名 Presence 提供动态前缀和中转信息。
-# transit_enabled = false
-# relay_urls = ["https://relay-a.example.com", "https://relay-b.example.com"]
-# 当 relay.servers 非空时，设置该 peer 单独生成的 DERP 密钥：
-# derp_public_key = "REPLACE_WITH_64_HEX_DERP_PUBLIC_KEY"
-# direct_addresses = ["203.0.113.10:4433"]
-# mesh 开启时此静态源清单可省略：远端签名 Presence 会携带所有者前缀
-# 和中转能力。
-# allowed_source_prefixes = ["21.0.0.2/32", "21::2/128"]
+# endpoint_id = "REPLACE_WITH_IROH_ENDPOINT_ID"
+# direct_addresses = ["[2001:db8::10]:443"]
+# When relay.servers is non-empty, use the peer's DERP public key:
+# derp_public_key = "REPLACE_WITH_DERP_PUBLIC_KEY"
 
-# 私有点到点承载（IEPL/IPLC/内网交付/端口转发）使用 pairwise link contract。
-# 下面的地址只存在于本机配置，不会写入签名 NodeRecord、Presence 或候选交换。
-# 对应 peer 不再填写 direct_addresses、relay_urls 或 derp_public_key。
+# A private circuit is a locator constraint, not a separate protocol. V2 still
+# authenticates EndpointId and network membership on the QUIC connection.
 # [[links]]
-# id = "iepl-ab-01"
 # name = "iepl-ab"
-# peer_id = "REPLACE_WITH_64_HEX_IROH_ENDPOINT_ID"
-# class = "private-circuit"
-# visibility = "pairwise"
-# dial = "active" # 对端填 passive，或双方均使用 auto
+# peer_id = "REPLACE_WITH_IROH_ENDPOINT_ID"
 # exclusive = true
 # fallback = false
-# local_bind = "10.255.0.1:4000"
-# remote_addresses = ["10.255.0.2:4000"]
-# allowed_local_prefixes = ["10.255.0.1/32"]
-# allowed_remote_prefixes = ["10.255.0.2/32"]
-# auth_key = "REPLACE_WITH_64_HEX_PAIRWISE_SECRET"
-
-# 静态远端路由不写入本文件。使用 `ironet route add/import` 管理
-# identity_file 同目录的 routes.toml；`route list/remove` 可查询和删除。
+# remote_addresses = ["10.255.0.2:443"]

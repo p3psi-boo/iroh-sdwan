@@ -1,0 +1,6 @@
+package ironet:policy-spike@0.1.0;
+
+world policy {
+  /// Minimal Phase 0 spike ABI: opaque bytes in, opaque bytes out.
+  export decide: func(input: list<u8>) -> list<u8>;
+}

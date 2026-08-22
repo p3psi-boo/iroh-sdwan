@@ -19,6 +19,7 @@ done
 test -f "$ROOT/usr/lib/systemd/system/ironet.service"
 test -f "$ROOT/usr/lib/sysusers.d/ironet.conf"
 test -f "$ROOT/usr/lib/sysctl.d/90-ironet.conf"
+test -f "$ROOT/usr/share/polkit-1/rules.d/90-ironet-resolved.rules"
 test -f "$ROOT/usr/share/doc/ironet/examples/config.toml"
 test -f "$ROOT/usr/share/doc/ironet/config/example.toml"
 test -f "$ROOT/usr/share/doc/ironet/docs/README.md"
@@ -36,6 +37,9 @@ grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN$' "$SERVICE"
 grep -q '^NoNewPrivileges=true$' "$SERVICE"
 grep -q '^ProtectSystem=strict$' "$SERVICE"
 grep -q '^RuntimeDirectoryMode=0770$' "$SERVICE"
+grep -q 'systemd-resolved.service' "$SERVICE"
+grep -q 'org.freedesktop.resolve1.set-dns-servers' \
+  "$ROOT/usr/share/polkit-1/rules.d/90-ironet-resolved.rules"
 # 使用最小依赖集合验证已打包 unit。--root 会将默认依赖和 /bin/sh
 # 也解析到解包目录，因此为纯包布局测试提供对应的占位文件。
 install -d "$ROOT/bin" "$ROOT/usr/lib/systemd/system"
@@ -49,6 +53,16 @@ cat >"$ROOT/usr/lib/systemd/system/network-online.target" <<'EOF'
 Description=Test network target
 EOF
 cat >"$ROOT/usr/lib/systemd/system/systemd-sysctl.service" <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+EOF
+cat >"$ROOT/usr/lib/systemd/system/dbus.service" <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+EOF
+cat >"$ROOT/usr/lib/systemd/system/systemd-resolved.service" <<'EOF'
 [Service]
 Type=oneshot
 ExecStart=/bin/true

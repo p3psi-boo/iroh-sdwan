@@ -1,7 +1,7 @@
 use std::{
-    fs::OpenOptions,
+    fs::{DirBuilder, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -91,9 +91,16 @@ fn create_parent(path: &Path) -> Result<()> {
 }
 
 fn create_private_parent(path: &Path) -> Result<()> {
-    create_parent(path)?;
     if let Some(parent) = path.parent() {
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        // Apply the private mode only to directories created by this call.
+        // Rechmodding an existing parent is unsafe: an identity placed below
+        // /tmp, a state mount, or another shared directory must not change the
+        // access mode of that directory for the entire host.
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     Ok(())
 }
@@ -151,6 +158,24 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn identity_creation_preserves_existing_parent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("identity.key");
+
+        load_or_create(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }

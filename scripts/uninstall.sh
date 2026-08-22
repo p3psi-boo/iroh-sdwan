@@ -5,6 +5,7 @@ PREFIX=${PREFIX:-/usr/local}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${SYSCTL_DIR:-/etc/sysctl.d}
 SYSUSERS_DIR=${SYSUSERS_DIR:-/etc/sysusers.d}
+POLKIT_RULES_DIR=${POLKIT_RULES_DIR:-/etc/polkit-1/rules.d}
 
 if [[ $EUID -ne 0 ]]; then
   echo "uninstall.sh must run as root" >&2
@@ -16,6 +17,7 @@ rm -f \
   "$SYSTEMD_DIR/ironet.service" \
   "$SYSCTL_DIR/90-ironet.conf" \
   "$SYSUSERS_DIR/ironet.conf" \
+  "$POLKIT_RULES_DIR/90-ironet-resolved.rules" \
   "$PREFIX/bin/ironet" \
   "$PREFIX/bin/ironetd"
 sysctl --system >/dev/null

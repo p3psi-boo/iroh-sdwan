@@ -37,13 +37,20 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        rust = pkgs.rust-bin.stable."1.91.0".default.override {
+        rust = pkgs.rust-bin.stable."1.98.0".default.override {
           extensions = [
             "clippy"
             "rust-src"
             "rustfmt"
           ];
-          targets = [ "x86_64-unknown-linux-musl" ];
+          targets = [
+            "x86_64-unknown-linux-musl"
+            # WASM policy guests (crates/ironet-policy-*) build for wasm32.
+            "wasm32-unknown-unknown"
+          ];
+        };
+        rustFuzz = pkgs.rust-bin.nightly.latest.default.override {
+          extensions = [ "rust-src" ];
         };
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rust;
@@ -85,6 +92,22 @@
             pkgs.iptables
             pkgs.pkg-config
             pkgs.python3
+            # scripts/profile-v2-netns*.sh: netem labs, iperf3 saturation,
+            # concurrent ping, perf + FlameGraph post-processing.
+            pkgs.iperf3
+            pkgs.perf
+            pkgs.flamegraph
+            pkgs.ethtool
+            pkgs.iputils
+            pkgs.util-linux
+            pkgs.coreutils
+            pkgs.bc
+            pkgs.file
+            # WASM policy guest toolchain: component packaging / validation
+            # (wasm-tools) and WIT binding generation (wit-bindgen CLI).
+            pkgs.wasm-tools
+            pkgs.wit-bindgen
+            pkgs.b3sum
           ];
 
           RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
@@ -109,6 +132,25 @@
           shellHook = ''
             echo "ironet static release shell"
             echo "  scripts/build-deb.sh"
+          '';
+        };
+
+        devShells.fuzz = pkgs.mkShell {
+          packages = [
+            rustFuzz
+            pkgs.cargo-fuzz
+            pkgs.cacert
+            pkgs.git
+            pkgs.llvmPackages.clang
+            pkgs.pkg-config
+            pkgs.python3
+          ];
+
+          RUST_SRC_PATH = "${rustFuzz}/lib/rustlib/src/rust/library";
+          shellHook = ''
+            echo "ironet V2 fuzz shell"
+            echo "  rustc:      $(rustc --version)"
+            echo "  cargo-fuzz: $(cargo fuzz --version)"
           '';
         };
 

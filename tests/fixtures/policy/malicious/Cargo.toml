@@ -1,0 +1,34 @@
+[workspace]
+
+[package]
+name = "ironet-policy-malicious-fixture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["echo"]
+echo = []
+loop = []
+fuel-burn = []
+memory-grow = []
+trap = []
+oversized-state = []
+oversized-output = []
+invalid-enum = []
+overflow-action = []
+all-maximums = []
+non-deterministic-attempt = []
+
+[dependencies]
+ironet-policy-sdk = { path = "../../../../crates/ironet-policy-sdk" }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1

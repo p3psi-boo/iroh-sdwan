@@ -1,0 +1,24 @@
+[package]
+name = "ironet-policy-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Guest SDK for Ironet adaptive-control policy components: WIT bindings, ABI conversions, fixed-point helpers and the export macro"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ironet-policy-abi = { path = "../ironet-policy-abi" }
+# Guest-side component-model bindings. The generated code is the only unsafe
+# code in the crate (`bindings` module). Version must stay compatible with the
+# `wit-bindgen` CLI in the dev shell (0.60) so the CLI and the macro agree.
+wit-bindgen = { version = "0.60.0", default-features = false, features = ["macros", "realloc", "std"] }
+
+[[example]]
+name = "echo"
+path = "fixtures/echo.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "conservative"
+path = "fixtures/conservative.rs"
+crate-type = ["cdylib"]

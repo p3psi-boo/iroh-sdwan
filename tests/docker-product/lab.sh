@@ -38,6 +38,7 @@ CREATE_JSON=$(product_cli product-a node-a network create production-demo \
   --node-name edge-a \
   --address-pool 198.23.0.0/16 \
   --listen 0.0.0.0:4000 \
+  --no-dns \
   --no-start \
   --output json)
 jq -e '
@@ -49,11 +50,23 @@ jq -e '
   (.network.address | endswith("/32")) and
   (.network.addresses | length == 2) and
   (any(.network.addresses[]; endswith("/32"))) and
-  (any(.network.addresses[]; endswith("/128")))
+  (any(.network.addresses[]; endswith("/128"))) and
+  .network.dns_domain == null
 ' <<<"$CREATE_JSON" >/dev/null
 NETWORK_ID=$(jq -r '.network.network_id' <<<"$CREATE_JSON")
 ADDRESS_A=$(jq -r '.network.address | split("/")[0]' <<<"$CREATE_JSON")
 ADDRESS_A6=$(jq -r '.network.addresses[] | select(endswith("/128")) | split("/")[0]' <<<"$CREATE_JSON")
+
+# The authority owns the network-wide visible QUIC profile. Make it
+# deliberately non-default before issuing the invite so this integration test
+# proves the signed payload distributes generation and pool to the joiner.
+cat >>/state/node-a/config.toml <<'EOF'
+
+[cover]
+sni_pool = ["edge-video.example", "origin-video.example"]
+profile_id = 17
+EOF
+product_cli product-a node-a seal-config >/dev/null
 
 echo "==> issuing and consuming a signed invite"
 INVITE_JSON=$(product_cli product-a node-a invite create \
@@ -63,7 +76,7 @@ INVITE_JSON=$(product_cli product-a node-a invite create \
 INVITE_ID=$(jq -r '.id' <<<"$INVITE_JSON")
 INVITE_TOKEN=$(jq -r '.token' <<<"$INVITE_JSON")
 test -n "$INVITE_ID"
-[[ $INVITE_TOKEN == ironet://join/v1/* ]]
+[[ $INVITE_TOKEN == ironet://join/v2/* ]]
 
 JOIN_JSON=$(product_cli product-b node-b join "$INVITE_TOKEN" \
   --node-name edge-b \
@@ -78,12 +91,27 @@ jq -e --arg network_id "$NETWORK_ID" '
   (.network.address | endswith("/32")) and
   (.network.addresses | length == 2) and
   (any(.network.addresses[]; endswith("/32"))) and
-  (any(.network.addresses[]; endswith("/128")))
+  (any(.network.addresses[]; endswith("/128"))) and
+  .network.dns_domain == null
 ' <<<"$JOIN_JSON" >/dev/null
+ENDPOINT_B=$(jq -r '.network.endpoint_id' <<<"$JOIN_JSON")
 ADDRESS_B=$(jq -r '.network.address | split("/")[0]' <<<"$JOIN_JSON")
 ADDRESS_B6=$(jq -r '.network.addresses[] | select(endswith("/128")) | split("/")[0]' <<<"$JOIN_JSON")
 test "$ADDRESS_A" != "$ADDRESS_B"
 test "$ADDRESS_A6" != "$ADDRESS_B6"
+for config in /state/node-a/config.toml /state/node-b/config.toml; do
+  python3 - "$config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as source:
+    cover = tomllib.load(source)["cover"]
+assert cover == {
+    "sni_pool": ["edge-video.example", "origin-video.example"],
+    "profile_id": 17,
+}
+PY
+done
 
 echo "==> starting both daemons from generated state"
 start_daemon product-a node-a PID_A
@@ -95,16 +123,55 @@ wait_until "product overlay connectivity" \
 ip netns exec product-a ping -c 3 -W 3 -I "$ADDRESS_A" "$ADDRESS_B"
 ip netns exec product-a ping -6 -c 3 -W 3 -I "$ADDRESS_A6" "$ADDRESS_B6"
 
+echo "==> verifying live status is V2-native telemetry"
+for node_spec in "product-a node-a" "product-b node-b"; do
+  read -r namespace node <<<"$node_spec"
+  product_cli "$namespace" "$node" status --output json \
+    | tee "/state/$node/status.json" \
+    | jq -e '
+        (has("capacities") | not) and
+        (has("network") | not) and
+        (has("dataplane") | not) and
+        .mesh.enabled == true and
+        .mesh.directory_entries == 2 and
+        (.mesh.nodes | length == 2) and
+        (all(.mesh.nodes[]; (.node_addresses | length) == 2)) and
+        .gateway.subnet_nat_enabled == true and
+        .gateway.transit_enabled == false and
+        (.gateway.advertised_prefixes | length) == 0 and
+        (.peers | length == 1) and
+        (.peers[0] |
+          .protocol_major == 2 and
+          .tx_packets > 0 and .rx_packets > 0 and
+          .trains_built > 0 and .cells_built > 0 and
+          (has("delivery_tagged_packets") | not) and
+          (has("tx_fragments") | not) and
+          (has("fec_tx_recovery_shards") | not) and
+          (has("capacity_probe_attempts") | not)
+        )
+      ' >/dev/null
+done
+
+product_cli product-a node-a metrics \
+  | tee /state/node-a/metrics.prom \
+  | awk '
+      /^# TYPE ironet_v2_peer_tx_records_total counter$/ { type = 1 }
+      /^ironet_v2_peer_tx_records_total\{/ && $2 + 0 > 0 { live = 1 }
+      /^ironet_v2_gateway_subnet_nat_enabled 1$/ { nat = 1 }
+      /^ironet_peer_/ { legacy = 1 }
+      END { exit !(type && live && nat && !legacy) }
+    '
+
 echo "==> verifying that product vocabulary exposes the live network"
 product_cli product-a node-a network show --output json \
   | tee /state/node-a/network-show.json \
   | jq -e --arg network_id "$NETWORK_ID" '.network.network_id == $network_id' >/dev/null
 product_cli product-a node-a node list --output json \
   | tee /state/node-a/node-list.json \
-  | jq -e '
+  | jq -e --arg endpoint "$ENDPOINT_B" '
       length == 2 and
       any(.[]; .name == "edge-a" and .local == true) and
-      any(.[]; .name == "edge-b" and .local == false and .removed == false)
+      any(.[]; .endpoint_id == $endpoint and .local == false and .removed == false)
     ' >/dev/null
 product_cli product-b node-b node list --output json \
   | tee /state/node-b/node-list.json \

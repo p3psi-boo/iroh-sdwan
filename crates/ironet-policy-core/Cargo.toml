@@ -1,0 +1,12 @@
+[package]
+name = "ironet-policy-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Single-source policy core (contextual bandit learner) shared by the Ironet native backend and the builtin WASM guest"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ironet-policy-abi = { path = "../ironet-policy-abi" }
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }

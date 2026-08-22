@@ -1,9 +1,14 @@
+use std::io::IsTerminal;
+
 use tracing_subscriber::EnvFilter;
 
 pub fn init(quiet: bool) {
     let default_filter = if quiet { "warn" } else { "info" };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    // ANSI colour only when a human is watching. Journald, redirected files and
+    // the netns profile harness all parse these lines as plain `key=value`.
+    let ansi = std::io::stderr().is_terminal();
     if std::env::var("IRONET_LOG_FORMAT").as_deref() == Ok("json") {
         tracing_subscriber::fmt()
             .json()
@@ -14,6 +19,7 @@ pub fn init(quiet: bool) {
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_ansi(ansi)
             .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .init();

@@ -11,7 +11,7 @@ use tracing::{debug, info};
 
 use crate::config::Config;
 
-// Private route-protocol marker used only for FlowRouter-owned kernel routes.
+// Private route-protocol marker used only for V2 dataplane-owned kernel routes.
 // 100 avoids the named assignments commonly used by dynamic routing stacks,
 // OSPF, and other routing daemons.
 const FLOW_ROUTER_ROUTE_PROTOCOL: &str = "100";
@@ -19,10 +19,10 @@ const NAT_INGRESS_CHAIN: &str = "IRONET_NAT_INGRESS";
 const NAT_POSTROUTING_CHAIN: &str = "IRONET_NAT_POSTROUTING";
 // Conntrack marks do not participate in policy routing, unlike packet marks.
 // Reserve one bit so the postrouting hook can recognize packets that entered
-// through the FlowRouter TUN without changing their source address earlier.
+// through the V2 dataplane TUN without changing their source address earlier.
 const NAT_CONNMARK: &str = "0x40000000/0x40000000";
 
-/// Configure the already-created FlowRouter TUN. Device creation stays in the
+/// Configure the already-created V2 dataplane TUN. Device creation stays in the
 /// data-plane lifecycle so exactly one file descriptor owns packet I/O.
 pub async fn prepare_node_interface(config: &Config) -> Result<()> {
     if !cfg!(target_os = "linux") {
@@ -50,7 +50,7 @@ pub async fn prepare_node_interface(config: &Config) -> Result<()> {
 
 pub async fn cleanup_node_interface(config: &Config) -> Result<()> {
     run_ip_allow_failure(&["link", "del", "dev", &config.node_interface]).await?;
-    info!(interface = %config.node_interface, "cleaned FlowRouter TUN interface");
+    info!(interface = %config.node_interface, "cleaned V2 dataplane TUN interface");
     Ok(())
 }
 
@@ -108,7 +108,7 @@ pub async fn prepare_routing(config: &Config) -> Result<()> {
         table = routing_table(config),
         priority = config.routing.rule_priority,
         interface = %config.node_interface,
-        "prepared FlowRouter routes"
+        "prepared V2 dataplane routes"
     );
     Ok(())
 }
@@ -185,16 +185,16 @@ async fn installed_overlay_routes(table: &str) -> Result<HashSet<IpNet>> {
             ])
             .output()
             .await
-            .context("failed to inspect FlowRouter routes")?;
+            .context("failed to inspect V2 dataplane routes")?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
             if error.contains("FIB table does not exist") {
                 continue;
             }
-            bail!("failed to inspect FlowRouter routes: {}", error.trim());
+            bail!("failed to inspect V2 dataplane routes: {}", error.trim());
         }
         let routes: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .context("failed to parse FlowRouter route inventory")?;
+            .context("failed to parse V2 dataplane route inventory")?;
         for destination in routes
             .as_array()
             .into_iter()
@@ -266,7 +266,7 @@ pub async fn cleanup_routing(config: &Config) -> Result<()> {
     info!(
         table = routing_table(config),
         priority = config.routing.rule_priority,
-        "cleaned FlowRouter routes"
+        "cleaned V2 dataplane routes"
     );
     Ok(())
 }
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_flow_router_route_destinations() {
+    fn parses_dataplane_route_destinations() {
         assert_eq!(
             parse_route_destination("-4", "10.0.0.7/32"),
             Some("10.0.0.7/32".parse().unwrap())

@@ -1,7 +1,7 @@
 use std::{
-    fs::OpenOptions,
+    fs::{DirBuilder, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -53,11 +53,7 @@ pub fn load_or_create(path: &Path) -> Result<DerpIdentity> {
     if path.exists() {
         return load(path);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating {}", parent.display()))?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
+    create_private_parent(path)?;
     let identity = DerpIdentity::generate();
     match OpenOptions::new()
         .write(true)
@@ -111,11 +107,7 @@ pub fn restore(source: &Path, destination: &Path) -> Result<DerpIdentity> {
 }
 
 fn write_new(path: &Path, bytes: [u8; 32], operation: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating {}", parent.display()))?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
+    create_private_parent(path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -124,6 +116,19 @@ fn write_new(path: &Path, bytes: [u8; 32], operation: &str) -> Result<()> {
         .with_context(|| format!("failed to {operation} DERP identity {}", path.display()))?;
     writeln!(file, "{}", hex::encode(bytes))?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn create_private_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        // DirBuilder applies this mode only to directories it creates. Never
+        // mutate an existing shared parent merely because it contains a key.
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -154,5 +159,23 @@ mod tests {
         backup(&source, &backup_path).unwrap();
         let restored = restore(&backup_path, &restored_path).unwrap();
         assert_eq!(original.public_key(), restored.public_key());
+    }
+
+    #[test]
+    fn identity_creation_preserves_existing_parent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("derp.key");
+
+        load_or_create(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

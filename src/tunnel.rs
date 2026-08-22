@@ -1,12 +1,16 @@
-use std::sync::Arc;
+use std::{io::IoSlice, sync::Arc};
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use tun_rs::{AsyncDevice, DeviceBuilder, GROTable, Layer, VIRTIO_NET_HDR_LEN};
 
-use crate::buffer::{DataplaneBuf, OVERLAY_HEADER_HEADROOM, PacketSlotPool};
-
 const MAX_TUN_QUEUES: usize = 8;
+// A virtio-net TUN record can carry a ~64 KiB GSO aggregate. The Linux
+// default of hundreds of packets therefore permits tens of MiB to accumulate
+// behind a backpressured userspace reader, hiding overload from inner TCP and
+// delaying even newly generated control traffic by seconds. fq_codel remains
+// the queueing discipline; this is only its device-ring ceiling.
+const TUN_TX_QUEUE_RECORDS: u32 = 128;
 
 pub fn data_plane_parallelism() -> usize {
     std::thread::available_parallelism()
@@ -15,7 +19,7 @@ pub fn data_plane_parallelism() -> usize {
         .clamp(1, MAX_TUN_QUEUES)
 }
 
-/// The single L3 device owned by FlowRouter. All local overlay traffic enters
+/// The single L3 device owned by V2 dataplane. All local overlay traffic enters
 /// here; next-hop selection happens in userspace rather than in the kernel.
 pub struct OverlayTunnel {
     pub name: String,
@@ -30,10 +34,11 @@ impl OverlayTunnel {
             .name(name.clone())
             .layer(Layer::L3)
             .mtu(mtu)
+            .tx_queue_len(TUN_TX_QUEUE_RECORDS)
             .offload(true)
             .multi_queue(queue_count > 1)
             .build_async()
-            .with_context(|| format!("failed to create FlowRouter TUN interface {name}"))?;
+            .with_context(|| format!("failed to create V2 dataplane TUN interface {name}"))?;
         let mut devices = Vec::with_capacity(queue_count);
         devices.push(Arc::new(device));
         for queue in 1..queue_count {
@@ -49,10 +54,6 @@ impl OverlayTunnel {
         self.devices.len()
     }
 
-    pub fn device(&self, shard: usize) -> &Arc<AsyncDevice> {
-        &self.devices[shard % self.devices.len()]
-    }
-
     pub fn writer(&self) -> OverlayTunnelWriter {
         OverlayTunnelWriter {
             queues: self
@@ -63,10 +64,6 @@ impl OverlayTunnel {
                 .collect(),
         }
     }
-
-    pub fn queue_writer(&self, shard: usize) -> OverlayTunnelQueueWriter {
-        OverlayTunnelQueueWriter::new(self.devices[shard % self.devices.len()].clone())
-    }
 }
 
 /// Single-owner TUN writer covering every queue. Prefer a per-queue writer
@@ -76,14 +73,29 @@ pub struct OverlayTunnelWriter {
 }
 
 impl OverlayTunnelWriter {
-    pub async fn send(&mut self, shard: usize, packet: &[u8]) -> std::io::Result<usize> {
+    pub async fn send_owned(
+        &mut self,
+        shard: usize,
+        packets: &mut [BytesMut],
+    ) -> std::io::Result<usize> {
         let index = shard % self.queues.len();
-        self.queues[index].send_slice(packet).await
+        self.queues[index].send_owned(packets).await
     }
 
-    pub async fn send_batch(&mut self, shard: usize, packets: &[&[u8]]) -> std::io::Result<usize> {
+    /// Gather-write one already validated raw virtio-net record. This keeps a
+    /// fragmented GSO packet in its QUIC-owned `Bytes` slices all the way to
+    /// the TUN syscall instead of coalescing it in userspace.
+    pub async fn send_raw_vectored(
+        &mut self,
+        shard: usize,
+        virtio_header: &[u8; VIRTIO_NET_HDR_LEN],
+        fragments: &[bytes::Bytes],
+    ) -> std::io::Result<usize> {
         let index = shard % self.queues.len();
-        self.queues[index].send_slices(packets).await
+        let mut slices = Vec::with_capacity(fragments.len() + 1);
+        slices.push(IoSlice::new(virtio_header));
+        slices.extend(fragments.iter().map(|fragment| IoSlice::new(fragment)));
+        self.queues[index].device.send_vectored(&slices).await
     }
 }
 
@@ -101,100 +113,9 @@ impl OverlayTunnelQueueWriter {
         }
     }
 
-    pub async fn send_slice(&mut self, packet: &[u8]) -> std::io::Result<usize> {
-        self.send_slices(&[packet]).await
-    }
-
-    pub async fn send_slices(&mut self, packets: &[&[u8]]) -> std::io::Result<usize> {
-        let mut buffers = packets
-            .iter()
-            .map(|packet| attach_virtio_copy(packet))
-            .collect::<Vec<_>>();
-        self.device
-            .send_multiple(&mut self.gro_table, &mut buffers, VIRTIO_NET_HDR_LEN)
-            .await
-    }
-
     pub async fn send_owned(&mut self, packets: &mut [BytesMut]) -> std::io::Result<usize> {
         self.device
             .send_multiple(&mut self.gro_table, packets, VIRTIO_NET_HDR_LEN)
             .await
-    }
-}
-
-pub fn tun_read_pool(mtu: u16) -> PacketSlotPool {
-    PacketSlotPool::with_small_payload(
-        tun_rs::IDEAL_BATCH_SIZE,
-        OVERLAY_HEADER_HEADROOM,
-        usize::from(mtu),
-    )
-}
-
-/// Place a virtio-net header in unused prefix bytes when the packet is unique.
-pub fn attach_virtio(packet: DataplaneBuf) -> BytesMut {
-    attach_virtio_counted(packet).0
-}
-
-/// Return the prepared TUN buffer and the number of packet payload bytes that
-/// had to be copied because the received allocation could not be reused.
-pub fn attach_virtio_counted(packet: DataplaneBuf) -> (BytesMut, u64) {
-    const HDR: usize = VIRTIO_NET_HDR_LEN;
-    if packet.can_prepend(HDR) {
-        match packet.try_prepend(&[0_u8; HDR]) {
-            Ok(sealed) => match sealed.try_into_mut() {
-                Ok(mut unique) => {
-                    unique[..HDR].fill(0);
-                    return (unique, 0);
-                }
-                Err(sealed) => {
-                    let packet_len = sealed.len().saturating_sub(HDR);
-                    return (attach_virtio_copy(&sealed[HDR..]), packet_len as u64);
-                }
-            },
-            Err(packet) => {
-                let packet_len = packet.len();
-                return (attach_virtio_copy(packet.as_slice()), packet_len as u64);
-            }
-        }
-    }
-    let packet_len = packet.len();
-    (attach_virtio_copy(packet.as_slice()), packet_len as u64)
-}
-
-pub fn attach_virtio_copy(packet: &[u8]) -> BytesMut {
-    let mut buffer = BytesMut::zeroed(VIRTIO_NET_HDR_LEN + packet.len());
-    buffer[VIRTIO_NET_HDR_LEN..].copy_from_slice(packet);
-    buffer
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::BytesMut;
-
-    #[test]
-    fn attach_virtio_uses_unique_prefix() {
-        let mut raw = BytesMut::zeroed(VIRTIO_NET_HDR_LEN + 4);
-        raw[VIRTIO_NET_HDR_LEN..].copy_from_slice(b"abcd");
-        let packet = DataplaneBuf::from_pooled(raw.freeze(), VIRTIO_NET_HDR_LEN);
-        let prepared = attach_virtio(packet);
-        assert_eq!(&prepared[..VIRTIO_NET_HDR_LEN], &[0; VIRTIO_NET_HDR_LEN]);
-        assert_eq!(&prepared[VIRTIO_NET_HDR_LEN..], b"abcd");
-    }
-
-    #[test]
-    fn attach_virtio_reports_fallback_copy_bytes() {
-        let packet = DataplaneBuf::from_static(b"abcd");
-        let (prepared, copied) = attach_virtio_counted(packet);
-        assert_eq!(copied, 4);
-        assert_eq!(&prepared[VIRTIO_NET_HDR_LEN..], b"abcd");
-    }
-
-    #[test]
-    fn tun_read_pool_is_not_all_jumbo() {
-        let pool = tun_read_pool(9_000);
-        assert!(pool.large_slot_count() < pool.slot_count());
-        assert_eq!(pool.headroom(), OVERLAY_HEADER_HEADROOM);
-        assert_eq!(pool.slot_payload_capacity(pool.large_slot_count()), 9_000);
     }
 }

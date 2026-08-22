@@ -1,19 +1,18 @@
 # Ironet
 
-`ironet` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在一个多队列 GSO/GRO TUN 接口上处理覆盖网流量，并通过分片 FlowRouter 按实时路径状态选择首跳。
+`ironet` 是运行在 Linux 上的三层加密覆盖网络。它使用 iroh/QUIC 建立经认证的节点邻接关系，在多队列 GSO/GRO TUN 接口与 QUIC DATAGRAM 之间传递 PacketTrain/Cell，并按实时路径状态自动调节 Bulk、FEC、Repair、pacing 和接收预算。
 
-当前软件版本为 `0.1.0`，当前网络协议正式定位为 **Ironet Protocol V1（1.0）**。协议分层、兼容边界和稳定性规则见 [Protocol V1](docs/protocol-v1.md)。配置格式、Presence 格式和内部 wire format 在首次稳定发布前可能发生不兼容变更。
+当前软件版本为 `0.1.0`，唯一网络协议为 **Ironet Protocol V2**。正式 `ironetd` 直接运行 V2 数据面，不包含 V1 协商、解码或回退入口。协议分层与不变量见 [Protocol V2](docs/protocol-v2.md)。配置、Presence 和 wire format 在首次稳定发布前允许不兼容演进。
 
 ## 项目范围
 
 - 每个守护进程创建并管理一个三层 TUN 接口，默认名称为 `ironet0`；接口内部按 CPU 数使用最多 8 条队列。
 - 节点使用签名 Presence 传播节点地址、前缀归属和转发能力；固定 peer 用于引导连接。
-- 同一流在短租约内固定到一条路径；租约到期后可根据延迟、抖动、丢包、队列压力和实测容量重新选择路径。
-- 路由与策略使用不可变 generation；peer 发送队列采用有界无共享互斥热路径和单写者调度，连接读取通过原子快照完成。
-- 容量以 `(目的节点所有者, 首跳节点)` 为键，分别维护两个方向的测量值。主动探测和接收端确认的业务交付样本共同参与估计。
-- 开启发现时会发布直连候选，并通过已连接 peer 交换观察到的 NAT 映射以协调打洞；硬 NAT 节点可先通过 DERP 或已有覆盖邻接建立连接。
-- 固定 bootstrap peer 继续交换签名 Presence 和经过过滤的 NAT 地址候选；普通 transit peer 是覆盖层的额外兜底，不与底层 relay 混为一层。
-- 默认仅允许直连 UDP、DERP 和已连接节点的覆盖层中转；iroh relay 默认禁止，仅能显式开启。
+- 同一流持有 V2 route-label lease；拓扑变化时原子发布不可变 generation，旧 generation 最多保留两个以自然排空在途 PacketTrain。
+- 每条邻接由单写者发送，Bulk 使用有界 DRR，Latency 使用 EDF，并在最多 4 个 Cell 后重新检查抢占。
+- PacketTrain 保留 GSO 语义，Cell 是 QUIC DATAGRAM 的独立调度/FEC 单元；丢失数据优先由低冗余 FEC 恢复，再通过可靠 Repair 补齐。
+- 固定 bootstrap peer 交换经过 owner 签名和 network membership tag 验证的 V2 Presence；transit peer 是覆盖层路径，不与 DERP underlay 混为一层。
+- 默认仅允许直连 UDP、DERP 和已连接节点的覆盖层中转；V2 不启用 iroh relay。
 - 守护进程以 `CAP_NET_ADMIN` 运行；操作命令通过 Unix 控制套接字访问守护进程。
 
 当前约束：仅支持 Linux；每个节点按单一互联网出口建模；每条流在一个租约内只使用一条覆盖路径；未实现多路径发送。
@@ -23,26 +22,19 @@
 ```mermaid
 flowchart LR
     R["Linux 策略路由"] --> T["多队列 L3 TUN：ironet0\nGSO/GRO"]
-    T --> F["FlowRouter shards\n流键、压力与路径租约"]
-    F --> B["首跳 B 的发送队列"]
-    F --> D["首跳 D 的发送队列"]
-    B --> U1["iroh/QUIC\n直连、relay 或 DERP"]
-    D --> U2["iroh/QUIC\n直连、relay 或 DERP"]
-    U1 --> P["远端 FlowRouter"]
+    T --> F["V2 flow lease + route label\n不可变 snapshot"]
+    F --> B["首跳 B\nControl/Latency/Bulk/Probe"]
+    F --> D["首跳 D\nControl/Latency/Bulk/Probe"]
+    B --> U1["iroh/QUIC\n直连或 DERP"]
+    D --> U2["iroh/QUIC\n直连或 DERP"]
+    U1 --> P["远端 label dispatch"]
     U2 --> P
-    M["签名 Presence\n前缀与转发能力"] --> F
-    C["容量估计\n主动探测与交付确认"] --> F
+    M["PRV2 Presence\n前缀、双边 link、PMTU"] --> F
+    C["自动调优\nRTT/loss/rate/CPU/queue"] --> B
+    C --> D
 ```
 
-FlowRouter 的候选路径比较包含以下因素：
-
-```text
-ETA = RTT + 抖动 + 丢包惩罚
-    + 8 × (候选路径队列字节数 + 流压力字节数) / 方向容量
-    + 切换惩罚
-```
-
-新建或稀疏流通常优先选择低延迟路径；持续流量会累积压力，并在租约到期后重新比较路径。该过程不依赖端口、协议或应用类型的优先级表。
+Topology compiler 根据双边认证的 link、健康度和 cost 生成端到端 route label。transit 热路径只校验 expected-ingress、epoch 和 hop shim，然后按 label 查找下一邻接，不扫描 Presence、前缀或策略，也不解码 Record/FEC。
 
 ## 安装与首次运行
 
@@ -56,7 +48,7 @@ nix develop -c cargo build --locked --release
 sudo scripts/install.sh
 ```
 
-第一台机器创建网络。节点名、Overlay IPv4 和 Overlay IPv6 地址默认自动生成；命令会生成身份、原子写入并密封配置，然后启动服务：
+第一台机器创建网络。节点名和 Overlay IPv4/IPv6 地址默认自动生成；命令会生成身份、原子写入并密封配置，然后启动服务：
 
 ```bash
 sudo ironet network create production
@@ -68,10 +60,10 @@ sudo ironet network create production
 sudo ironet invite create --expires 1h
 ```
 
-在另一台机器粘贴输出的 `ironet://join/v1/...` 地址：
+在另一台机器粘贴输出的 `ironet://join/v2/...` 地址：
 
 ```bash
-sudo ironet join 'ironet://join/v1/...'
+sudo ironet join 'ironet://join/v2/...'
 ```
 
 需要向网络发布本地 LAN 时再启用该能力：
@@ -86,13 +78,14 @@ sudo ironet subnet publish 192.168.50.0/24
 sudo ironet transit enable
 ```
 
-无需手工复制 network ID、endpoint ID 或 DERP key，也无需编辑或密封 TOML。无人值守部署可用 `--output json`、`--invite-file` 和 `--no-start`。完整流程见 [快速开始](docs/快速开始.md)。
+无需手工复制 network ID 或 endpoint ID，也无需编辑或密封 TOML。无人值守部署可用 `--output json`、`--invite-file` 和 `--no-start`。完整流程见 [快速开始](docs/快速开始.md)。
 
 ## 日常操作
 
 ```bash
 sudo ironet health
 sudo ironet status
+sudo ironet metrics
 sudo ironet peers
 sudo ironet tui
 sudo ironet ping 21.0.0.3
@@ -109,7 +102,7 @@ sudo ironet reload
 在守护进程运行时会自动 reload；`--dry-run` 可预览，维护窗口可加 `--defer`
 延后应用。
 
-`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`tui` 是交互式运维台，`Tab` 可切换 Peer、Routes、Diagnostics 三个视图：查看实时链路，在 Routes 中按 `a` 接受或按两次 `x` 移除持久路由，在 Diagnostics 中直接对所选节点执行 ping/trace；任意视图按两次 `R` 可校验并 reload 守护进程。原 `top` 命令保留为兼容别名。
+`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。`metrics` 从同一份实时 V2 snapshot 输出 `ironet_v2_*` Prometheus 文本指标。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`tui` 是交互式运维台，`Tab` 可切换 Peer、Routes、Diagnostics 三个视图：查看实时链路，在 Routes 中按 `a` 接受或按两次 `x` 移除持久路由，在 Diagnostics 中直接对所选节点执行 ping/trace；任意视图按两次 `R` 可校验并 reload 守护进程。原 `top` 命令保留为兼容别名。
 
 服务、监控、配置更新、备份与排障命令见 [运行与运维](docs/运行与运维.md)。
 

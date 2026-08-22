@@ -105,7 +105,7 @@ impl DerpServer {
         );
         url.set_path("/derp");
         let canonical = url.to_string();
-        let digest = blake3::derive_key("ironet DERP region URL v1", canonical.as_bytes());
+        let digest = blake3::derive_key("ironet DERP region URL v2", canonical.as_bytes());
         let region_id = RegionId(u64::from_be_bytes(
             digest[..8].try_into().expect("fixed size"),
         ));

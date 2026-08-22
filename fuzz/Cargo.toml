@@ -1,0 +1,42 @@
+[package]
+name = "ironet-v2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.11.1"
+ironet = { path = ".." }
+libfuzzer-sys = "0.4.13"
+postcard = "1.1.3"
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+noq = { path = "../crates/noq-v2" }
+noq-proto = { path = "../crates/noq-proto-v2" }
+
+[[bin]]
+name = "v2_wire_decoders"
+path = "fuzz_targets/v2_wire_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_stateful_receive"
+path = "fuzz_targets/v2_stateful_receive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_policy_guardrails"
+path = "fuzz_targets/v2_policy_guardrails.rs"
+test = false
+doc = false
+bench = false

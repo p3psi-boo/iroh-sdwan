@@ -3,8 +3,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use iroh::{EndpointAddr, unstable_net_report::NetReport};
 use serde::{Deserialize, Serialize};
 
-use crate::PROTOCOL_NAME;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nat64Prefix {
     pub network: Ipv6Addr,
@@ -160,41 +158,10 @@ fn clear_after_prefix(bytes: &mut [u8; 16], prefix_len: u8) {
     bytes[start..].fill(0);
 }
 
-pub fn network_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"ironet-network-alpn-v1\0", "")
-}
-
-/// Separate ALPN for short-lived reachability/RTT probes. Keeping probes off
-/// the data-plane ALPN prevents an exploratory handshake from replacing an
-/// established overlay connection for the same endpoint.
-pub fn network_probe_alpn(network_id: &str) -> Vec<u8> {
-    network_alpn_with_context(network_id, b"ironet-mesh-probe-alpn-v1\0", "/probe")
-}
-
-fn network_alpn_with_context(network_id: &str, context: &[u8], suffix: &str) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(context);
-    hasher.update(network_id.as_bytes());
-    format!("{PROTOCOL_NAME}{suffix}/{}", hasher.finalize().to_hex()).into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use iroh::{EndpointAddr, SecretKey};
-
-    #[test]
-    fn network_id_separates_alpn_domains() {
-        assert_ne!(network_alpn("one"), network_alpn("two"));
-        assert_ne!(network_probe_alpn("one"), network_probe_alpn("two"));
-        assert_ne!(network_alpn("one"), network_probe_alpn("one"));
-    }
-
-    #[test]
-    fn alpn_identifies_ironet_protocol_v1() {
-        assert!(network_alpn("network").starts_with(b"ironet/ip/1/"));
-        assert!(network_probe_alpn("network").starts_with(b"ironet/ip/1/probe/"));
-    }
 
     #[test]
     fn discovers_and_uses_well_known_nat64_prefix() {

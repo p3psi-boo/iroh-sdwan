@@ -50,6 +50,7 @@ initialize_identity() {
     --config "/state/$node/config.toml" \
     --state-dir "/state/$node" \
     --node-name "$node" \
+    --no-dns \
     --no-start \
     --output json \
     "$@")

@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{
-        AttachmentMode, Config, FecConfig, NodeInfo, ObservabilityConfig, PacketPolicyConfig,
-        PeerConfig, RelayConfig, RoutingConfig, UdpSegmentationOffload, config_digest_path,
+        Config, CoverConfig, DnsConfig, NodeInfo, PeerConfig, RelayConfig, RoutingConfig,
+        config_digest_path,
     },
     deployment,
     derp::DerpPublicKey,
@@ -24,11 +24,10 @@ use crate::{
     routes::RouteRegistry,
 };
 
-pub const PRODUCT_STATE_VERSION: u8 = 1;
-pub const INVITE_VERSION: u8 = 1;
+pub const PRODUCT_STATE_VERSION: u8 = 2;
+pub const INVITE_VERSION: u8 = 2;
 pub const DEFAULT_ADDRESS_POOL: &str = "100.64.0.0/10";
-/// Compatibility pool used when reading product state or V1 invites created
-/// before Overlay IPv6 was represented explicitly.
+/// Default pool used for the V2 product address plan.
 pub const DEFAULT_IPV6_ADDRESS_POOL: &str = "fd42:6972:6f68::/64";
 const PRODUCT_STATE_FILE: &str = "network.toml";
 const AUTHORITY_KEY_FILE: &str = "network-authority.key";
@@ -38,10 +37,6 @@ fn default_ipv6_address_pool() -> Ipv6Net {
     DEFAULT_IPV6_ADDRESS_POOL
         .parse()
         .expect("default Overlay IPv6 pool is valid")
-}
-
-fn is_default_ipv6_address_pool(pool: &Ipv6Net) -> bool {
-    *pool == default_ipv6_address_pool()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,16 +94,19 @@ pub struct InvitePayload {
     pub id: String,
     pub network_name: String,
     pub network_uid: String,
-    /// Existing V1 data planes use this high-entropy value as their admission secret.
+    /// V2 SessionHello uses this high-entropy value as its membership secret.
     /// It only appears inside the signed, secret invite token.
     pub network_secret: String,
     pub authority: EndpointId,
     pub address_pool: Ipv4Net,
-    #[serde(
-        default = "default_ipv6_address_pool",
-        skip_serializing_if = "is_default_ipv6_address_pool"
-    )]
     pub ipv6_address_pool: Ipv6Net,
+    /// Authority-selected network-wide QUIC cover generation. Because this is
+    /// inside the signed payload, a joiner cannot silently fall back to a
+    /// different SNI pool while still claiming membership in the same V2
+    /// network.
+    pub cover: CoverConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_domain: Option<String>,
     pub issued_unix_secs: u64,
     pub expires_unix_secs: u64,
     pub capabilities: Vec<String>,
@@ -125,8 +123,6 @@ pub struct InviteBootstrap {
     pub endpoint_id: EndpointId,
     #[serde(default)]
     pub direct_addresses: Vec<SocketAddr>,
-    #[serde(default)]
-    pub relay_urls: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derp_public_key: Option<DerpPublicKey>,
 }
@@ -146,6 +142,7 @@ pub struct NetworkSummary {
     pub endpoint_id: String,
     pub address: String,
     pub addresses: Vec<String>,
+    pub dns_domain: Option<String>,
     pub config: String,
     pub state: String,
     pub created: bool,
@@ -180,7 +177,9 @@ pub struct CreateNetworkOptions {
     pub address_pool: Option<Ipv4Net>,
     pub ipv6_address_pool: Option<Ipv6Net>,
     pub derp_servers: Vec<String>,
-    pub bind_addresses: Vec<SocketAddr>,
+    pub bind_address: Option<SocketAddr>,
+    pub dns_domain: Option<String>,
+    pub no_dns: bool,
     pub reuse_identity: bool,
 }
 
@@ -210,13 +209,20 @@ pub fn load_state(state_dir: &Path) -> Result<ProductState> {
             path.display()
         )
     })?;
-    let state: ProductState = toml::from_str(&raw)
+    let mut state: ProductState = toml::from_str(&raw)
         .with_context(|| format!("failed to parse product state {}", path.display()))?;
     ensure!(
-        state.version == PRODUCT_STATE_VERSION,
+        (1..=PRODUCT_STATE_VERSION).contains(&state.version),
         "unsupported product state version {}",
         state.version
     );
+    // Product state is local deployment metadata, not a wire-protocol
+    // compatibility surface.  Version 1 already carries the V2 identity,
+    // authority and address-plan data needed here; normalize it in memory so
+    // the next transactional write upgrades it atomically to the current
+    // schema.  This keeps an in-place binary upgrade from stranding an
+    // otherwise valid V2 deployment.
+    state.version = PRODUCT_STATE_VERSION;
     Ok(state)
 }
 
@@ -237,9 +243,15 @@ pub async fn create_network(
         address_pool,
         ipv6_address_pool,
         derp_servers,
-        bind_addresses,
+        bind_address,
+        dns_domain,
+        no_dns,
         reuse_identity,
     } = options;
+    ensure!(
+        !(no_dns && dns_domain.is_some()),
+        "--dns-domain conflicts with --no-dns"
+    );
     validate_display_name(network_name, "network name")?;
     if state_path(state_dir).exists() && config_path.exists() {
         let existing = load_state(state_dir)?;
@@ -272,6 +284,21 @@ pub async fn create_network(
                 existing.ipv6_address_pool == ipv6_address_pool,
                 "network already uses IPv6 address pool {}",
                 existing.ipv6_address_pool
+            );
+        }
+        let existing_config = Config::load(config_path).await?;
+        if no_dns {
+            ensure!(
+                !existing_config.dns.enabled,
+                "network already has embedded DNS enabled"
+            );
+        }
+        if let Some(dns_domain) = &dns_domain {
+            ensure!(
+                existing_config.dns.enabled
+                    && existing_config.dns.domain.as_deref() == Some(dns_domain.as_str()),
+                "network already uses DNS domain {}",
+                existing_config.dns.domain.as_deref().unwrap_or("disabled")
             );
         }
         return show_network(config_path, state_dir).await;
@@ -326,15 +353,26 @@ pub async fn create_network(
     let address = allocate_address(pool, node_key.public());
     let ipv6_address = allocate_ipv6_address(ipv6_pool, node_key.public());
     let now = now_unix()?;
-    let config = base_config(
+    let dns = if no_dns {
+        DnsConfig::default()
+    } else {
+        DnsConfig {
+            enabled: true,
+            domain: Some(dns_domain.unwrap_or_else(|| default_dns_domain(&network_uid))),
+            reverse_prefixes: vec![IpNet::V4(pool), IpNet::V6(ipv6_pool)],
+            ..DnsConfig::default()
+        }
+    };
+    let mut config = base_config(
         network_secret,
         identity_file.clone(),
         node_name.clone(),
         vec![address, ipv6_address],
         derp_servers,
-        bind_addresses,
+        bind_address,
         Vec::new(),
     );
+    config.dns = dns;
     config.validate()?;
     config.validate_local_id(node_key.public())?;
     let state = ProductState {
@@ -372,6 +410,7 @@ pub async fn create_network(
         endpoint_id: node_key.public().to_string(),
         address: address.to_string(),
         addresses: vec![address.to_string(), ipv6_address.to_string()],
+        dns_domain: config.dns.domain.clone(),
         config: config_path.display().to_string(),
         state: product_file.display().to_string(),
         created: true,
@@ -385,7 +424,7 @@ pub fn create_invite(
     direct_addresses: Vec<SocketAddr>,
     member_endpoint_id: Option<EndpointId>,
 ) -> Result<InviteSummary> {
-    let config = load_sealed_sync(config_path)?;
+    let mut config = load_sealed_sync(config_path)?;
     config.validate()?;
     let mut state = load_state(state_dir)?;
     let authority_file = state
@@ -410,6 +449,20 @@ pub fn create_invite(
     let member_endpoint_id = member_endpoint_id
         .or_else(|| generated_member.as_ref().map(SecretKey::public))
         .expect("member identity is generated or supplied");
+    if !config
+        .peers
+        .iter()
+        .any(|peer| peer.endpoint_id == member_endpoint_id)
+    {
+        config.peers.push(PeerConfig {
+            name: format!("invite-{}", &member_endpoint_id.to_string()[..12]),
+            endpoint_id: member_endpoint_id,
+            direct_addresses: Vec::new(),
+            derp_public_key: None,
+        });
+    }
+    config.validate()?;
+    config.validate_local_id(node_key.public())?;
     let derp_public_key = if config.relay.derp_enabled() && config.derp_identity_file().exists() {
         Some(crate::derp::identity::load(&config.derp_identity_file())?.public_key())
     } else {
@@ -424,6 +477,8 @@ pub fn create_invite(
         authority: state.authority,
         address_pool: state.address_pool,
         ipv6_address_pool: state.ipv6_address_pool,
+        cover: config.cover.clone(),
+        dns_domain: config.dns.domain.clone(),
         issued_unix_secs: now,
         expires_unix_secs: expires,
         capabilities: vec!["join".into()],
@@ -435,7 +490,6 @@ pub fn create_invite(
             name: state.node_name.clone(),
             endpoint_id: node_key.public(),
             direct_addresses,
-            relay_urls: config.relay.iroh_urls().map(str::to_owned).collect(),
             derp_public_key,
         },
     };
@@ -443,7 +497,7 @@ pub fn create_invite(
     let signature = authority.sign(&bytes).to_bytes().to_vec();
     let envelope = SignedInvite { payload, signature };
     let token = format!(
-        "ironet://join/v1/{}",
+        "ironet://join/v2/{}",
         hex::encode(serde_json::to_vec(&envelope)?)
     );
     state.invites.push(InviteRecord {
@@ -454,12 +508,45 @@ pub fn create_invite(
         token_hash: blake3::hash(token.as_bytes()).to_hex().to_string(),
         member_endpoint_id,
     });
-    save_state(state_dir, &state)?;
+    save_invite_transaction(config_path, state_dir, &config, &state)?;
     Ok(InviteSummary {
         id,
         token,
         expires_unix_secs: expires,
     })
+}
+
+fn save_invite_transaction(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &Config,
+    state: &ProductState,
+) -> Result<()> {
+    let digest_path = config_digest_path(config_path);
+    let product_path = state_path(state_dir);
+    let previous_config = fs::read(config_path)
+        .with_context(|| format!("failed reading {}", config_path.display()))?;
+    let previous_digest = fs::read(&digest_path)
+        .with_context(|| format!("failed reading {}", digest_path.display()))?;
+    let previous_state = fs::read(&product_path)
+        .with_context(|| format!("failed reading {}", product_path.display()))?;
+    let encoded_config = toml::to_string_pretty(config)?;
+    let encoded_state = toml::to_string_pretty(state)?;
+    let digest = format!("{}\n", blake3::hash(encoded_config.as_bytes()).to_hex());
+
+    let result = (|| -> Result<()> {
+        deployment::atomic_write(config_path, encoded_config.as_bytes(), 0o600)?;
+        deployment::atomic_write(&digest_path, digest.as_bytes(), 0o600)?;
+        deployment::atomic_write(&product_path, encoded_state.as_bytes(), 0o600)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = deployment::atomic_write(config_path, &previous_config, 0o600);
+        let _ = deployment::atomic_write(&digest_path, &previous_digest, 0o600);
+        let _ = deployment::atomic_write(&product_path, &previous_state, 0o600);
+        return Err(error.context("invite creation was rolled back"));
+    }
+    Ok(())
 }
 
 pub fn list_invites(state_dir: &Path) -> Result<Vec<InviteRecord>> {
@@ -563,21 +650,33 @@ pub async fn join_network(
     let peer = PeerConfig {
         name: payload.bootstrap.name.clone(),
         endpoint_id: payload.bootstrap.endpoint_id,
-        transit_enabled: false,
         direct_addresses: payload.bootstrap.direct_addresses.clone(),
-        relay_urls: payload.bootstrap.relay_urls.clone(),
         derp_public_key: payload.bootstrap.derp_public_key,
-        allowed_source_prefixes: Vec::new(),
     };
-    let config = base_config(
+    let dns = payload
+        .dns_domain
+        .as_ref()
+        .map(|domain| DnsConfig {
+            enabled: true,
+            domain: Some(domain.clone()),
+            reverse_prefixes: vec![
+                IpNet::V4(payload.address_pool),
+                IpNet::V6(payload.ipv6_address_pool),
+            ],
+            ..DnsConfig::default()
+        })
+        .unwrap_or_default();
+    let mut config = base_config(
         payload.network_secret,
         identity_file,
         node_name.clone(),
         vec![address, ipv6_address],
         Vec::new(),
-        Vec::new(),
+        None,
         vec![peer],
     );
+    config.cover = payload.cover;
+    config.dns = dns;
     config.validate()?;
     config.validate_local_id(node_key.public())?;
     let state = ProductState {
@@ -613,6 +712,7 @@ pub async fn join_network(
         endpoint_id: node_key.public().to_string(),
         address: address.to_string(),
         addresses: vec![address.to_string(), ipv6_address.to_string()],
+        dns_domain: config.dns.domain.clone(),
         config: config_path.display().to_string(),
         state: product_file.display().to_string(),
         created: false,
@@ -620,10 +720,10 @@ pub async fn join_network(
 }
 
 pub fn decode_invite(token: &str) -> Result<InvitePayload> {
+    let token = token.trim();
     let encoded = token
-        .trim()
-        .strip_prefix("ironet://join/v1/")
-        .context("invalid invite; expected ironet://join/v1/…")?;
+        .strip_prefix("ironet://join/v2/")
+        .context("invalid invite; expected ironet://join/v2/…")?;
     let raw = hex::decode(encoded).context("invite payload is not valid encoding")?;
     let signed: SignedInvite = serde_json::from_slice(&raw).context("invalid invite payload")?;
     ensure!(
@@ -654,7 +754,25 @@ pub fn decode_invite(token: &str) -> Result<InvitePayload> {
         .authority
         .verify(&bytes, &signature)
         .context("invite signature is invalid")?;
+    validate_invite_cover(&signed.payload.cover)?;
     Ok(signed.payload)
+}
+
+fn validate_invite_cover(cover: &CoverConfig) -> Result<()> {
+    ensure!(
+        cover.profile_id != 0,
+        "invite cover generation zero is reserved"
+    );
+    ensure!(
+        !cover.sni_pool.is_empty(),
+        "invite cover SNI pool cannot be empty"
+    );
+    let mut names = HashSet::new();
+    for name in &cover.sni_pool {
+        crate::v2_runtime::validate_cover_sni(name)?;
+        ensure!(names.insert(name), "duplicate invite cover SNI {name}");
+    }
+    Ok(())
 }
 
 pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<NetworkSummary> {
@@ -672,6 +790,7 @@ pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<Networ
             .iter()
             .map(ToString::to_string)
             .collect(),
+        dns_domain: config.dns.domain.clone(),
         config: config_path.display().to_string(),
         state: state_path(state_dir).display().to_string(),
         created: state.authority_key_file.is_some(),
@@ -956,39 +1075,15 @@ fn base_config(
     node_name: String,
     addresses: Vec<IpNet>,
     derp_servers: Vec<String>,
-    bind_addresses: Vec<SocketAddr>,
+    bind_address: Option<SocketAddr>,
     peers: Vec<PeerConfig>,
 ) -> Config {
-    let iroh_relay_enabled = peers.iter().any(|peer| !peer.relay_urls.is_empty());
     Config {
         network_id: network_secret,
         identity_file,
-        bind_addresses,
+        bind_addresses: bind_address.into_iter().collect(),
         excluded_underlay_prefixes: Vec::new(),
-        discovery_enabled: true,
-        attachment: AttachmentMode::Tun,
         tun_mtu: u16::MAX,
-        max_frame_size: 1400,
-        udp_segmentation_offload: UdpSegmentationOffload::Auto,
-        quic_auto_tune: true,
-        quic_cipher_preference: crate::config::QuicCipherPreference::default(),
-        quic_send_buffer_bytes: crate::config::default_quic_send_buffer_bytes(),
-        quic_receive_buffer_bytes: crate::config::default_quic_receive_buffer_bytes(),
-        quic_data_lanes: crate::config::default_quic_data_lanes(),
-        quic_congestion_controller: crate::config::QuicCongestionController::default(),
-        quic_initial_rtt_millis: crate::config::default_quic_initial_rtt_millis(),
-        quic_initial_mtu: crate::config::default_quic_initial_mtu(),
-        quic_mtu_discovery_enabled: false,
-        quic_mtu_black_hole_cooldown_millis:
-            crate::config::default_quic_mtu_black_hole_cooldown_millis(),
-        quic_keep_alive_millis: crate::config::default_quic_keep_alive_millis(),
-        quic_passthrough_window_bytes: crate::config::default_quic_passthrough_window_bytes(),
-        quic_passthrough_pacing_mbps: None,
-        quic_adaptive_initial_mbps: crate::config::default_quic_adaptive_initial_mbps(),
-        quic_adaptive_min_mbps: crate::config::default_quic_adaptive_min_mbps(),
-        quic_adaptive_max_mbps: crate::config::default_quic_adaptive_max_mbps(),
-        quic_adaptive_loss_backoff_bps: crate::config::default_quic_adaptive_loss_backoff_bps(),
-        quic_pacing_quantum_bytes: crate::config::default_quic_pacing_quantum_bytes(),
         node_interface: "ironet0".into(),
         node_addresses: addresses,
         advertised_prefixes: Vec::new(),
@@ -997,21 +1092,18 @@ fn base_config(
             description: None,
             metadata: BTreeMap::new(),
         }),
-        path_selection: Default::default(),
         relay: RelayConfig {
-            iroh_relay_enabled,
-            urls: Vec::new(),
-            discovery_urls: Vec::new(),
             servers: derp_servers,
         },
+        cover: crate::config::CoverConfig::default(),
         peers,
         links: Vec::new(),
         route_origins: Vec::new(),
         routing: RoutingConfig::default(),
         mesh: Default::default(),
-        packet_policy: PacketPolicyConfig::default(),
-        fec: FecConfig::default(),
-        observability: ObservabilityConfig::default(),
+        dns: DnsConfig::default(),
+        autotune: Default::default(),
+        path_migration: Default::default(),
     }
 }
 
@@ -1201,7 +1293,7 @@ fn select_ipv6_address_pool(seed: EndpointId) -> Result<Ipv6Net> {
     (0_u16..=u16::MAX)
         .map(|subnet| {
             let mut hasher = blake3::Hasher::new();
-            hasher.update(b"ironet-auto-ipv6-pool-v1\0");
+            hasher.update(b"ironet-auto-ipv6-pool-v2\0");
             hasher.update(seed.as_bytes());
             hasher.update(&subnet.to_be_bytes());
             let hash = hasher.finalize();
@@ -1306,7 +1398,7 @@ fn ipv6_nets_overlap(left: Ipv6Net, right: Ipv6Net) -> bool {
 
 fn allocate_address(pool: Ipv4Net, endpoint: EndpointId) -> IpNet {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ironet-auto-address-v1\0");
+    hasher.update(b"ironet-auto-address-v2\0");
     hasher.update(pool.to_string().as_bytes());
     hasher.update(endpoint.as_bytes());
     let hash = hasher.finalize();
@@ -1325,7 +1417,7 @@ fn allocate_address(pool: Ipv4Net, endpoint: EndpointId) -> IpNet {
 
 fn allocate_ipv6_address(pool: Ipv6Net, endpoint: EndpointId) -> IpNet {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ironet-auto-ipv6-address-v1\0");
+    hasher.update(b"ironet-auto-ipv6-address-v2\0");
     hasher.update(pool.to_string().as_bytes());
     hasher.update(endpoint.as_bytes());
     let hash = hasher.finalize();
@@ -1340,6 +1432,11 @@ fn allocate_ipv6_address(pool: Ipv6Net, endpoint: EndpointId) -> IpNet {
 
 fn short_network_uid(authority: EndpointId) -> String {
     authority.to_string()
+}
+
+fn default_dns_domain(network_uid: &str) -> String {
+    let short = network_uid.get(..12).unwrap_or(network_uid);
+    format!("n-{short}.ironet.internal")
 }
 
 fn now_unix() -> Result<u64> {
@@ -1371,6 +1468,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_product_state_is_upgraded_independently_of_the_wire_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = SecretKey::generate().public();
+        fs::write(
+            state_path(directory.path()),
+            format!(
+                r#"version = 1
+network_name = "deployed-v2"
+network_uid = "{authority}"
+node_name = "edge"
+authority = "{authority}"
+address_pool = "21.42.0.0/16"
+local_address = "21.42.0.7/32"
+created_unix_secs = 1
+invites = []
+removed_nodes = []
+"#
+            ),
+        )
+        .unwrap();
+
+        let state = load_state(directory.path()).unwrap();
+        assert_eq!(state.version, PRODUCT_STATE_VERSION);
+        assert_eq!(state.ipv6_address_pool, default_ipv6_address_pool());
+        assert_eq!(state.local_ipv6_address, None);
+    }
+
+    #[test]
     fn invite_round_trip_verifies_signature() {
         let authority = SecretKey::generate();
         let payload = InvitePayload {
@@ -1381,7 +1506,12 @@ mod tests {
             network_secret: "secret".into(),
             authority: authority.public(),
             address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
-            ipv6_address_pool: default_ipv6_address_pool(),
+            ipv6_address_pool: DEFAULT_IPV6_ADDRESS_POOL.parse().unwrap(),
+            cover: CoverConfig {
+                sni_pool: vec!["video-a.example".into(), "video-b.example".into()],
+                profile_id: 9,
+            },
+            dns_domain: Some("n-test.ironet.internal".into()),
             issued_unix_secs: 1,
             expires_unix_secs: u64::MAX,
             capabilities: vec!["join".into()],
@@ -1391,82 +1521,44 @@ mod tests {
                 name: "edge-a".into(),
                 endpoint_id: SecretKey::generate().public(),
                 direct_addresses: Vec::new(),
-                relay_urls: Vec::new(),
                 derp_public_key: None,
             },
         };
         let bytes = serde_json::to_vec(&payload).unwrap();
-        let signed = SignedInvite {
+        let mut signed = SignedInvite {
             signature: authority.sign(&bytes).to_bytes().to_vec(),
             payload,
         };
         let token = format!(
-            "ironet://join/v1/{}",
+            "ironet://join/v2/{}",
             hex::encode(serde_json::to_vec(&signed).unwrap())
         );
         let decoded = decode_invite(&token).unwrap();
         assert_eq!(decoded.network_name, "production");
+        assert_eq!(decoded.cover.profile_id, 9);
+
+        // The cover profile is authenticated network control state, not a
+        // joiner-local default. Even a correctly signed V2 invite is rejected
+        // when that state is structurally invalid.
+        signed.payload.cover.sni_pool.clear();
+        let bytes = serde_json::to_vec(&signed.payload).unwrap();
+        signed.signature = authority.sign(&bytes).to_bytes().to_vec();
+        let invalid = format!(
+            "ironet://join/v2/{}",
+            hex::encode(serde_json::to_vec(&signed).unwrap())
+        );
+        assert!(
+            decode_invite(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("cover SNI pool cannot be empty")
+        );
     }
 
     #[test]
-    fn invite_without_ipv6_pool_remains_valid_and_gets_compatibility_pool() {
-        #[derive(Serialize)]
-        struct LegacyInvitePayload {
-            version: u8,
-            id: String,
-            network_name: String,
-            network_uid: String,
-            network_secret: String,
-            authority: EndpointId,
-            address_pool: Ipv4Net,
-            issued_unix_secs: u64,
-            expires_unix_secs: u64,
-            capabilities: Vec<String>,
-            member_endpoint_id: EndpointId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            member_secret: Option<String>,
-            bootstrap: InviteBootstrap,
-        }
-
-        #[derive(Serialize)]
-        struct LegacySignedInvite {
-            payload: LegacyInvitePayload,
-            signature: Vec<u8>,
-        }
-
-        let authority = SecretKey::generate();
-        let payload = LegacyInvitePayload {
-            version: INVITE_VERSION,
-            id: "legacy".into(),
-            network_name: "production".into(),
-            network_uid: authority.public().to_string(),
-            network_secret: "secret".into(),
-            authority: authority.public(),
-            address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
-            issued_unix_secs: 1,
-            expires_unix_secs: u64::MAX,
-            capabilities: vec!["join".into()],
-            member_endpoint_id: SecretKey::generate().public(),
-            member_secret: None,
-            bootstrap: InviteBootstrap {
-                name: "edge-a".into(),
-                endpoint_id: SecretKey::generate().public(),
-                direct_addresses: Vec::new(),
-                relay_urls: Vec::new(),
-                derp_public_key: None,
-            },
-        };
-        let bytes = serde_json::to_vec(&payload).unwrap();
-        let envelope = LegacySignedInvite {
-            signature: authority.sign(&bytes).to_bytes().to_vec(),
-            payload,
-        };
-        let token = format!(
-            "ironet://join/v1/{}",
-            hex::encode(serde_json::to_vec(&envelope).unwrap())
-        );
-        let decoded = decode_invite(&token).unwrap();
-        assert_eq!(decoded.ipv6_address_pool, default_ipv6_address_pool());
+    fn removed_invite_generation_is_rejected_without_fallback() {
+        let error = decode_invite("ironet://join/v1/00").unwrap_err();
+        assert!(error.to_string().contains("expected ironet://join/v2/"));
     }
 
     #[test]
@@ -1491,27 +1583,6 @@ mod tests {
         };
         assert!(ipv6_pool.contains(&address));
         assert_eq!(first_ipv6.prefix_len(), 128);
-    }
-
-    #[test]
-    fn legacy_product_state_loads_without_ipv6_fields() {
-        let authority = SecretKey::generate();
-        let state: ProductState = toml::from_str(&format!(
-            r#"
-version = 1
-network_name = "production"
-network_uid = "{authority}"
-node_name = "edge-a"
-authority = "{authority}"
-address_pool = "100.64.0.0/10"
-local_address = "100.64.0.1/32"
-created_unix_secs = 1
-"#,
-            authority = authority.public()
-        ))
-        .unwrap();
-        assert_eq!(state.ipv6_address_pool, default_ipv6_address_pool());
-        assert_eq!(state.local_ipv6_address, None);
     }
 
     #[test]
@@ -1543,6 +1614,16 @@ created_unix_secs = 1
         .await
         .unwrap();
         assert!(first.created);
+        let expected_cover = CoverConfig {
+            sni_pool: vec!["edge-video.example".into(), "origin-video.example".into()],
+            profile_id: 17,
+        };
+        update_config(&creator_config, |config| {
+            config.cover = expected_cover.clone();
+            Ok(())
+        })
+        .await
+        .unwrap();
         let invite = create_invite(
             &creator_config,
             creator.path(),
@@ -1551,6 +1632,14 @@ created_unix_secs = 1
             None,
         )
         .unwrap();
+        let creator_runtime = Config::load(&creator_config).await.unwrap();
+        assert_eq!(creator_runtime.peers.len(), 1);
+        assert_eq!(
+            creator_runtime.peers[0].endpoint_id,
+            decode_invite(&invite.token).unwrap().member_endpoint_id
+        );
+        assert_eq!(decode_invite(&invite.token).unwrap().cover, expected_cover);
+        assert!(creator_runtime.peers[0].direct_addresses.is_empty());
         let second = join_network(
             &joiner_config,
             joiner.path(),
@@ -1562,6 +1651,13 @@ created_unix_secs = 1
         .unwrap();
         assert!(!second.created);
         assert_eq!(first.network_id, second.network_id);
+        assert_eq!(first.dns_domain, second.dns_domain);
+        assert!(
+            first
+                .dns_domain
+                .as_deref()
+                .is_some_and(|domain| domain.ends_with(".ironet.internal"))
+        );
         assert_ne!(first.address, second.address);
         assert_eq!(first.addresses.len(), 2);
         assert_eq!(second.addresses.len(), 2);
@@ -1578,6 +1674,10 @@ created_unix_secs = 1
                 .any(|address| address.ends_with("/128"))
         );
         let joiner_runtime = Config::load(&joiner_config).await.unwrap();
+        assert_eq!(joiner_runtime.cover, expected_cover);
+        assert!(joiner_runtime.dns.enabled);
+        assert_eq!(joiner_runtime.dns.domain, first.dns_domain);
+        assert_eq!(joiner_runtime.dns.reverse_prefixes.len(), 2);
         assert_eq!(
             joiner_runtime
                 .node_addresses
@@ -1617,6 +1717,64 @@ created_unix_secs = 1
     }
 
     #[tokio::test]
+    async fn invite_revocation_updates_v2_runtime_admission() {
+        let creator = tempfile::tempdir().unwrap();
+        let config_path = creator.path().join("config.toml");
+        create_network(
+            &config_path,
+            creator.path(),
+            "revocation",
+            CreateNetworkOptions {
+                node_name: Some("issuer".into()),
+                address_pool: Some("198.23.0.0/16".parse().unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let invite = create_invite(
+            &config_path,
+            creator.path(),
+            Some(60),
+            vec!["203.0.113.10:4000".parse().unwrap()],
+            None,
+        )
+        .unwrap();
+        let member = decode_invite(&invite.token).unwrap().member_endpoint_id;
+        let config = Config::load(&config_path).await.unwrap();
+        assert_eq!(
+            crate::v2_runtime::V2RuntimeConfig::from_product_config(&config)
+                .unwrap()
+                .mesh_peers
+                .len(),
+            1
+        );
+
+        revoke_invite(creator.path(), &invite.id).unwrap();
+        assert!({
+            let runtime = crate::v2_runtime::V2RuntimeConfig::from_product_config(&config).unwrap();
+            !runtime.accept_first_peer && runtime.mesh_peers.is_empty()
+        });
+
+        create_invite(
+            &config_path,
+            creator.path(),
+            Some(60),
+            vec!["203.0.113.10:4000".parse().unwrap()],
+            Some(member),
+        )
+        .unwrap();
+        let config = Config::load(&config_path).await.unwrap();
+        assert_eq!(
+            crate::v2_runtime::V2RuntimeConfig::from_product_config(&config)
+                .unwrap()
+                .mesh_peers
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn setup_rolls_back_when_any_target_already_exists() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -1653,7 +1811,9 @@ created_unix_secs = 1
             network_secret: "secret".into(),
             authority: authority.public(),
             address_pool: DEFAULT_ADDRESS_POOL.parse().unwrap(),
-            ipv6_address_pool: default_ipv6_address_pool(),
+            ipv6_address_pool: DEFAULT_IPV6_ADDRESS_POOL.parse().unwrap(),
+            cover: CoverConfig::default(),
+            dns_domain: Some("n-test.ironet.internal".into()),
             issued_unix_secs: 1,
             expires_unix_secs: u64::MAX,
             capabilities: vec!["join".into()],
@@ -1663,7 +1823,6 @@ created_unix_secs = 1
                 name: "edge-a".into(),
                 endpoint_id: SecretKey::generate().public(),
                 direct_addresses: Vec::new(),
-                relay_urls: Vec::new(),
                 derp_public_key: None,
             },
         };
@@ -1674,7 +1833,7 @@ created_unix_secs = 1
         };
         signed.payload.network_name = "attacker".into();
         let token = format!(
-            "ironet://join/v1/{}",
+            "ironet://join/v2/{}",
             hex::encode(serde_json::to_vec(&signed).unwrap())
         );
         assert!(decode_invite(&token).is_err());

@@ -82,6 +82,7 @@ install -d -m 0755 \
   "$PACKAGE_ROOT/usr/lib/sysusers.d" \
   "$PACKAGE_ROOT/usr/lib/systemd/system" \
   "$PACKAGE_ROOT/usr/lib/sysctl.d" \
+  "$PACKAGE_ROOT/usr/share/polkit-1/rules.d" \
   "$PACKAGE_ROOT/usr/share/doc/ironet/config" \
   "$PACKAGE_ROOT/usr/share/doc/ironet/examples" \
   "$PACKAGE_ROOT/usr/share/doc/ironet/docs"
@@ -98,6 +99,9 @@ install -m 0644 \
 install -m 0644 \
   "$ROOT/systemd/90-ironet.conf" \
   "$PACKAGE_ROOT/usr/lib/sysctl.d/90-ironet.conf"
+install -m 0644 \
+  "$ROOT/systemd/90-ironet-resolved.rules" \
+  "$PACKAGE_ROOT/usr/share/polkit-1/rules.d/90-ironet-resolved.rules"
 install -m 0644 "$ROOT/config/example.toml" \
   "$PACKAGE_ROOT/usr/share/doc/ironet/examples/config.toml"
 # 保留与仓库 docs/ 相同的相对链接结构，便于离线浏览已安装文档。
@@ -188,11 +192,11 @@ Priority: optional
 Architecture: $DEB_ARCH
 Maintainer: ironet maintainers <maintainers@ironet.invalid>
 Installed-Size: $INSTALLED_SIZE
-Depends: adduser, iproute2, iptables, procps
-Description: Demand-aware SD-WAN data plane using iroh and FlowRouter
+Depends: adduser, dbus, iproute2, iptables, polkitd, procps, systemd-resolved
+Description: QUIC SD-WAN data plane using Ironet Protocol V2
  ironet provides an unprivileged control CLI and a capability-bounded
  daemon. The daemon builds encrypted peer tunnels, exchanges bounded mesh
- presence, and uses FlowRouter to route node and LAN prefixes. Both executables are
+ presence, and uses immutable V2 route-label snapshots for node and LAN prefixes. Both executables are
  statically linked against musl; host routing utilities come from Debian packages.
 EOF
 
