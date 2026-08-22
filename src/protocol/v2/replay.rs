@@ -7,14 +7,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use ironet_policy_core::PolicySpecV1;
 use serde::{Deserialize, Serialize};
 
 use super::{
     fec::FecGeometryV2,
     learner::{
         BanditLearnerV2, ContextKeyV2, LearnerMemoryV2, LearnerModeV2, materialize_policy_action,
+        policy_utility_weights,
     },
-    policy::{PolicyArtifactV2, api::CandidateActionV1, api::ClampReportV1},
+    policy::{api::CandidateActionV1, api::ClampReportV1, canonical_spec_digest},
     policy_tick::{PolicySlotV1, PolicyTickConfigV1, PolicyTickV1},
     tuning::{
         AutoTuneBoundsV2, AutoTunerV2, Bbr3PresetV2, CoverTrafficProfileV2, PathReliability,
@@ -414,8 +416,8 @@ struct DigestStepV2 {
 
 pub fn replay(
     samples: &[ReplayTapSampleV2],
-    source_policy: &PolicyArtifactV2,
-    candidate_policy: PolicyArtifactV2,
+    source_policy: &PolicySpecV1,
+    candidate_policy: PolicySpecV1,
     objective: Objective,
     seed: u64,
 ) -> Result<ReplayReportV2> {
@@ -555,8 +557,8 @@ pub fn replay_ticks(
 /// golden fill them in.
 pub fn replay_with_golden(
     samples: &[ReplayTapSampleV2],
-    source_policy: &PolicyArtifactV2,
-    candidate_policy: PolicyArtifactV2,
+    source_policy: &PolicySpecV1,
+    candidate_policy: PolicySpecV1,
     objective: Objective,
     seed: u64,
 ) -> Result<(ReplayReportV2, ReplayGoldenV2)> {
@@ -567,6 +569,8 @@ pub fn replay_with_golden(
     candidate_policy
         .validate()
         .context("validating candidate policy")?;
+    let source_policy_digest = canonical_spec_digest(source_policy)?;
+    let candidate_policy_digest = canonical_spec_digest(&candidate_policy)?;
     let first_micros = samples[0].sampled_unix_micros;
     let start = Instant::now();
     let mut previous_micros = first_micros;
@@ -574,7 +578,7 @@ pub fn replay_with_golden(
     let learner_mode = LearnerModeV2::Shadow;
     let mut learner =
         BanditLearnerV2::with_policy(learner_mode, seed, Arc::new(candidate_policy.clone()));
-    let utility_weights = candidate_policy.utility_weights(objective);
+    let utility_weights = policy_utility_weights(&candidate_policy, objective);
     let mut estimator = UtilityEstimator::with_weights(utility_weights);
     let mut golden_samples = Vec::with_capacity(samples.len());
     let mut contexts = BTreeMap::new();
@@ -613,7 +617,10 @@ pub fn replay_with_golden(
             )
         } else if let Some(recorded) = sample.utility {
             (
-                recorded.reweight(source_policy.utility_weights(objective), utility_weights)?,
+                recorded.reweight(
+                    policy_utility_weights(source_policy, objective),
+                    utility_weights,
+                )?,
                 "recorded",
             )
         } else {
@@ -705,8 +712,8 @@ pub fn replay_with_golden(
         generated_by: String::new(),
         fixture: String::new(),
         policy_id: candidate_policy.id.clone(),
-        policy_digest: candidate_policy.digest.clone(),
-        source_policy_digest: source_policy.digest.clone(),
+        policy_digest: candidate_policy_digest.clone(),
+        source_policy_digest,
         objective: objective_name(objective).to_owned(),
         seed,
         learner_mode: learner_mode_name(learner_mode).to_owned(),
@@ -720,7 +727,7 @@ pub fn replay_with_golden(
     let report = ReplayReportV2 {
         schema_version: REPLAY_REPORT_SCHEMA_V2,
         policy_id: candidate_policy.id,
-        policy_digest: candidate_policy.digest,
+        policy_digest: candidate_policy_digest,
         objective: objective_name(objective).to_owned(),
         seed,
         samples: samples.len(),
@@ -881,13 +888,14 @@ fn action_from_decision(decision: TuneDecisionV2) -> ReplayActionV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::v2::policy::builtin;
+    use crate::protocol::v2::{learner::policy_utility_weights, policy::canonical_spec_digest};
+    use ironet_policy_core::PolicySpecV1;
 
     #[test]
     fn replay_is_deterministic_and_rejects_time_travel() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let first = replay(&samples, &policy, policy.clone(), Objective::Balanced, 7).unwrap();
         let second = replay(&samples, &policy, policy.clone(), Objective::Balanced, 7).unwrap();
         assert_eq!(first.trace_digest, second.trace_digest);
@@ -906,7 +914,7 @@ mod tests {
     fn golden_trace_is_deterministic_and_consistent_with_report() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let (first_report, first) =
             replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1).unwrap();
         let (second_report, second) =
@@ -943,13 +951,16 @@ mod tests {
     fn golden_matches_checked_in_fixture() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let expected: ReplayGoldenV2 = serde_json::from_str(include_str!(
             "../../../tests/fixtures/autotune-golden-v1.json"
         ))
         .unwrap();
         assert_eq!(expected.schema_version, REPLAY_GOLDEN_SCHEMA_V2);
-        assert_eq!(expected.policy_digest, policy.digest);
+        assert_eq!(
+            expected.policy_digest,
+            canonical_spec_digest(&policy).unwrap()
+        );
         assert_eq!(expected.objective, "balanced");
         assert_eq!(expected.seed, 1);
         let (_, mut actual) =
@@ -967,8 +978,8 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    fn builtin_tick_slot(policy: &PolicyArtifactV2, mode: LearnerModeV2) -> PolicySlotV1 {
-        crate::protocol::v2::policy_tick::core_slot_from_artifact(policy, mode, false)
+    fn builtin_tick_slot(policy: &PolicySpecV1, mode: LearnerModeV2) -> PolicySlotV1 {
+        crate::protocol::v2::policy_tick::core_slot_from_spec(policy, mode)
     }
 
     /// The tick-pipeline replay of the builtin policy reproduces the checked-in
@@ -978,7 +989,7 @@ mod tests {
     fn tick_replay_matches_the_checked_in_golden() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let golden: ReplayGoldenV2 = serde_json::from_str(include_str!(
             "../../../tests/fixtures/autotune-golden-v1.json"
         ))
@@ -986,7 +997,7 @@ mod tests {
         let report = replay_ticks(
             &samples,
             builtin_tick_slot(&policy, LearnerModeV2::Shadow),
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             Objective::Balanced,
             LearnerModeV2::Shadow,
             1,
@@ -1017,12 +1028,12 @@ mod tests {
     fn tick_replay_is_deterministic_and_rejects_time_travel() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let run = || {
             replay_ticks(
                 &samples,
                 builtin_tick_slot(&policy, LearnerModeV2::Shadow),
-                policy.utility_weights(Objective::Balanced),
+                policy_utility_weights(&policy, Objective::Balanced),
                 Objective::Balanced,
                 LearnerModeV2::Shadow,
                 7,
@@ -1040,7 +1051,7 @@ mod tests {
             replay_ticks(
                 &reversed,
                 builtin_tick_slot(&policy, LearnerModeV2::Shadow),
-                policy.utility_weights(Objective::Balanced),
+                policy_utility_weights(&policy, Objective::Balanced),
                 Objective::Balanced,
                 LearnerModeV2::Shadow,
                 7,
@@ -1144,7 +1155,7 @@ mod tests {
 
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let bytes = include_bytes!("../../../crates/ironet-policy-builtin/builtin.wasm");
         let config = AutotuneWasmConfig {
             require_signature: false,
@@ -1157,7 +1168,7 @@ mod tests {
             let expected = replay_ticks(
                 &samples,
                 builtin_tick_slot(&policy, mode),
-                policy.utility_weights(Objective::Balanced),
+                policy_utility_weights(&policy, Objective::Balanced),
                 Objective::Balanced,
                 mode,
                 1,
@@ -1169,7 +1180,7 @@ mod tests {
             let actual = replay_ticks(
                 &samples,
                 PolicySlotV1::new(Box::new(backend), None, "builtin.wasm"),
-                policy.utility_weights(Objective::Balanced),
+                policy_utility_weights(&policy, Objective::Balanced),
                 Objective::Balanced,
                 mode,
                 1,

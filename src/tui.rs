@@ -182,10 +182,10 @@ impl PreviousPeer {
     fn from_peer(peer: &PeerStatus, sampled_at: Instant) -> Self {
         Self {
             sampled_at,
-            tx_bytes: peer.tx_bytes,
-            rx_bytes: peer.rx_bytes,
-            latency_service_bytes: peer.latency_service_bytes,
-            bulk_service_bytes: peer.bulk_service_bytes,
+            tx_bytes: peer.traffic.tx_bytes,
+            rx_bytes: peer.traffic.rx_bytes,
+            latency_service_bytes: peer.traffic.latency_service_bytes,
+            bulk_service_bytes: peer.traffic.bulk_service_bytes,
             drops: total_drops(peer),
             errors: total_errors(peer),
             connected: peer.connected,
@@ -376,12 +376,14 @@ impl Dashboard {
                     .cmp(&left.path_rtt_micros)
                     .then_with(|| left.name.cmp(&right.name)),
                 SortMode::Queue => right
+                    .traffic
                     .packet_train_queue_bytes
-                    .saturating_add(right.latency_queue_bytes)
+                    .saturating_add(right.traffic.latency_queue_bytes)
                     .cmp(
                         &left
+                            .traffic
                             .packet_train_queue_bytes
-                            .saturating_add(left.latency_queue_bytes),
+                            .saturating_add(left.traffic.latency_queue_bytes),
                     )
                     .then_with(|| left.name.cmp(&right.name)),
                 SortMode::Drops => total_drops(right)
@@ -1487,8 +1489,9 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         .peers
         .iter()
         .map(|peer| {
-            peer.packet_train_queue_bytes
-                .saturating_add(peer.latency_queue_bytes)
+            peer.traffic
+                .packet_train_queue_bytes
+                .saturating_add(peer.traffic.latency_queue_bytes)
         })
         .sum();
     let drops: u64 = dashboard.rates.values().map(|rate| rate.drop_ps).sum();
@@ -1562,8 +1565,9 @@ fn render_peers(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
             Cell::from(short(nonempty(&peer.selected_path_transport, "unknown"), 7)),
             Cell::from(format_micros(peer.path_rtt_micros)),
             Cell::from(human_bytes(
-                peer.packet_train_queue_bytes
-                    .saturating_add(peer.latency_queue_bytes),
+                peer.traffic
+                    .packet_train_queue_bytes
+                    .saturating_add(peer.traffic.latency_queue_bytes),
             )),
             Cell::from(human_rate(rate.tx_bps)),
             Cell::from(human_rate(rate.rx_bps)),
@@ -1655,6 +1659,8 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         return;
     }
 
+    let policy = &peer.policy;
+    let shadow = policy.shadow.as_ref();
     let text = vec![
         Line::from(format!(
             "endpoint={}  remote={}",
@@ -1671,25 +1677,25 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         )),
         Line::from(format!(
             "queue split: latency={} train={} rx_budget={} preemptions={}",
-            human_bytes(peer.latency_queue_bytes),
-            human_bytes(peer.packet_train_queue_bytes),
-            human_bytes(peer.receive_buffer_bytes),
-            peer.bulk_preemptions,
+            human_bytes(peer.traffic.latency_queue_bytes),
+            human_bytes(peer.traffic.packet_train_queue_bytes),
+            human_bytes(peer.traffic.receive_buffer_bytes),
+            peer.traffic.bulk_preemptions,
         )),
         Line::from(format!(
             "mtu={} cwnd={} open_paths={} pmtu_drops={}/{}",
             peer.path_mtu,
             human_bytes(peer.path_cwnd_bytes),
             peer.open_paths,
-            peer.pmtu_drop_datagrams,
-            human_bytes(peer.pmtu_drop_bytes),
+            peer.traffic.pmtu_drop_datagrams,
+            human_bytes(peer.traffic.pmtu_drop_bytes),
         )),
         Line::from(format!("drops/errors: {}", error_detail(peer))),
         Line::from(format!(
             "autotune: mode={} policy={} source={} U={:.3} reason={} bbr={} fec={} train={} rollbacks={}",
             nonempty(&peer.learner_mode, "unknown"),
-            nonempty(&peer.policy_id, "unknown"),
-            nonempty(&peer.policy_source, "unknown"),
+            nonempty(&policy.live.policy_id, "unknown"),
+            nonempty(&policy.policy_source, "unknown"),
             peer.utility_total,
             nonempty(&peer.tune_reason, "unknown"),
             nonempty(&peer.bbr_preset, "unknown"),
@@ -1699,30 +1705,30 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         )),
         Line::from(format!(
             "shadow: policy={} preset={} predicted_advantage={:.3}",
-            nonempty(&peer.shadow_policy_id, "off"),
-            nonempty(&peer.shadow_preset, "-"),
-            peer.shadow_advantage,
+            shadow.map_or("off", |slot| nonempty(&slot.policy_id, "off")),
+            nonempty(&policy.shadow_preset, "-"),
+            policy.shadow_advantage,
         )),
         Line::from(format!(
             "backend: {} {} abi={} health={} state={}B call={}us faults={} clamps={} [{}]",
-            nonempty(&peer.policy_backend, "-"),
-            nonempty(&peer.policy_version, "-"),
-            nonempty(&peer.abi_version, "-"),
-            nonempty(&peer.policy_health, "-"),
-            peer.state_bytes,
-            peer.last_call_micros,
-            peer.faults_total,
-            peer.clamped_fields_total,
-            nonempty(&peer.last_clamp_reasons, "-"),
+            nonempty(&policy.live.backend, "-"),
+            nonempty(&policy.live.policy_version, "-"),
+            nonempty(&policy.live.abi_version, "-"),
+            nonempty(&policy.live.health, "-"),
+            policy.live.state_bytes,
+            policy.live.last_call_micros,
+            policy.live.faults_total,
+            policy.live.clamped_fields_total,
+            nonempty(&policy.live.last_clamp_reasons, "-"),
         )),
         Line::from(format!(
             "module: digest={} signer={} gen={} fuel={} timeouts={} quarantines={}",
-            nonempty(&short(&peer.policy_module_digest, 18), "-"),
-            nonempty(&peer.policy_signer_id, "-"),
-            peer.policy_module_generation,
-            peer.policy_fuel_consumed,
-            peer.policy_timeouts_total,
-            peer.policy_quarantines_total,
+            nonempty(&short(&policy.live.module_digest, 18), "-"),
+            nonempty(&policy.live.signer_id, "-"),
+            policy.live.module_generation,
+            policy.live.fuel_consumed,
+            policy.live.timeouts_total,
+            policy.live.quarantines_total,
         )),
         Line::from(format!(
             "egress: requested={}/s assigned={}/s",
@@ -1732,14 +1738,14 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, dashboard: &Dashboard) {
         Line::from(format!("fec: {}", fec_detail(peer))),
         Line::from(format!(
             "wire: trains={} cells={} payload={} wire={} cover={}/{} control={}/{}",
-            peer.trains_built,
-            peer.cells_built,
-            human_bytes(peer.cell_payload_tx_bytes),
-            human_bytes(peer.data_cell_tx_bytes),
-            human_bytes(peer.cover_tx_bytes),
-            human_bytes(peer.cover_rx_bytes),
-            human_bytes(peer.control_tx_bytes),
-            human_bytes(peer.control_rx_bytes),
+            peer.traffic.trains_built,
+            peer.traffic.cells_built,
+            human_bytes(peer.traffic.cell_payload_tx_bytes),
+            human_bytes(peer.traffic.data_cell_tx_bytes),
+            human_bytes(peer.traffic.cover_tx_bytes),
+            human_bytes(peer.traffic.cover_rx_bytes),
+            human_bytes(peer.traffic.control_tx_bytes),
+            human_bytes(peer.traffic.control_rx_bytes),
         )),
     ];
     frame.render_widget(
@@ -1769,7 +1775,7 @@ fn render_compact_detail(
                 format!(
                     "{} / {} pkt",
                     human_bytes(peer_queue_bytes(peer)),
-                    peer.trains_built
+                    peer.traffic.trains_built
                 ),
                 pressure_style(peer_queue_bytes(peer)),
             ),
@@ -1820,8 +1826,8 @@ fn peer_health(peer: &PeerStatus, rate: PeerRate) -> (String, Style) {
         }
     }
     if messages.is_empty() {
-        let fec = if peer.fec_recovered_cells > 0 {
-            format!(" · FEC recovered {}", peer.fec_recovered_cells)
+        let fec = if peer.traffic.fec_recovered_cells > 0 {
+            format!(" · FEC recovered {}", peer.traffic.fec_recovered_cells)
         } else {
             String::new()
         };
@@ -1835,12 +1841,12 @@ fn error_detail(peer: &PeerStatus) -> String {
     let mut errors = Vec::new();
     for (label, count) in [
         ("conn", peer.connection_errors),
-        ("protocol", peer.protocol_datagram_errors),
-        ("route", peer.route_gate_drops),
-        ("admission", peer.tun_admission_drop_records),
-        ("reassembly", peer.reassembly_pressure_evictions),
-        ("pmtu", peer.pmtu_drop_datagrams),
-        ("repair-stale", peer.repair_stale_responses),
+        ("protocol", peer.traffic.protocol_datagram_errors),
+        ("route", peer.traffic.route_gate_drops),
+        ("admission", peer.traffic.tun_admission_drop_records),
+        ("reassembly", peer.traffic.reassembly_pressure_evictions),
+        ("pmtu", peer.traffic.pmtu_drop_datagrams),
+        ("repair-stale", peer.traffic.repair_stale_responses),
     ] {
         if count > 0 {
             errors.push(format!("{label}={count}"));
@@ -1856,26 +1862,26 @@ fn error_detail(peer: &PeerStatus) -> String {
 fn fec_detail(peer: &PeerStatus) -> String {
     let mut fields = Vec::new();
     for (label, count) in [
-        ("tx", peer.fec_tx_cells),
-        ("rx", peer.fec_rx_cells),
-        ("recovered", peer.fec_recovered_cells),
-        ("wasted", peer.fec_wasted_cells),
-        ("unprotected", peer.fec_unprotected_tail_cells),
-        ("expired", peer.fec_expired_stripes),
+        ("tx", peer.traffic.fec_tx_cells),
+        ("rx", peer.traffic.fec_rx_cells),
+        ("recovered", peer.traffic.fec_recovered_cells),
+        ("wasted", peer.traffic.fec_wasted_cells),
+        ("unprotected", peer.traffic.fec_unprotected_tail_cells),
+        ("expired", peer.traffic.fec_expired_stripes),
     ] {
         if count > 0 {
             fields.push(format!("{label}={count}"));
         }
     }
-    if peer.fec_tx_bytes > 0 {
-        fields.push(format!("wire={}", human_bytes(peer.fec_tx_bytes)));
+    if peer.traffic.fec_tx_bytes > 0 {
+        fields.push(format!("wire={}", human_bytes(peer.traffic.fec_tx_bytes)));
     }
-    if peer.repair_completed_requests > 0 {
+    if peer.traffic.repair_completed_requests > 0 {
         fields.push(format!(
             "repair={}/{} max={}",
-            peer.repair_received_cells,
-            peer.repair_requested_cells,
-            format_micros(peer.repair_latency_max_micros)
+            peer.traffic.repair_received_cells,
+            peer.traffic.repair_requested_cells,
+            format_micros(peer.traffic.repair_latency_max_micros)
         ));
     }
     if fields.is_empty() {
@@ -1978,15 +1984,23 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 fn peer_rate(peer: &PeerStatus, previous: &PreviousPeer, now: Instant) -> PeerRate {
     let elapsed = now.saturating_duration_since(previous.sampled_at);
     PeerRate {
-        tx_bps: per_second(peer.tx_bytes.saturating_sub(previous.tx_bytes), elapsed),
-        rx_bps: per_second(peer.rx_bytes.saturating_sub(previous.rx_bytes), elapsed),
+        tx_bps: per_second(
+            peer.traffic.tx_bytes.saturating_sub(previous.tx_bytes),
+            elapsed,
+        ),
+        rx_bps: per_second(
+            peer.traffic.rx_bytes.saturating_sub(previous.rx_bytes),
+            elapsed,
+        ),
         latency_bps: per_second(
-            peer.latency_service_bytes
+            peer.traffic
+                .latency_service_bytes
                 .saturating_sub(previous.latency_service_bytes),
             elapsed,
         ),
         bulk_bps: per_second(
-            peer.bulk_service_bytes
+            peer.traffic
+                .bulk_service_bytes
                 .saturating_sub(previous.bulk_service_bytes),
             elapsed,
         ),
@@ -2003,21 +2017,23 @@ fn per_second(delta: u64, elapsed: Duration) -> u64 {
 }
 
 fn total_drops(peer: &PeerStatus) -> u64 {
-    peer.route_gate_drops
-        .saturating_add(peer.tun_admission_drop_records)
-        .saturating_add(peer.reassembly_pressure_evictions)
-        .saturating_add(peer.pmtu_drop_datagrams)
+    peer.traffic
+        .route_gate_drops
+        .saturating_add(peer.traffic.tun_admission_drop_records)
+        .saturating_add(peer.traffic.reassembly_pressure_evictions)
+        .saturating_add(peer.traffic.pmtu_drop_datagrams)
 }
 
 fn total_errors(peer: &PeerStatus) -> u64 {
     peer.connection_errors
-        .saturating_add(peer.protocol_datagram_errors)
-        .saturating_add(peer.repair_stale_responses)
+        .saturating_add(peer.traffic.protocol_datagram_errors)
+        .saturating_add(peer.traffic.repair_stale_responses)
 }
 
 fn peer_queue_bytes(peer: &PeerStatus) -> u64 {
-    peer.packet_train_queue_bytes
-        .saturating_add(peer.latency_queue_bytes)
+    peer.traffic
+        .packet_train_queue_bytes
+        .saturating_add(peer.traffic.latency_queue_bytes)
 }
 
 fn peer_name(status: &RuntimeStatus, endpoint_id: EndpointId) -> Option<&str> {
@@ -2168,15 +2184,18 @@ mod tests {
             protocol_major: 2,
             connected: true,
             connection_events: 1,
-            tx_packets: 10,
-            tx_bytes,
-            bulk_service_bytes: bulk,
-            latency_queue_bytes: 512,
-            packet_train_queue_bytes: 4_096,
-            receive_buffer_bytes: 2_400,
-            bulk_preemptions: 7,
-            rx_packets: 4,
-            rx_bytes: 500,
+            traffic: crate::status::PeerTrafficStatus {
+                tx_packets: 10,
+                tx_bytes,
+                bulk_service_bytes: bulk,
+                latency_queue_bytes: 512,
+                packet_train_queue_bytes: 4_096,
+                receive_buffer_bytes: 2_400,
+                bulk_preemptions: 7,
+                rx_packets: 4,
+                rx_bytes: 500,
+                ..crate::status::PeerTrafficStatus::default()
+            },
             ..PeerStatus::default()
         }
     }
@@ -2197,10 +2216,10 @@ mod tests {
     #[test]
     fn peer_fixture_exposes_v2_queue_isolation_detail() {
         let peer = peer(1_000, 1);
-        assert_eq!(peer.latency_queue_bytes, 512);
-        assert_eq!(peer.packet_train_queue_bytes, 4_096);
-        assert_eq!(peer.receive_buffer_bytes, 2_400);
-        assert_eq!(peer.bulk_preemptions, 7);
+        assert_eq!(peer.traffic.latency_queue_bytes, 512);
+        assert_eq!(peer.traffic.packet_train_queue_bytes, 4_096);
+        assert_eq!(peer.traffic.receive_buffer_bytes, 2_400);
+        assert_eq!(peer.traffic.bulk_preemptions, 7);
     }
 
     #[test]
@@ -2255,9 +2274,9 @@ mod tests {
 
         let mut impaired = peer(1_000, 1);
         impaired.connection_errors = 3;
-        impaired.tun_admission_drop_records = 4;
-        impaired.fec_recovered_cells = 5;
-        impaired.fec_tx_bytes = 1_500;
+        impaired.traffic.tun_admission_drop_records = 4;
+        impaired.traffic.fec_recovered_cells = 5;
+        impaired.traffic.fec_tx_bytes = 1_500;
         let (summary, style) = peer_health(
             &impaired,
             PeerRate {

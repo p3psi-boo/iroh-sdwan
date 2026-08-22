@@ -1,6 +1,8 @@
-# WASM 策略模块化：单文件交付实施计划
+# WASM 策略模块化：单文件交付实施计划（历史）
 
-目标：把当前由内置规则、`PolicyArtifactV2` JSON 和 `BanditLearnerV2` 共同完成的慢环策略，演进成可热加载、可签名、可回放、可灰度的单文件 `policy.wasm`；宿主继续独占护栏、协议、实时调度、资源上限和故障回退。
+> **归档状态（2026-08-22）**：本计划的 Phase 0–6 已完成并由后续实现交接记录确认。它保留当时的设计取舍、阶段拆分和验收设想；当前 ABI、配置、运行时行为和验证入口以[策略运行时架构](../../策略运行时架构.md)、[配置参考](../../配置参考.md)和[开发与测试](../../开发与测试.md)为准。
+
+目标：把当时由内置规则、`PolicyArtifactV2` JSON 和 `BanditLearnerV2` 共同完成的慢环策略，演进成可热加载、可签名、可回放、可灰度的单文件 `policy.wasm`；宿主继续独占护栏、协议、实时调度、资源上限和故障回退。
 
 本文是按阶段、按文件和按验收门禁执行的实施计划。符号位置以当前工作区为依据，实施时以符号名重新定位，不依赖固定行号。
 
@@ -121,7 +123,7 @@ Dataplane 不执行策略推理
 | replay/oracle/promotion | `examples/`、`scripts/` | 让 native 与 WASM 走同一 ABI/guardrail |
 | policy digest/hot reload | `policy.rs`、`tuner_loop` | 升级为签名 Component 的预验证、预编译和原子激活 |
 
-现有 `/home/bubu/sdwan/crates/ironet-extension-sdk` 是 Unix Socket 控制面 SDK，不复用为数据面策略 ABI，避免把两个生命周期和信任边界混在一起。
+现有 ``crates/ironet-extension-sdk`` 是 Unix Socket 控制面 SDK，不复用为数据面策略 ABI，避免把两个生命周期和信任边界混在一起。
 
 ## 3. 目标模块边界
 
@@ -405,7 +407,7 @@ pub struct ClampReportV1 { /* field, requested, effective, reason */ }
 
 ### 6.2 拆分 `AutoTunerV2`
 
-从 `/home/bubu/sdwan/src/protocol/v2/tuning.rs` 拆出：
+从 ``src/protocol/v2/tuning.rs`` 拆出：
 
 ```text
 TelemetryFilterV1
@@ -481,7 +483,7 @@ shadow/live、replay、oracle 和 promotion 只依赖 `PolicyBackend`，不再�
 
 默认倾向 Pulley；只有当目标 peer 数下 Pulley 的 p99 调用延迟超过 7.3 预算时才启用 Cranelift。两种配置共用同一 WIT 和 `PolicyBackend`，切换只影响 Cargo feature。
 
-> **Phase 0 spike 更正（2026-08-21，详见 `docs/WASM策略Phase0-runtime-spike.md`）**：Pulley 字节码由 Cranelift 编译，关闭 `cranelift` feature 后只能加载预编译 `.cwasm`，上表"小数 MB 增量"只对 AOT-only 成立。实测（wasmtime 43.0.2，Rust 1.91）：`pulley` 无编译器 +1.10 MiB，`cranelift,pulley` +11.29 MiB；Pulley 调用 p99 72–164 µs，Cranelift 3.5–4.1 µs，fuel 7,379/次。结论：默认 `features = ["runtime","component-model","std","cranelift","pulley"]` + `Config::target("pulley64")`（保留无 JIT 页、确定性、热路径无编译器，接受 +~11 MiB）；AOT-only 作为体积优化备选。另需决策 toolchain：wasmtime 48 LTS 需 Rust ≥1.95。
+> **Phase 0 spike 更正（2026-08-21，详见[Phase 0 runtime spike 报告](WASM策略Phase0-runtime-spike.md)）**：Pulley 字节码由 Cranelift 编译，关闭 `cranelift` feature 后只能加载预编译 `.cwasm`，上表"小数 MB 增量"只对 AOT-only 成立。实测（wasmtime 43.0.2，Rust 1.91）：`pulley` 无编译器 +1.10 MiB，`cranelift,pulley` +11.29 MiB；Pulley 调用 p99 72–164 µs，Cranelift 3.5–4.1 µs，fuel 7,379/次。结论：默认 `features = ["runtime","component-model","std","cranelift","pulley"]` + `Config::target("pulley64")`（保留无 JIT 页、确定性、热路径无编译器，接受 +~11 MiB）；AOT-only 作为体积优化备选。另需决策 toolchain：wasmtime 48 LTS 需 Rust ≥1.95。
 
 ### 7.2 执行器
 
@@ -724,7 +726,7 @@ src/protocol/v2/policy/
 | `examples/autotune_train.rs` | 输出 guest 可嵌入的训练数据或生成 builtin guest 源数据 |
 | `examples/autotune_promote.rs` | promotion 输入改为 module digest/signature/ABI |
 | `scripts/check-v2-only.sh` | 允许新 policy 目录和 SDK crate，继续禁止额外生产二进制 |
-| `config/example.toml`、`docs/配置参考.md` | 更新单文件策略配置和 trust 模型 |
+| `config/example.toml`、[配置参考](../../配置参考.md) | 更新单文件策略配置和 trust 模型 |
 
 ## 11. 分阶段实施
 
@@ -944,23 +946,23 @@ build time delta
 每个 peer 状态新增：
 
 ```text
-policy_backend = native|wasm
-policy_id
-policy_version
-module_digest
-signer_id
-abi_version
-module_generation
-state_schema/state_bytes
-last_call_micros
-fuel_consumed
-faults_total
-timeouts_total
-quarantines_total
-clamped_fields_total
-last_clamp_reasons
+policy.live.backend = native|wasm
+policy.live.policy_id
+policy.live.policy_version
+policy.live.module_digest
+policy.live.signer_id
+policy.live.abi_version
+policy.live.module_generation
+policy.live.state_schema/state_bytes
+policy.live.last_call_micros
+policy.live.fuel_consumed
+policy.live.faults_total
+policy.live.timeouts_total
+policy.live.quarantines_total
+policy.live.clamped_fields_total
+policy.live.last_clamp_reasons
 candidate/effective action summary
-shadow candidate/advantage
+policy.shadow (optional candidate/advantage)
 egress requested/assigned rate
 ```
 

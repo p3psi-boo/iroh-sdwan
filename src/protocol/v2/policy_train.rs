@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use ironet_policy_core::{PolicySpecV1, PosteriorSpecV1, PresetSpecV1};
+
 use super::{
     learner::{ContextKeyV2, preset_is_eligible},
-    policy::{PolicyArtifactV2, PosteriorSpecV2, PresetSpecV2},
     tuning::Bbr3PresetV2,
 };
 
@@ -40,6 +41,8 @@ pub struct TrainingReportV2 {
     pub accepted_observations: usize,
     pub skipped_observations: usize,
     pub contexts: usize,
+    /// Provenance is report metadata, not part of the canonical policy spec.
+    pub trained_on: Vec<String>,
     pub mappings: Vec<ActionMappingV2>,
 }
 
@@ -59,17 +62,17 @@ struct AggregateV2 {
 }
 
 pub fn train_policy(
-    mut base: PolicyArtifactV2,
+    mut base: PolicySpecV1,
     id: String,
-    built_at: String,
+    version: String,
     observations: &[TrainingObservationV2],
     prior_observations_per_run: u32,
-) -> Result<(PolicyArtifactV2, TrainingReportV2)> {
+) -> Result<(PolicySpecV1, TrainingReportV2)> {
     base.validate()?;
     ensure!(!id.trim().is_empty(), "trained policy id is empty");
     ensure!(
-        !built_at.trim().is_empty(),
-        "trained policy built_at is empty"
+        !version.trim().is_empty(),
+        "trained policy version is empty"
     );
     ensure!(!observations.is_empty(), "training set has no observations");
     ensure!(
@@ -137,8 +140,8 @@ pub fn train_policy(
     }
 
     base.id = id;
-    base.built_at = built_at;
-    base.trained_on = trained_on.into_iter().collect();
+    base.version = version;
+    let trained_on = trained_on.into_iter().collect::<Vec<_>>();
     base.priors.clear();
     ensure!(
         accepted_observations != 0,
@@ -147,13 +150,12 @@ pub fn train_policy(
     for ((context, preset), aggregate) in aggregates {
         base.priors.entry(context).or_default().insert(
             preset,
-            PosteriorSpecV2 {
+            PosteriorSpecV1 {
                 observations: aggregate.samples.saturating_mul(prior_observations_per_run),
                 mean: aggregate.utility_sum / f64::from(aggregate.samples),
             },
         );
     }
-    base.digest = base.calculated_digest()?;
     base.validate()?;
     mappings.sort_by(|left, right| {
         (&left.context, &left.preset, &left.source).cmp(&(
@@ -169,6 +171,7 @@ pub fn train_policy(
         accepted_observations,
         skipped_observations: observations.len() - accepted_observations,
         contexts: base.priors.len(),
+        trained_on,
         mappings,
     };
     Ok((base, report))
@@ -192,17 +195,17 @@ fn validate_action(action: &OracleActionV2) -> Result<()> {
 }
 
 fn closest_preset<'a>(
-    policy: &'a PolicyArtifactV2,
+    policy: &'a PolicySpecV1,
     context: ContextKeyV2,
     action: &OracleActionV2,
-) -> Result<Option<(&'a PresetSpecV2, u64)>> {
+) -> Result<Option<(&'a PresetSpecV1, u64)>> {
     let requested_preset = action
         .bbr_preset
         .ok_or_else(|| anyhow::anyhow!("oracle action has no measured BBR preset"))?;
-    let mut best: Option<(&PresetSpecV2, u64)> = None;
+    let mut best: Option<(&PresetSpecV1, u64)> = None;
     for preset in &policy.presets {
-        if preset.proposal.preset != requested_preset
-            || !preset_is_eligible(context, preset.proposal.preset)
+        if preset.proposal.preset != requested_preset.into()
+            || !preset_is_eligible(context, preset.proposal.preset.into())
             || !is_complete(preset)
         {
             continue;
@@ -215,7 +218,7 @@ fn closest_preset<'a>(
     Ok(best)
 }
 
-fn is_complete(preset: &PresetSpecV2) -> bool {
+fn is_complete(preset: &PresetSpecV1) -> bool {
     preset.action.fec_data_cells.is_some()
         && preset.action.fec_parity_cells.is_some()
         && preset.action.train_target_bytes.is_some()
@@ -223,7 +226,7 @@ fn is_complete(preset: &PresetSpecV2) -> bool {
         && preset.action.cover_overhead_per_mille.is_some()
 }
 
-fn action_distance(action: &OracleActionV2, preset: &PresetSpecV2) -> Result<u64> {
+fn action_distance(action: &OracleActionV2, preset: &PresetSpecV1) -> Result<u64> {
     let requested_fec = parse_fec(action.fec.as_deref())?;
     let preset_fec = preset
         .action
@@ -232,17 +235,20 @@ fn action_distance(action: &OracleActionV2, preset: &PresetSpecV2) -> Result<u64
         .expect("complete action checked");
     let fec_distance = if requested_fec == preset_fec { 0 } else { 100 };
     let train_distance = action.train_target_bytes.abs_diff(
-        preset
-            .action
-            .train_target_bytes
-            .expect("complete action checked"),
+        usize::try_from(
+            preset
+                .action
+                .train_target_bytes
+                .expect("complete action checked"),
+        )
+        .expect("u32 always fits usize on supported targets"),
     ) / (8 * 1024);
-    let quantum_distance = action.bulk_quantum_cells.abs_diff(
+    let quantum_distance = action.bulk_quantum_cells.abs_diff(usize::from(
         preset
             .action
             .bulk_quantum_cells
             .expect("complete action checked"),
-    ) * 4;
+    )) * 4;
     let cover_distance = usize::from(
         action.cover_overhead_per_mille.abs_diff(
             preset
@@ -255,7 +261,7 @@ fn action_distance(action: &OracleActionV2, preset: &PresetSpecV2) -> Result<u64
 }
 
 pub fn oracle_action_matches_preset(
-    policy: &PolicyArtifactV2,
+    policy: &PolicySpecV1,
     preset: Bbr3PresetV2,
     action: &OracleActionV2,
 ) -> bool {
@@ -265,7 +271,7 @@ pub fn oracle_action_matches_preset(
     policy
         .presets
         .iter()
-        .find(|candidate| candidate.proposal.preset == preset)
+        .find(|candidate| candidate.proposal.preset == preset.into())
         .filter(|candidate| is_complete(candidate))
         .and_then(|candidate| action_distance(action, candidate).ok())
         == Some(0)
@@ -307,7 +313,7 @@ pub fn context_name(context: ContextKeyV2) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::v2::policy::builtin;
+    use crate::protocol::v2::policy::canonical_spec_digest;
 
     #[test]
     fn oracle_actions_train_valid_deterministic_priors() {
@@ -331,7 +337,7 @@ mod tests {
             source: "fixture/lossy".to_owned(),
         };
         let (first, report) = train_policy(
-            builtin().unwrap(),
+            PolicySpecV1::builtin(),
             "fixture@1".to_owned(),
             "2026-08-20T00:00:00Z".to_owned(),
             std::slice::from_ref(&observation),
@@ -339,14 +345,17 @@ mod tests {
         )
         .unwrap();
         let (second, _) = train_policy(
-            builtin().unwrap(),
+            PolicySpecV1::builtin(),
             "fixture@1".to_owned(),
             "2026-08-20T00:00:00Z".to_owned(),
             &[observation],
             16,
         )
         .unwrap();
-        assert_eq!(first.digest, second.digest);
+        assert_eq!(
+            canonical_spec_digest(&first).unwrap(),
+            canonical_spec_digest(&second).unwrap()
+        );
         assert_eq!(report.mappings[0].preset.as_deref(), Some("lossy-radio"));
         assert_eq!(
             first.priors["r2-b1-l2-datagram"]["lossy-radio"].observations,
@@ -393,7 +402,7 @@ mod tests {
             },
         ];
         let (_, report) = train_policy(
-            builtin().unwrap(),
+            PolicySpecV1::builtin(),
             "grid@1".to_owned(),
             "2026-08-20T00:00:00Z".to_owned(),
             &observations,
@@ -435,7 +444,7 @@ mod tests {
             source: "shallow-policer".to_owned(),
         };
         let (policy, report) = train_policy(
-            builtin().unwrap(),
+            PolicySpecV1::builtin(),
             "policer@1".to_owned(),
             "2026-08-20T00:00:00Z".to_owned(),
             &[observation],
@@ -469,7 +478,7 @@ mod tests {
         };
         assert!(
             train_policy(
-                builtin().unwrap(),
+                PolicySpecV1::builtin(),
                 "invalid@1".to_owned(),
                 "2026-08-20T00:00:00Z".to_owned(),
                 &[observation],
@@ -502,7 +511,7 @@ mod tests {
         };
         assert!(
             train_policy(
-                builtin().unwrap(),
+                PolicySpecV1::builtin(),
                 "invalid@2".to_owned(),
                 "2026-08-20T00:00:00Z".to_owned(),
                 &[observation],

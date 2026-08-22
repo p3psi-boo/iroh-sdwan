@@ -9,23 +9,24 @@ use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use ironet::protocol::v2::{
     learner::ContextKeyV2,
-    policy::{PolicyArtifactV2, builtin, load},
+    policy::{canonical_spec_digest, load_canonical_spec},
     policy_train::{OracleActionV2, TrainingObservationV2, train_policy},
     replay::ReplayTelemetryV2,
     utility::Objective,
 };
+use ironet_policy_core::PolicySpecV1;
 use serde::Deserialize;
 
 #[derive(Debug, Parser)]
-#[command(about = "Build a validated Ironet V2 PolicyArtifact from oracle results")]
+#[command(about = "Build a validated canonical Ironet PolicySpecV1 from oracle results")]
 struct Args {
     /// One or more oracle.json files produced by scripts/autotune-oracle.sh.
     #[arg(long, required = true)]
     oracle: Vec<PathBuf>,
-    /// Base PolicyArtifact JSON, or 'builtin'.
+    /// Base canonical PolicySpecV1 JSON, or 'builtin'.
     #[arg(long, default_value = "builtin")]
     base_policy: String,
-    /// Unique ID written into the trained artifact.
+    /// Unique ID written into the trained canonical spec.
     #[arg(long)]
     id: String,
     /// RFC3339 timestamp; defaults to the current UTC second.
@@ -34,7 +35,7 @@ struct Args {
     /// Posterior confidence assigned to each independent candidate run.
     #[arg(long, default_value_t = 8)]
     prior_observations_per_run: u32,
-    /// Destination PolicyArtifact JSON.
+    /// Destination canonical PolicySpecV1 JSON.
     #[arg(long)]
     output: PathBuf,
     /// Optional mapping/audit report destination.
@@ -76,9 +77,9 @@ fn main() -> Result<()> {
         &observations,
         args.prior_observations_per_run,
     )?;
-    policy.objective = Some(objective);
-    policy.digest = policy.calculated_digest()?;
+    policy.objective = Some(objective.into());
     policy.validate()?;
+    let digest = canonical_spec_digest(&policy)?;
     write_json(&args.output, &policy)?;
     if let Some(path) = args.report {
         write_json(&path, &report)?;
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
         serde_json::json!({
             "policy": args.output,
             "id": policy.id,
-            "digest": policy.digest,
+            "digest": digest,
             "contexts": policy.priors.len(),
             "objective": objective,
             "input_observations": report.input_observations,
@@ -99,19 +100,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_base(selection: &str) -> Result<PolicyArtifactV2> {
+fn load_base(selection: &str) -> Result<PolicySpecV1> {
     if selection == "builtin" {
-        builtin()
+        Ok(PolicySpecV1::builtin())
     } else {
         let path = PathBuf::from(selection);
         ensure!(path.is_absolute(), "base policy path must be absolute");
-        load(&path)
+        load_canonical_spec(&path)
     }
 }
 
 fn load_observations(
     oracle_paths: &[PathBuf],
-    policy: &PolicyArtifactV2,
+    policy: &PolicySpecV1,
 ) -> Result<(Vec<TrainingObservationV2>, Objective)> {
     let mut observations = Vec::new();
     let mut objectives = BTreeSet::new();
@@ -173,7 +174,7 @@ fn load_observations(
     ))
 }
 
-fn load_contexts(summary_path: &Path, policy: &PolicyArtifactV2) -> Result<BTreeSet<ContextKeyV2>> {
+fn load_contexts(summary_path: &Path, policy: &PolicySpecV1) -> Result<BTreeSet<ContextKeyV2>> {
     let summary: serde_json::Value = serde_json::from_slice(
         &fs::read(summary_path).with_context(|| format!("reading {}", summary_path.display()))?,
     )?;

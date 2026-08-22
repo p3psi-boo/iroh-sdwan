@@ -142,8 +142,8 @@ for node_spec in "product-a node-a" "product-b node-b"; do
         (.peers | length == 1) and
         (.peers[0] |
           .protocol_major == 2 and
-          .tx_packets > 0 and .rx_packets > 0 and
-          .trains_built > 0 and .cells_built > 0 and
+          .traffic.tx_packets > 0 and .traffic.rx_packets > 0 and
+          .traffic.trains_built > 0 and .traffic.cells_built > 0 and
           (has("delivery_tagged_packets") | not) and
           (has("tx_fragments") | not) and
           (has("fec_tx_recovery_shards") | not) and

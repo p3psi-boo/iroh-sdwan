@@ -1,6 +1,0 @@
-build: features: cranelift=true pulley=true
-mode: precompile file: /tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/bin-guest-component.wasm target: host 
-engine_new: 55.003µs
-input_file_bytes: 11486
-precompile_time: 16.877662ms
-cwasm_bytes: 49368

@@ -26,14 +26,16 @@ use crate::{
     trace::{self, PingResult, PingSample, TraceHop, TraceResult},
 };
 use ironet_extension_sdk::{
-    ApiLimits, ApplyRoutesRequest, Capability, CapabilitySet, DeleteRoutesRequest, EventWatchAck,
-    ExtensionEvent, RouteMutationResult,
+    ApiLimits, ApplyRoutesRequest, Capability, CapabilitySet, Client as ControlClient,
+    DeleteRoutesRequest, EventWatchAck, ExtensionEvent,
+    MAX_CONTROL_REQUEST_BYTES as MAX_REQUEST_BYTES,
+    MAX_CONTROL_RESPONSE_BYTES as MAX_RESPONSE_BYTES, ResponseStream as ControlResponseStream,
+    RouteMutationResult,
+};
+pub use ironet_extension_sdk::{
+    CONTROL_API_VERSION as CONTROL_PROTOCOL_VERSION, DEFAULT_CONTROL_SOCKET, RpcError,
 };
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
-pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ironet/control.sock";
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTROL_CONNECTIONS: usize = 64;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRACE_HOP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -43,21 +45,6 @@ const EVENT_HISTORY_LIMIT: usize = 1_024;
 pub struct ReloadAck {
     pub generation: u64,
     pub endpoint_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcError {
-    pub code: String,
-    pub message: String,
-}
-
-impl RpcError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-        }
-    }
 }
 
 pub enum DaemonCommand {
@@ -892,7 +879,7 @@ async fn mutate_extension_routes(
     let previous = ExtensionState::load(&path).await?;
     let mutation = mutate(&previous, extensions::now_unix())?;
     let result = mutation.result;
-    validate_extension_candidate(config, &mutation.state)?;
+    validate_extension_candidate(config, &mutation.state).await?;
     if dry_run || !mutation.persist {
         return Ok(result);
     }
@@ -918,24 +905,10 @@ async fn mutate_extension_routes(
     Ok(result)
 }
 
-fn validate_extension_candidate(config: &Config, state: &ExtensionState) -> Result<()> {
-    let mut candidate = config.clone();
-    let routes = std::fs::read_to_string(config.route_registry_path())
-        .ok()
-        .map(|raw| crate::routes::RouteRegistry::parse(&raw))
-        .transpose()?
-        .unwrap_or_default()
-        .routes;
-    let mut registry = crate::routes::RouteRegistry {
-        routes,
-        ..Default::default()
-    };
-    registry
-        .routes
-        .extend(state.route_origins(extensions::now_unix())?);
-    registry.normalize()?;
-    candidate.route_origins = registry.routes;
-    candidate.validate()
+async fn validate_extension_candidate(config: &Config, state: &ExtensionState) -> Result<()> {
+    crate::routes::RouteSources::load_with_extension_candidate(&config.identity_file, state.clone())
+        .await?
+        .validate_candidate(config)
 }
 
 pub fn ensure_healthy(config: &Config, status: &RuntimeStatus) -> Result<()> {
@@ -1019,91 +992,27 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn request_id() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-        ^ (u64::from(std::process::id()) << 32)
+fn request_parameters(method: &Method) -> Result<serde_json::Value> {
+    let mut parameters = serde_json::to_value(method).context("failed encoding control request")?;
+    let object = parameters
+        .as_object_mut()
+        .context("control method did not encode as an object")?;
+    object.remove("method");
+    Ok(parameters)
 }
 
-async fn connect(
-    path: &Path,
-    method: Method,
-) -> Result<(u64, BufReader<tokio::net::unix::OwnedReadHalf>)> {
-    let stream = UnixStream::connect(path)
-        .await
-        .with_context(|| format!("failed connecting to daemon socket {}", path.display()))?;
-    let id = request_id();
-    let request = Request {
-        version: CONTROL_PROTOCOL_VERSION,
-        id,
-        method,
-    };
-    let mut encoded = serde_json::to_vec(&request)?;
-    ensure!(
-        encoded.len() <= MAX_REQUEST_BYTES,
-        "control request is too large"
-    );
-    encoded.push(b'\n');
-    let (reader, mut writer) = stream.into_split();
-    writer
-        .write_all(&encoded)
-        .await
-        .context("failed writing control request")?;
-    writer
-        .shutdown()
-        .await
-        .context("failed closing control request")?;
-    Ok((id, BufReader::new(reader)))
+async fn connect(path: &Path, method: Method) -> Result<ControlResponseStream> {
+    let parameters = request_parameters(&method)?;
+    Ok(ControlClient::new(path)
+        .request_stream(method_name(&method), parameters)
+        .await?)
 }
 
 async fn request_result<T: DeserializeOwned>(path: &Path, method: Method) -> Result<T> {
-    let (id, mut reader) = connect(path, method).await?;
-    let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
-    ensure!(
-        !line.is_empty(),
-        "daemon closed the control connection without a response"
-    );
-    let message: ServerMessage =
-        serde_json::from_slice(&line).context("failed parsing daemon response")?;
-    match message {
-        ServerMessage::Result {
-            version,
-            id: response_id,
-            result,
-        } => {
-            validate_response(version, id, response_id)?;
-            serde_json::from_value(result).context("failed decoding daemon result")
-        }
-        ServerMessage::Error {
-            version,
-            id: response_id,
-            error,
-        } => {
-            validate_response(version, id, response_id)?;
-            bail!("daemon {}: {}", error.code, error.message);
-        }
-        ServerMessage::PingSample { .. }
-        | ServerMessage::PingDone { .. }
-        | ServerMessage::TraceHop { .. }
-        | ServerMessage::TraceDone { .. }
-        | ServerMessage::ExtensionEvent { .. } => {
-            bail!("daemon returned a streaming event for a non-streaming request")
-        }
-    }
-}
-
-fn validate_response(version: u16, expected_id: u64, actual_id: u64) -> Result<()> {
-    ensure!(
-        version == CONTROL_PROTOCOL_VERSION,
-        "daemon returned unsupported control protocol {version}"
-    );
-    ensure!(
-        expected_id == actual_id,
-        "daemon response ID mismatch: expected {expected_id}, got {actual_id}"
-    );
-    Ok(())
+    let parameters = request_parameters(&method)?;
+    Ok(ControlClient::new(path)
+        .request_raw(method_name(&method), parameters)
+        .await?)
 }
 
 pub async fn status(path: &Path) -> Result<RuntimeStatus> {
@@ -1155,7 +1064,7 @@ where
         "ping timeout must be between 1 ms and 60 s"
     );
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-    let (id, mut reader) = connect(
+    let mut stream = connect(
         path,
         Method::Ping {
             target,
@@ -1166,38 +1075,21 @@ where
     .await?;
     let mut streamed_samples = Vec::new();
     loop {
-        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
-        ensure!(!line.is_empty(), "daemon closed an incomplete ping stream");
-        let message: ServerMessage =
-            serde_json::from_slice(&line).context("failed parsing daemon ping event")?;
+        let message: ServerMessage = serde_json::from_value(stream.next_frame().await?)
+            .context("failed parsing daemon ping event")?;
         match message {
-            ServerMessage::PingSample {
-                version,
-                id: response_id,
-                sample,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::PingSample { sample, .. } => {
                 on_sample(&sample)?;
                 streamed_samples.push(sample);
             }
-            ServerMessage::PingDone {
-                version,
-                id: response_id,
-                result,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::PingDone { result, .. } => {
                 ensure!(
                     streamed_samples == result.samples,
                     "daemon ping stream disagrees with final result"
                 );
                 return Ok(result);
             }
-            ServerMessage::Error {
-                version,
-                id: response_id,
-                error,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::Error { error, .. } => {
                 bail!("daemon {}: {}", error.code, error.message);
             }
             ServerMessage::Result { .. }
@@ -1235,7 +1127,7 @@ where
         "trace timeout must be between 1 ms and 60 s"
     );
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-    let (id, mut reader) = connect(
+    let mut stream = connect(
         path,
         Method::Trace {
             target,
@@ -1246,38 +1138,21 @@ where
     .await?;
     let mut streamed_hops = Vec::new();
     loop {
-        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).await?;
-        ensure!(!line.is_empty(), "daemon closed an incomplete trace stream");
-        let message: ServerMessage =
-            serde_json::from_slice(&line).context("failed parsing daemon trace event")?;
+        let message: ServerMessage = serde_json::from_value(stream.next_frame().await?)
+            .context("failed parsing daemon trace event")?;
         match message {
-            ServerMessage::TraceHop {
-                version,
-                id: response_id,
-                hop,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::TraceHop { hop, .. } => {
                 on_hop(&hop)?;
                 streamed_hops.push(hop);
             }
-            ServerMessage::TraceDone {
-                version,
-                id: response_id,
-                result,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::TraceDone { result, .. } => {
                 ensure!(
                     streamed_hops == result.hops,
                     "daemon trace stream disagrees with final result"
                 );
                 return Ok(result);
             }
-            ServerMessage::Error {
-                version,
-                id: response_id,
-                error,
-            } => {
-                validate_response(version, id, response_id)?;
+            ServerMessage::Error { error, .. } => {
                 bail!("daemon {}: {}", error.code, error.message);
             }
             ServerMessage::Result { .. }
@@ -1335,6 +1210,47 @@ mod tests {
         assert_eq!(json["version"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(json["id"], 8);
         assert_eq!(json["method"], "snapshot");
+    }
+
+    #[tokio::test]
+    async fn extension_candidate_validation_composes_operator_and_candidate_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.identity_file = directory.path().join("identity.key");
+        config.route_origins.clear();
+
+        let operator = SecretKey::from_bytes(&[31; 32]).public();
+        crate::routes::RouteRegistry::parse_lines(&format!("{operator} 10.40.0.0/24\n"))
+            .unwrap()
+            .write(&config.route_registry_path())
+            .unwrap();
+
+        let extension = ExtensionState::new()
+            .apply(
+                &ApplyRoutesRequest {
+                    routes: vec![ironet_extension_sdk::RouteApply {
+                        api_version: CONTROL_PROTOCOL_VERSION,
+                        name: "office".into(),
+                        owner: "example.com/ipam".into(),
+                        revision: 1,
+                        ttl_seconds: None,
+                        spec: ironet_extension_sdk::DesiredRouteSpec {
+                            endpoint_id: SecretKey::from_bytes(&[32; 32]).public().to_string(),
+                            prefixes: vec!["10.40.0.128/25".into()],
+                        },
+                    }],
+                    dry_run: false,
+                    idempotency_key: "candidate-composition".into(),
+                },
+                100,
+            )
+            .unwrap()
+            .state;
+
+        let error = validate_extension_candidate(&config, &extension)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("overlaps"), "{error}");
     }
 
     #[test]
@@ -1686,7 +1602,7 @@ mod tests {
                 .any(|capability| capability.name == "events" && capability.streaming)
         );
 
-        let (id, mut reader) = connect(
+        let mut stream = connect(
             &socket,
             Method::WatchEvents {
                 after_cursor: Some(0),
@@ -1694,19 +1610,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let ack: ServerMessage = serde_json::from_slice(
-            &read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let id = stream.request_id();
+        let ack: ServerMessage =
+            serde_json::from_value(stream.next_frame().await.unwrap()).unwrap();
         assert!(matches!(ack, ServerMessage::Result { id: response, .. } if response == id));
-        let event: ServerMessage = serde_json::from_slice(
-            &read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let event: ServerMessage =
+            serde_json::from_value(stream.next_frame().await.unwrap()).unwrap();
         assert!(matches!(
             event,
             ServerMessage::ExtensionEvent { extension_event, .. }

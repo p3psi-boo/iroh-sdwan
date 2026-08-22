@@ -413,10 +413,9 @@ impl LimitsHostExt for HostLimitsV1 {
 
 /// Host conversions for [`BbrEffectiveV1`].
 pub trait BbrHostExt: Sized {
-    /// Expand a legacy proposal the way `apply_bbr3_proposal` in
-    /// `v2_runtime.rs` does (see [`BbrEffectiveV1::expand_preset`]). The
-    /// adaptive cwnd floor the runtime adds from live telemetry is not
-    /// included.
+    /// Expand a legacy proposal into its full preset-resolved BBR action (see
+    /// [`BbrEffectiveV1::expand_preset`]). The telemetry-dependent host
+    /// finalization happens after this conversion.
     fn from_proposal(proposal: &Bbr3ProposalV2) -> Self;
     /// Project back onto the legacy proposal (the five fields it carries).
     fn to_proposal(&self) -> Bbr3ProposalV2;

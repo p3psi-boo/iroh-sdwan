@@ -40,11 +40,10 @@ pub struct BbrEffectiveV1 {
 
 impl BbrEffectiveV1 {
     /// Expand a preset plus the five learner-controlled knobs into the full
-    /// tunable set, exactly the way the host's `apply_bbr3_proposal` does:
-    /// `cruise`, `queue guard`, `probe RTT interval` and the static cwnd
-    /// floor come from the preset table, the rest are controller defaults.
-    /// The adaptive cwnd floor the host adds from live telemetry is not part
-    /// of this expansion.
+    /// static tunable set: `cruise`, `queue guard`, `probe RTT interval` and
+    /// the static cwnd floor come from the preset table, the rest are
+    /// controller defaults. The runtime later finalizes its telemetry-derived
+    /// cwnd floor before applying the action.
     pub fn expand_preset(
         preset: Bbr3PresetV1,
         up_gain_milli: u32,

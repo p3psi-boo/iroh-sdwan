@@ -23,10 +23,17 @@ pub const INITIAL_SEND_BUFFER_BYTES_V2: usize = 256 * 1024;
 pub const REPAIR_CACHE_DEFAULT_TTL_V2: Duration = Duration::from_secs(2);
 const MINIMUM_PROTECTION_TRAFFIC_BYTES_PER_SECOND: u64 = 64 * 1024;
 const MINIMUM_PROTECTION_PACKETS_PER_SECOND: u64 = 128;
+// A saturated producer can be throttled below the ordinary evidence floors
+// by the very loss that protection is meant to recover from.  A real Bulk
+// backlog distinguishes that state from idle keepalive/PMTU probe loss.
+const MINIMUM_BACKLOG_PROTECTION_BYTES: u64 = 64 * 1024;
+const MINIMUM_BACKLOG_PROTECTION_PACKETS_PER_SECOND: u64 = 32;
 
 fn has_protection_evidence(sample: PathTelemetryV2) -> bool {
-    sample.real_traffic_bytes_per_second >= MINIMUM_PROTECTION_TRAFFIC_BYTES_PER_SECOND
-        && sample.packets_per_second >= MINIMUM_PROTECTION_PACKETS_PER_SECOND
+    (sample.real_traffic_bytes_per_second >= MINIMUM_PROTECTION_TRAFFIC_BYTES_PER_SECOND
+        && sample.packets_per_second >= MINIMUM_PROTECTION_PACKETS_PER_SECOND)
+        || (sample.packet_train_queue_bytes >= MINIMUM_BACKLOG_PROTECTION_BYTES
+            && sample.packets_per_second >= MINIMUM_BACKLOG_PROTECTION_PACKETS_PER_SECOND)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1796,6 +1803,23 @@ pub(crate) mod tests_fixture {
             assert_eq!(decision.reason, TuneReasonV2::HealthyLowLoss);
         }
         assert_eq!(tuner.smoothed.loss_ppm, 0);
+    }
+
+    #[test]
+    fn saturated_loss_stall_arms_protection_below_normal_traffic_floor() {
+        let start = Instant::now();
+        let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(80);
+        telemetry.rtt = Duration::from_millis(85);
+        telemetry.loss_ppm = 100_000;
+        telemetry.real_traffic_bytes_per_second = 32 * 1024;
+        telemetry.packets_per_second = 64;
+        telemetry.packet_train_queue_bytes = 256 * 1024;
+
+        let decision = tuner.observe_at(telemetry, start);
+        assert_eq!(decision.reason, TuneReasonV2::RandomLoss);
+        assert!(decision.fec.is_some());
     }
 
     #[test]

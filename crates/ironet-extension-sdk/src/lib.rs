@@ -19,7 +19,18 @@ use tokio::{
 
 pub const CONTROL_API_VERSION: u16 = 1;
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ironet/control.sock";
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum size of a single client-to-daemon JSON request frame.
+///
+/// This is part of the control API contract and matches the value advertised
+/// by the daemon in [`ApiLimits::maximum_request_bytes`].
+pub const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Maximum size of a single daemon-to-client JSON response frame.
+///
+/// This is part of the control API contract and matches the value advertised
+/// by the daemon in [`ApiLimits::maximum_response_bytes`].
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +133,15 @@ pub struct RpcError {
     pub message: String,
 }
 
+impl RpcError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -174,71 +194,102 @@ impl Client {
     }
 
     pub async fn capabilities(&self) -> Result<CapabilitySet> {
-        self.request("get_capabilities", json!({})).await
+        self.request_raw("get_capabilities", json!({})).await
     }
 
     /// Return a forward-compatible JSON snapshot. Extensions should deserialize
     /// only the fields they consume instead of binding to daemon internals.
     pub async fn snapshot(&self) -> Result<Value> {
-        self.request("get_snapshot", json!({})).await
+        self.request_raw("get_snapshot", json!({})).await
     }
 
     pub async fn routes(&self) -> Result<Vec<DesiredRoute>> {
-        self.request("list_routes", json!({})).await
+        self.request_raw("list_routes", json!({})).await
     }
 
     pub async fn apply_routes(&self, request: ApplyRoutesRequest) -> Result<RouteMutationResult> {
-        self.request("apply_routes", serde_json::to_value(request)?)
+        self.request_raw("apply_routes", serde_json::to_value(request)?)
             .await
     }
 
     pub async fn delete_routes(&self, request: DeleteRoutesRequest) -> Result<RouteMutationResult> {
-        self.request("delete_routes", serde_json::to_value(request)?)
+        self.request_raw("delete_routes", serde_json::to_value(request)?)
             .await
     }
 
     pub async fn watch_events(&self, after_cursor: Option<u64>) -> Result<EventStream> {
-        let id = next_request_id();
-        let mut request = json!({
-            "version": CONTROL_API_VERSION,
-            "id": id,
-            "method": "watch_events",
-        });
-        request["after_cursor"] = serde_json::to_value(after_cursor)?;
-        let mut reader = send(&self.socket, &request).await?;
-        let frame = read_frame(&mut reader).await?;
-        let ack = decode_result::<EventWatchAck>(frame, id)?;
-        Ok(EventStream { id, ack, reader })
+        let stream = self
+            .request_stream(
+                "watch_events",
+                json!({"after_cursor": serde_json::to_value(after_cursor)?}),
+            )
+            .await?;
+        EventStream::from_stream(stream).await
     }
 
-    async fn request<T: DeserializeOwned>(&self, method: &str, parameters: Value) -> Result<T> {
+    /// Send a single non-streaming control request.
+    ///
+    /// `parameters` must be a JSON object. The SDK owns the request envelope
+    /// (`version`, `id`, and `method`) so all control clients use the same
+    /// framing and response validation while callers retain typed result
+    /// decoding.
+    pub async fn request_raw<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        parameters: Value,
+    ) -> Result<T> {
+        let mut stream = self.request_stream(method, parameters).await?;
+        decode_result(stream.next_frame().await?)
+    }
+
+    /// Open a control request whose response contains more than one frame.
+    ///
+    /// The returned stream validates the protocol version and request ID on
+    /// every frame before exposing it to the caller.
+    pub async fn request_stream(&self, method: &str, parameters: Value) -> Result<ResponseStream> {
         let id = next_request_id();
-        let mut request = parameters;
-        let object = request.as_object_mut().ok_or_else(|| {
-            Error::Protocol("control request parameters must be an object".into())
-        })?;
-        object.insert("version".into(), json!(CONTROL_API_VERSION));
-        object.insert("id".into(), json!(id));
-        object.insert("method".into(), json!(method));
-        let mut reader = send(&self.socket, &request).await?;
-        decode_result(read_frame(&mut reader).await?, id)
+        let request = build_request(id, method, parameters)?;
+        let reader = send(&self.socket, &request).await?;
+        Ok(ResponseStream { id, reader })
+    }
+}
+
+/// A version- and request-ID-validated stream of response frames for one
+/// control request.
+pub struct ResponseStream {
+    id: u64,
+    reader: BufReader<OwnedReadHalf>,
+}
+
+impl ResponseStream {
+    pub fn request_id(&self) -> u64 {
+        self.id
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Value> {
+        let frame = read_frame(&mut self.reader).await?;
+        validate_frame(&frame, self.id)?;
+        Ok(frame)
     }
 }
 
 pub struct EventStream {
-    id: u64,
     ack: EventWatchAck,
-    reader: BufReader<OwnedReadHalf>,
+    stream: ResponseStream,
 }
 
 impl EventStream {
+    async fn from_stream(mut stream: ResponseStream) -> Result<Self> {
+        let ack = decode_result(stream.next_frame().await?)?;
+        Ok(Self { ack, stream })
+    }
+
     pub fn acknowledgement(&self) -> &EventWatchAck {
         &self.ack
     }
 
     pub async fn next(&mut self) -> Result<ExtensionEvent> {
-        let frame = read_frame(&mut self.reader).await?;
-        validate_frame(&frame, self.id)?;
+        let frame = self.stream.next_frame().await?;
         match frame.get("event").and_then(Value::as_str) {
             Some("extension_event") => Ok(serde_json::from_value(
                 frame.get("extension_event").cloned().ok_or_else(|| {
@@ -258,11 +309,22 @@ impl EventStream {
     }
 }
 
+fn build_request(id: u64, method: &str, parameters: Value) -> Result<Value> {
+    let mut request = parameters;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| Error::Protocol("control request parameters must be an object".into()))?;
+    object.insert("version".into(), json!(CONTROL_API_VERSION));
+    object.insert("id".into(), json!(id));
+    object.insert("method".into(), json!(method));
+    Ok(request)
+}
+
 async fn send(path: &Path, request: &Value) -> Result<BufReader<OwnedReadHalf>> {
     let stream = UnixStream::connect(path).await?;
     let (reader, mut writer) = stream.into_split();
     let mut encoded = serde_json::to_vec(request)?;
-    if encoded.len() > MAX_FRAME_BYTES {
+    if encoded.len() > MAX_CONTROL_REQUEST_BYTES {
         return Err(Error::Protocol("control request is too large".into()));
     }
     encoded.push(b'\n');
@@ -279,14 +341,13 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Value> {
             "daemon closed the control connection without a frame".into(),
         ));
     }
-    if encoded.len() > MAX_FRAME_BYTES {
+    if encoded.len() > MAX_CONTROL_RESPONSE_BYTES {
         return Err(Error::Protocol("control response is too large".into()));
     }
     Ok(serde_json::from_slice(&encoded)?)
 }
 
-fn decode_result<T: DeserializeOwned>(frame: Value, id: u64) -> Result<T> {
-    validate_frame(&frame, id)?;
+fn decode_result<T: DeserializeOwned>(frame: Value) -> Result<T> {
     match frame.get("event").and_then(Value::as_str) {
         Some("result") => Ok(serde_json::from_value(
             frame
@@ -347,5 +408,25 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["routes"][0]["owner"], "example.com/ipam");
         assert_eq!(value["routes"][0]["revision"], 7);
+    }
+
+    #[test]
+    fn raw_requests_use_the_versioned_control_envelope() {
+        let request = build_request(
+            7,
+            "status",
+            json!({"version": 99, "id": 8, "method": "wrong", "verbose": true}),
+        )
+        .unwrap();
+        assert_eq!(request["version"], CONTROL_API_VERSION);
+        assert_eq!(request["id"], 7);
+        assert_eq!(request["method"], "status");
+        assert_eq!(request["verbose"], true);
+    }
+
+    #[test]
+    fn raw_requests_require_object_parameters() {
+        let error = build_request(7, "status", json!(null)).unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)));
     }
 }

@@ -1,11 +1,6 @@
 {
-  "schema_version": 1,
   "id": "bandit-vivace@1",
   "algorithm": "bandit-vivace",
-  "built_at": "2026-08-20T00:00:00Z",
-  "trained_on": [
-    "builtin-conservative-baseline"
-  ],
   "contexts": {
     "rtt_millis": [
       10,
@@ -185,5 +180,5 @@
     "maximum_cpu_per_mille": 900,
     "rollback_regression_per_mille": 100
   },
-  "digest": "557c102ccc0b85a1b3c749912ca6c5568b51abfe12543728a0f37db8ab36b7c3"
+  "version": "2026-08-20T00:00:00Z"
 }

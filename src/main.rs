@@ -370,12 +370,14 @@ enum PolicyCommand {
     /// deterministic, through the production PolicyBackend/guardrail pipeline.
     ///
     /// POLICY is `builtin`, `native`, or an absolute path to a `.wasm`
-    /// package. `builtin` runs the embedded builtin.wasm component through
-    /// the verified loader; an external `.wasm` package is verified against
-    /// the sealed trust store of `--config`, or against
+    /// package. Replay intentionally runs `builtin` through the embedded
+    /// `builtin.wasm` guest and verified loader for bit-exact parity checks;
+    /// the daemon default instead uses the in-process CorePolicy. `native`
+    /// selects conservative host rules. An external `.wasm` package is
+    /// verified against the sealed trust store of `--config`, or against
     /// `--signer-pubkey`/`--digest-pin`.
     Replay {
-        /// `builtin`, `native`, or an absolute `.wasm` path.
+        /// `builtin` replays the embedded guest; `native` uses conservative rules; or an absolute `.wasm` path.
         #[arg(value_name = "POLICY")]
         policy: String,
         /// Tap fixture: JSON array, profile summary, or JSONL; '-' reads stdin.
@@ -1868,12 +1870,13 @@ async fn policy_replay(
     let samples = decode_replay_samples(&input, side)?;
     let (slot, weights) = match policy {
         ironet::config::AUTOTUNE_POLICY_NATIVE => {
-            // Host-side conservative rules, no learner (plan Phase 6).
+            // Explicit host-side conservative rules, with no learner.
             (PolicySlotV1::native_rules(), objective.weights())
         }
         ironet::config::AUTOTUNE_POLICY_BUILTIN => {
-            // The same component the daemon runs: the embedded builtin.wasm
-            // through the verified loader, trusted by its digest sidecar.
+            // Replay intentionally exercises the embedded guest through the
+            // verified loader. The daemon's default builtin path is instead
+            // the in-process CorePolicy; this is the bit-exact parity path.
             let backend = PolicyLoader::new(PolicyEngine::try_new()?)
                 .load_builtin(&ironet::config::AutotuneWasmConfig::default())
                 .context("loading the embedded builtin policy component")?;
@@ -2200,30 +2203,32 @@ fn format_peer_human(peer: &PeerStatus) -> String {
         peer.path_mtu,
         display::bytes(peer.path_cwnd_bytes),
         display::bytes(
-            peer.packet_train_queue_bytes
-                .saturating_add(peer.latency_queue_bytes)
+            peer.traffic
+                .packet_train_queue_bytes
+                .saturating_add(peer.traffic.latency_queue_bytes)
         ),
-        peer.tx_packets,
-        display::bytes(peer.tx_bytes),
-        peer.rx_packets,
-        display::bytes(peer.rx_bytes),
-        peer.trains_built,
-        peer.cells_built,
-        peer.fec_tx_cells,
-        display::bytes(peer.fec_tx_bytes),
-        peer.fec_rx_cells,
-        peer.fec_recovered_cells,
-        peer.repair_received_cells,
-        peer.repair_requested_cells,
-        display::bytes(peer.cover_tx_bytes),
-        display::bytes(peer.cover_rx_bytes),
-        peer.route_gate_drops
-            .saturating_add(peer.tun_admission_drop_records)
-            .saturating_add(peer.reassembly_pressure_evictions)
-            .saturating_add(peer.pmtu_drop_datagrams),
+        peer.traffic.tx_packets,
+        display::bytes(peer.traffic.tx_bytes),
+        peer.traffic.rx_packets,
+        display::bytes(peer.traffic.rx_bytes),
+        peer.traffic.trains_built,
+        peer.traffic.cells_built,
+        peer.traffic.fec_tx_cells,
+        display::bytes(peer.traffic.fec_tx_bytes),
+        peer.traffic.fec_rx_cells,
+        peer.traffic.fec_recovered_cells,
+        peer.traffic.repair_received_cells,
+        peer.traffic.repair_requested_cells,
+        display::bytes(peer.traffic.cover_tx_bytes),
+        display::bytes(peer.traffic.cover_rx_bytes),
+        peer.traffic
+            .route_gate_drops
+            .saturating_add(peer.traffic.tun_admission_drop_records)
+            .saturating_add(peer.traffic.reassembly_pressure_evictions)
+            .saturating_add(peer.traffic.pmtu_drop_datagrams),
         peer.connection_errors
-            .saturating_add(peer.protocol_datagram_errors)
-            .saturating_add(peer.repair_stale_responses),
+            .saturating_add(peer.traffic.protocol_datagram_errors)
+            .saturating_add(peer.traffic.repair_stale_responses),
     )
 }
 
@@ -2524,7 +2529,7 @@ mod tests {
     use clap::CommandFactory;
     use ironet::{
         config::NodeInfo,
-        status::{GatewayStatus, MeshStatus, RouteStatus},
+        status::{GatewayStatus, MeshStatus, PeerTrafficStatus, RouteStatus},
         trace::PingSample,
     };
 
@@ -2555,12 +2560,15 @@ mod tests {
             protocol_major: 2,
             connected: true,
             connection_events: 1,
-            tx_packets: 2,
-            tx_bytes: 3,
-            rx_packets: 4,
-            rx_bytes: 5,
-            route_gate_drops: 8,
-            protocol_datagram_errors: 9,
+            traffic: PeerTrafficStatus {
+                tx_packets: 2,
+                tx_bytes: 3,
+                rx_packets: 4,
+                rx_bytes: 5,
+                route_gate_drops: 8,
+                protocol_datagram_errors: 9,
+                ..PeerTrafficStatus::default()
+            },
             ..PeerStatus::default()
         }
     }
@@ -2640,6 +2648,35 @@ mod tests {
             "--output json",
         ] {
             assert!(help.contains(required), "root help is missing {required:?}");
+        }
+    }
+
+    #[test]
+    fn policy_replay_help_distinguishes_guest_fixture_from_daemon_default() {
+        let mut command = Cli::command();
+        let policy = command
+            .find_subcommand_mut("policy")
+            .expect("policy command is registered");
+        let replay = policy
+            .find_subcommand_mut("replay")
+            .expect("policy replay command is registered");
+        let help = replay
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for required in [
+            "embedded `builtin.wasm` guest",
+            "bit-exact parity checks",
+            "daemon default instead uses the in-process CorePolicy",
+            "`native` selects conservative host rules",
+        ] {
+            assert!(
+                help.contains(required),
+                "replay help is missing {required:?}"
+            );
         }
     }
 

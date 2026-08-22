@@ -15,25 +15,24 @@
 
 use std::{sync::Arc, time::Instant};
 
+use anyhow::{Result, ensure};
 use ironet_policy_core::{
     ActionSpecV1, ArmMemoryV1, BbrProposalSpecV1, ContextKeyV1, ContextMemoryV1,
-    ContextSchemaSpecV1, CorePolicy, EXTENSION_TAG_HOST_UTILITY_F64_V1, ExplorationSpecV1,
-    FineMemoryV1, LearnerMemoryV1, LearnerModeV1, LearnerStateV1, LearnerTraceV1, PolicySpecV1,
-    PosteriorSpecV1, PresetSpecV1, UtilityWeightsSpecV1, host_utility_extension,
+    ContextSchemaSpecV1, CorePolicy, EXTENSION_TAG_HOST_UTILITY_F64_V1, FineMemoryV1,
+    LearnerMemoryV1, LearnerModeV1, LearnerStateV1, LearnerTraceV1, PolicySpecV1,
+    host_utility_extension,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{
-    policy::{
-        ContextSchemaV2, PolicyArtifactV2,
-        api::{
-            BbrHostExt, EffectiveActionV1, EffectiveHostExt, HostCapabilitiesV1, HostLimitsV1,
-            HostUtilityV1, PolicyInputV1, PolicyTelemetryV1, TelemetryHostExt, UtilityHostExt,
-        },
-        builtin as builtin_policy,
+    policy::api::{
+        BbrHostExt, EffectiveActionV1, EffectiveHostExt, HostCapabilitiesV1, HostLimitsV1,
+        HostUtilityV1, PolicyInputV1, PolicyTelemetryV1, TelemetryHostExt, UtilityHostExt,
     },
-    tuning::{AutoTunerV2, Bbr3PresetV2, Bbr3ProposalV2, PathTelemetryV2, TuneDecisionV2},
-    utility::UtilitySample,
+    tuning::{
+        AutoTunerV2, Bbr3PresetV2, Bbr3ProposalV2, ForcedActionV2, PathTelemetryV2, TuneDecisionV2,
+    },
+    utility::{Objective, UtilitySample, UtilityWeights},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +78,7 @@ pub struct ContextKeyV2 {
 
 impl ContextKeyV2 {
     pub fn classify(t: &PathTelemetryV2) -> Self {
-        Self::classify_with(
-            t,
-            &ContextSchemaV2 {
-                rtt_millis: vec![10, 40, 120],
-                rate_mbps: vec![10, 100, 500],
-                loss_ppm: vec![1_000, 10_000, 30_000],
-            },
-        )
+        Self::classify_with(t, &ContextSchemaSpecV1::builtin())
     }
 
     #[cfg(test)]
@@ -94,11 +86,11 @@ impl ContextKeyV2 {
         ContextKeyV1::from(self).policy_key()
     }
 
-    pub fn classify_with(t: &PathTelemetryV2, schema: &ContextSchemaV2) -> Self {
+    pub fn classify_with(t: &PathTelemetryV2, schema: &ContextSchemaSpecV1) -> Self {
         ContextKeyV1::classify(
             &PolicyTelemetryV1::from_runtime(t),
             t.reliability.into(),
-            &context_schema_to_core(schema),
+            schema,
         )
         .into()
     }
@@ -260,27 +252,8 @@ impl From<&LearnerMemoryV2> for LearnerMemoryV1 {
 }
 
 // ---------------------------------------------------------------------------
-// Artifact -> core spec
+// Canonical spec -> host action adapter
 // ---------------------------------------------------------------------------
-
-fn context_schema_to_core(schema: &ContextSchemaV2) -> ContextSchemaSpecV1 {
-    ContextSchemaSpecV1 {
-        rtt_millis: schema.rtt_millis.clone(),
-        rate_mbps: schema.rate_mbps.clone(),
-        loss_ppm: schema.loss_ppm.clone(),
-    }
-}
-
-fn proposal_to_core(proposal: Bbr3ProposalV2) -> BbrProposalSpecV1 {
-    BbrProposalSpecV1 {
-        preset: proposal.preset.into(),
-        up_gain_milli: proposal.up_gain_milli,
-        headroom_milli: proposal.headroom_milli,
-        cwnd_gain_milli: proposal.cwnd_gain_milli,
-        pacing_cap_bytes_per_second: proposal.pacing_cap_bytes_per_second,
-        loss_is_congestion: proposal.loss_is_congestion,
-    }
-}
 
 fn proposal_to_runtime(proposal: BbrProposalSpecV1) -> Bbr3ProposalV2 {
     Bbr3ProposalV2 {
@@ -293,84 +266,73 @@ fn proposal_to_runtime(proposal: BbrProposalSpecV1) -> Bbr3ProposalV2 {
     }
 }
 
-/// Project the host's JSON artifact onto the core's pure-data spec (the
-/// schema version, digest, source and trained-on list stay host-only).
-pub fn policy_spec_from_artifact(policy: &PolicyArtifactV2) -> PolicySpecV1 {
-    PolicySpecV1 {
-        id: policy.id.clone(),
-        algorithm: policy.algorithm.clone(),
-        version: policy.built_at.clone(),
-        objective: policy.objective.map(Into::into),
-        contexts: context_schema_to_core(&policy.contexts),
-        presets: policy
-            .presets
-            .iter()
-            .map(|preset| PresetSpecV1 {
-                name: preset.name.clone(),
-                proposal: proposal_to_core(preset.proposal),
-                action: ActionSpecV1 {
-                    fec_data_cells: preset.action.fec_data_cells,
-                    fec_parity_cells: preset.action.fec_parity_cells,
-                    train_target_bytes: preset
-                        .action
-                        .train_target_bytes
-                        .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
-                    bulk_quantum_cells: preset
-                        .action
-                        .bulk_quantum_cells
-                        .map(|value| u16::try_from(value).unwrap_or(u16::MAX)),
-                    cover_overhead_per_mille: preset.action.cover_overhead_per_mille,
-                },
-            })
-            .collect(),
-        priors: policy
-            .priors
-            .iter()
-            .map(|(context, priors)| {
-                (
-                    context.clone(),
-                    priors
-                        .iter()
-                        .map(|(name, prior)| {
-                            (
-                                name.clone(),
-                                PosteriorSpecV1 {
-                                    observations: prior.observations,
-                                    mean: prior.mean,
-                                },
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-        weights: policy
-            .weights
-            .iter()
-            .map(|(name, weights)| {
-                (
-                    name.clone(),
-                    UtilityWeightsSpecV1 {
-                        throughput: weights.throughput,
-                        queue_delay: weights.queue_delay,
-                        latency_sojourn: weights.latency_sojourn,
-                        residual_loss: weights.residual_loss,
-                        jitter: weights.jitter,
-                        cpu: weights.cpu,
-                        wire_overhead: weights.wire_overhead,
-                        memory: weights.memory,
-                    },
-                )
-            })
-            .collect(),
-        exploration: ExplorationSpecV1 {
-            minimum_dwell_millis: policy.exploration.minimum_dwell_millis,
-            minimum_rtt_rounds: policy.exploration.minimum_rtt_rounds,
-            minimum_samples: policy.exploration.minimum_samples,
-            maximum_cpu_per_mille: policy.exploration.maximum_cpu_per_mille,
-            rollback_regression_per_mille: policy.exploration.rollback_regression_per_mille,
-        },
+fn action_to_runtime(action: ActionSpecV1) -> ForcedActionV2 {
+    ForcedActionV2 {
+        bbr_preset: None,
+        fec: action
+            .fec_data_cells
+            .zip(action.fec_parity_cells)
+            .map(|(data, parity)| {
+                if data == 0 && parity == 0 {
+                    None
+                } else {
+                    Some(super::fec::FecGeometryV2 {
+                        data_cells: usize::from(data),
+                        parity_cells: usize::from(parity),
+                    })
+                }
+            }),
+        train_target_bytes: action.train_target_bytes.map(|value| value as usize),
+        bulk_quantum_cells: action.bulk_quantum_cells.map(usize::from),
+        cover_profile: None,
+        cover_overhead_per_mille: action.cover_overhead_per_mille,
     }
+}
+
+/// Convert the canonical action of `preset` into the host's constrained-action
+/// input. The core spec owns the data; the host owns the runtime projection.
+pub fn forced_action_for_preset(
+    policy: &PolicySpecV1,
+    preset: Bbr3PresetV2,
+) -> Option<ForcedActionV2> {
+    policy.action(preset.into()).map(action_to_runtime)
+}
+
+/// Utility weights selected from the canonical spec. Validation guarantees all
+/// three host objectives are present before a spec reaches this adapter.
+pub fn policy_utility_weights(policy: &PolicySpecV1, objective: Objective) -> UtilityWeights {
+    let key = match objective {
+        Objective::Balanced => "balanced",
+        Objective::Throughput => "throughput",
+        Objective::Latency => "latency",
+    };
+    let weights = policy
+        .weights
+        .get(key)
+        .expect("validated canonical policy defines every utility objective");
+    UtilityWeights {
+        throughput: weights.throughput,
+        queue_delay: weights.queue_delay,
+        latency_sojourn: weights.latency_sojourn,
+        residual_loss: weights.residual_loss,
+        jitter: weights.jitter,
+        cpu: weights.cpu,
+        wire_overhead: weights.wire_overhead,
+        memory: weights.memory,
+    }
+}
+
+/// Reject an offline policy spec trained for a different runtime objective.
+pub fn ensure_policy_objective(policy: &PolicySpecV1, objective: Objective) -> Result<()> {
+    ensure!(
+        policy
+            .objective
+            .is_none_or(|trained| Objective::from(trained) == objective),
+        "autotune policy objective {:?} does not match runtime objective {:?}",
+        policy.objective,
+        objective
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +362,7 @@ impl TickClock {
 pub struct BanditLearnerV2 {
     mode: LearnerModeV2,
     seed: u64,
-    policy: Arc<PolicyArtifactV2>,
+    policy: Arc<PolicySpecV1>,
     core: CorePolicy,
     /// Encoded `ironet_policy_core` learner state; empty until the first
     /// step (cold start).
@@ -410,26 +372,22 @@ pub struct BanditLearnerV2 {
 
 impl BanditLearnerV2 {
     pub fn new(mode: LearnerModeV2, seed: u64) -> Self {
-        Self::with_policy(
-            mode,
-            seed,
-            Arc::new(builtin_policy().expect("embedded autotune policy must validate")),
-        )
+        Self::with_policy(mode, seed, Arc::new(PolicySpecV1::builtin()))
     }
 
-    pub fn with_policy(mode: LearnerModeV2, seed: u64, policy: Arc<PolicyArtifactV2>) -> Self {
+    pub fn with_policy(mode: LearnerModeV2, seed: u64, policy: Arc<PolicySpecV1>) -> Self {
         Self {
             mode,
             seed,
-            core: CorePolicy::new(policy_spec_from_artifact(&policy), mode.into()),
+            core: CorePolicy::new(policy.as_ref().clone(), mode.into()),
             policy,
             state: Vec::new(),
             clock: TickClock::default(),
         }
     }
 
-    pub fn replace_policy(&mut self, policy: Arc<PolicyArtifactV2>, now: Instant) {
-        if self.policy.digest == policy.digest {
+    pub fn replace_policy(&mut self, policy: Arc<PolicySpecV1>, now: Instant) {
+        if self.policy == policy {
             return;
         }
         let tick = self.clock.tick(now);
@@ -438,7 +396,7 @@ impl BanditLearnerV2 {
             state.reset_for_policy_change(same_algorithm, tick);
             self.state = state.encode().unwrap_or_default();
         }
-        self.core = CorePolicy::new(policy_spec_from_artifact(&policy), self.mode.into());
+        self.core = CorePolicy::new(policy.as_ref().clone(), self.mode.into());
         self.policy = policy;
     }
 
@@ -464,7 +422,7 @@ impl BanditLearnerV2 {
         baseline: TuneDecisionV2,
     ) -> (TuneDecisionV2, LearnerTraceV2) {
         let tick = self.clock.tick(now);
-        let objective = self.policy.objective.unwrap_or_default();
+        let objective = self.policy.objective.map(Into::into).unwrap_or_default();
         let input = PolicyInputV1 {
             logical_tick: tick,
             deterministic_seed: self.seed,
@@ -530,7 +488,7 @@ impl BanditLearnerV2 {
 /// The returned decision is never published by this helper; callers decide
 /// whether it is observability-only or an on-mode action.
 pub fn materialize_policy_action(
-    policy: &PolicyArtifactV2,
+    policy: &PolicySpecV1,
     tuner: &AutoTunerV2,
     telemetry: PathTelemetryV2,
     baseline: TuneDecisionV2,
@@ -538,11 +496,11 @@ pub fn materialize_policy_action(
 ) -> TuneDecisionV2 {
     let mut decision = baseline;
     decision.bbr = proposal_to_runtime(ironet_policy_core::resolve_preset_proposal(
-        policy.preset(preset).map(proposal_to_core),
+        policy.preset(preset.into()),
         preset.into(),
         telemetry.controller_bw_bytes_per_second,
     ));
-    policy.action(preset).map_or(decision, |action| {
+    forced_action_for_preset(policy, preset).map_or(decision, |action| {
         tuner.constrain_action(telemetry, decision, action)
     })
 }
@@ -566,10 +524,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_spec_matches_the_embedded_host_artifact() {
-        let host = policy_spec_from_artifact(&builtin_policy().unwrap());
-        assert_eq!(host, PolicySpecV1::builtin());
-        host.validate().unwrap();
+    fn builtin_spec_is_the_adapter_source_of_truth() {
+        let spec = PolicySpecV1::builtin();
+        spec.validate().unwrap();
+        assert_eq!(spec.contexts, ContextSchemaSpecV1::builtin());
     }
 
     #[test]
@@ -640,18 +598,17 @@ mod tests {
             components: [0.0; 8],
             goodput_bytes_per_second: 1,
         };
-        let mut policy = builtin_policy().unwrap();
+        let mut policy = PolicySpecV1::builtin();
         policy.priors.insert(
             ContextKeyV2::classify_with(&t, &policy.contexts).policy_key(),
             std::collections::BTreeMap::from([(
                 "private-aggressive".to_owned(),
-                crate::protocol::v2::policy::PosteriorSpecV2 {
+                ironet_policy_core::PosteriorSpecV1 {
                     observations: 100,
                     mean: 100.0,
                 },
             )]),
         );
-        policy.digest = policy.calculated_digest().unwrap();
         let mut learner = BanditLearnerV2::with_policy(LearnerModeV2::Shadow, 7, Arc::new(policy));
         let start = Instant::now();
         learner.step(start, &t, &utility, baseline);
@@ -708,9 +665,8 @@ mod tests {
             100
         );
 
-        let mut next = builtin_policy().unwrap();
+        let mut next = PolicySpecV1::builtin();
         next.id = "bandit-vivace@2".to_owned();
-        next.digest = next.calculated_digest().unwrap();
         learner.replace_policy(Arc::new(next), now + Duration::from_secs(1));
         let memory = learner.export_memory();
         assert_eq!(memory.contexts[0].arms[0].observations, 1);

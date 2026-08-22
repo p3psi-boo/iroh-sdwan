@@ -1,11 +1,15 @@
-//! Pure-data policy specification: the learner-relevant part of the host's
-//! JSON `PolicyArtifactV2` (contexts, presets, per-preset actions, priors,
-//! utility weights, exploration knobs) without the host-only envelope
-//! (schema version, digest, trained-on list, file source).
+//! Canonical pure-data policy specification.
+//!
+//! `PolicySpecV1` is the only serialized policy contract shared by offline
+//! training, native replay and the builtin WASM guest.  Package signatures,
+//! deployment provenance and module digests belong to the package/runtime
+//! layers rather than a second host-side policy envelope.
 
 use std::collections::BTreeMap;
 
-use ironet_policy_abi::{Bbr3PresetV1, ObjectiveV1};
+use ironet_policy_abi::{
+    Bbr3PresetV1, FEC_DATA_CELLS_MAX, FEC_PARITY_CELLS_MAX, FEC_PARITY_PER_MILLE_CAP, ObjectiveV1,
+};
 use serde::{Deserialize, Serialize};
 
 /// Algorithm identifier every V1 spec must carry.
@@ -16,6 +20,7 @@ pub const BANDIT_POLICY_ID_V1: &str = "bandit-vivace@1";
 /// Context bucketing thresholds. Each list is strictly increasing; a value
 /// falls into the index of the first threshold it is below (or `len()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextSchemaSpecV1 {
     pub rtt_millis: Vec<u32>,
     pub rate_mbps: Vec<u32>,
@@ -37,6 +42,7 @@ impl ContextSchemaSpecV1 {
 /// The five learner-controlled BBRv3 knobs plus the preset they belong to
 /// (mirror of the host's `Bbr3ProposalV2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BbrProposalSpecV1 {
     pub preset: Bbr3PresetV1,
     pub up_gain_milli: u32,
@@ -115,7 +121,7 @@ impl BbrProposalSpecV1 {
 /// Application-layer action attached to a preset. `None` inherits the host
 /// baseline; FEC `Some(0)`/`Some(0)` explicitly disables parity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ActionSpecV1 {
     pub fec_data_cells: Option<u8>,
     pub fec_parity_cells: Option<u8>,
@@ -126,6 +132,7 @@ pub struct ActionSpecV1 {
 
 /// One arm of the bandit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PresetSpecV1 {
     pub name: String,
     pub proposal: BbrProposalSpecV1,
@@ -135,6 +142,7 @@ pub struct PresetSpecV1 {
 
 /// Offline prior for one (context, preset) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PosteriorSpecV1 {
     pub observations: u32,
     pub mean: f64,
@@ -143,6 +151,7 @@ pub struct PosteriorSpecV1 {
 /// Utility weights per objective (the host computes utility; carried here so
 /// the spec stays a faithful copy of the artifact).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UtilityWeightsSpecV1 {
     pub throughput: f64,
     pub queue_delay: f64,
@@ -156,6 +165,7 @@ pub struct UtilityWeightsSpecV1 {
 
 /// Exploration and safety knobs of the learner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExplorationSpecV1 {
     pub minimum_dwell_millis: u64,
     pub minimum_rtt_rounds: u32,
@@ -166,6 +176,7 @@ pub struct ExplorationSpecV1 {
 
 /// Complete learner specification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicySpecV1 {
     /// Stable policy identifier, e.g. `bandit-vivace@1`.
     pub id: String,
@@ -200,9 +211,9 @@ impl std::fmt::Display for SpecError {
 impl std::error::Error for SpecError {}
 
 impl PolicySpecV1 {
-    /// The embedded policy, field for field equal to the host's
-    /// `config/autotune-policy-v1.json` (`bandit-vivace@1`); the host crate
-    /// asserts the equality in a test.
+    /// The embedded policy.  `config/autotune-policy-v1.json` is a canonical
+    /// serde fixture asserted against this constructor by the host tests; it
+    /// never supplies production policy data.
     pub fn builtin() -> Self {
         use Bbr3PresetV1::*;
         let proposal = |preset, up, headroom, cwnd, loss_is_congestion| BbrProposalSpecV1 {
@@ -347,13 +358,15 @@ impl PolicySpecV1 {
             {
                 return Err(SpecError("BBR proposal outside safe bounds"));
             }
+            validate_action(preset.action)?;
         }
         if kinds != 0x7f {
             return Err(SpecError(
                 "policy must define every BBR preset exactly once",
             ));
         }
-        for priors in self.priors.values() {
+        for (context, priors) in &self.priors {
+            validate_context_key(context)?;
             for (name, posterior) in priors {
                 if !self.presets.iter().any(|preset| &preset.name == name) {
                     return Err(SpecError("prior references unknown preset"));
@@ -362,6 +375,27 @@ impl PolicySpecV1 {
                     return Err(SpecError("prior contains non-finite reward"));
                 }
             }
+        }
+        for objective in ["balanced", "throughput", "latency"] {
+            if !self.weights.contains_key(objective) {
+                return Err(SpecError("policy must define all utility objectives"));
+            }
+        }
+        if self.weights.values().any(|weights| {
+            [
+                weights.throughput,
+                weights.queue_delay,
+                weights.latency_sojourn,
+                weights.residual_loss,
+                weights.jitter,
+                weights.cpu,
+                weights.wire_overhead,
+                weights.memory,
+            ]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=10.0).contains(&value))
+        }) {
+            return Err(SpecError("policy contains invalid utility weights"));
         }
         let exploration = self.exploration;
         if !(1_000..=300_000).contains(&exploration.minimum_dwell_millis)
@@ -390,6 +424,67 @@ impl PolicySpecV1 {
             .find(|candidate| candidate.proposal.preset == preset)
             .map(|candidate| candidate.action)
     }
+}
+
+fn validate_action(action: ActionSpecV1) -> Result<(), SpecError> {
+    if action.fec_data_cells.is_some() != action.fec_parity_cells.is_some() {
+        return Err(SpecError(
+            "policy FEC action must specify both data and parity",
+        ));
+    }
+    if let (Some(data), Some(parity)) = (action.fec_data_cells, action.fec_parity_cells)
+        && (data != 0 || parity != 0)
+        && (!(2..=FEC_DATA_CELLS_MAX).contains(&data)
+            || parity > FEC_PARITY_CELLS_MAX
+            || u16::from(parity).saturating_mul(1_000)
+                > u16::from(data).saturating_mul(FEC_PARITY_PER_MILLE_CAP))
+    {
+        return Err(SpecError("policy FEC action outside safe bounds"));
+    }
+    if action
+        .train_target_bytes
+        .is_some_and(|bytes| !(8 * 1024..=64 * 1024).contains(&bytes))
+    {
+        return Err(SpecError("policy train action outside safe bounds"));
+    }
+    if action
+        .bulk_quantum_cells
+        .is_some_and(|cells| !(1..=4).contains(&cells))
+    {
+        return Err(SpecError("policy quantum action outside safe bounds"));
+    }
+    if action
+        .cover_overhead_per_mille
+        .is_some_and(|overhead| overhead > 50)
+    {
+        return Err(SpecError("policy cover action outside safe bounds"));
+    }
+    Ok(())
+}
+
+fn validate_context_key(value: &str) -> Result<(), SpecError> {
+    let mut parts = value.split('-');
+    for prefix in ['r', 'b', 'l'] {
+        let Some(part) = parts.next() else {
+            return Err(SpecError("policy prior context is incomplete"));
+        };
+        let Some(class) = part.strip_prefix(prefix) else {
+            return Err(SpecError("policy prior context has invalid class prefix"));
+        };
+        let Ok(class) = class.parse::<u8>() else {
+            return Err(SpecError("policy prior context class is invalid"));
+        };
+        if class > 3 {
+            return Err(SpecError("policy prior context class exceeds 3"));
+        }
+    }
+    if !matches!(parts.next(), Some("datagram" | "reliable")) {
+        return Err(SpecError("policy prior context has invalid reliability"));
+    }
+    if !matches!(parts.next(), None | Some("host")) || parts.next().is_some() {
+        return Err(SpecError("policy prior context has invalid trailing data"));
+    }
+    Ok(())
 }
 
 /// Kebab-case preset name as used by spec files and diagnostics labels.

@@ -38,12 +38,13 @@ status = json.load(open(sys.argv[1]))
 assert status['ready'] is True
 assert status['peers'][0]['name'] == sys.argv[2]
 assert status['peers'][0]['connected'] is True
-assert status['peers'][0]['frame_drops'] == 0
-assert status['peers'][0]['tun_mtu'] == 1280
+traffic = status['peers'][0]['traffic']
+assert traffic['route_gate_drops'] == 0
+assert traffic['tun_mtu'] == 1280
 assert status['peers'][0]['selected_path_transport'] in ('direct', 'relay')
 assert status['peers'][0]['selected_path_remote']
 assert status['peers'][0]['open_paths'] >= 1
-print(status['endpoint_id'], status['peers'][0]['effective_frame_size'], status['peers'][0]['path_mtu'], status['peers'][0]['tun_mtu'])
+print(status['endpoint_id'], status['peers'][0]['path_mtu'], traffic['tun_mtu'])
 PY
   "
 }

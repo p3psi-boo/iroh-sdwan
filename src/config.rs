@@ -242,19 +242,23 @@ pub struct AutotuneConfig {
     pub memory: bool,
     /// Policy backend selection with three layers of meaning:
     ///
-    /// - `native`: the host-side conservative fallback. It only uses the
+    /// - `native`: an explicit selection of host-side conservative rules. It only uses the
     ///   deterministic `AutoTunerV2` propose rules, carries no learner and
-    ///   never loads an external artifact. It is kept permanently for fault
-    ///   fallback, quarantine and deployments without the WASM engine.
-    /// - `builtin` (default): the `builtin.wasm` component embedded in this
-    ///   binary, executed by the WASM runtime.
+    ///   never loads an external artifact.
+    /// - `builtin` (default): the learner-backed in-process `CorePolicy`
+    ///   constructed from the canonical `PolicySpecV1::builtin()`. It does
+    ///   not initialize Wasmtime or load `builtin.wasm`.
     /// - an absolute `.wasm` path: an external policy component verified
     ///   against `[autotune.wasm]` (signers or digest pins).
     ///
+    /// `builtin.wasm` remains a bit-exact guest fixture and a distributable
+    /// template for an explicitly configured external component; it is not
+    /// the daemon's default execution path. A rejected external component
+    /// falls back to the in-process builtin core without preventing the
+    /// dataplane from starting.
+    ///
     /// External JSON policy artifacts were removed in Phase 6; a `.json`
-    /// path is a configuration error. A rejected external component falls
-    /// back to `builtin`, then to `native`, without preventing the dataplane
-    /// from starting.
+    /// path is a configuration error.
     #[serde(
         default = "default_autotune_policy",
         skip_serializing_if = "is_builtin_policy"
@@ -284,9 +288,9 @@ impl Default for AutotuneConfig {
     }
 }
 
-/// `autotune.policy` value selecting the host-native conservative fallback.
+/// `autotune.policy` value selecting explicit host-side conservative rules.
 pub const AUTOTUNE_POLICY_NATIVE: &str = "native";
-/// `autotune.policy` value selecting the policy embedded in this binary.
+/// `autotune.policy` value selecting the default in-process `CorePolicy`.
 pub const AUTOTUNE_POLICY_BUILTIN: &str = "builtin";
 
 fn default_autotune_policy() -> String {
@@ -771,38 +775,11 @@ impl Config {
     }
 
     pub async fn load(path: &Path) -> Result<Self> {
-        let raw = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        verify_config_digest(path, raw.as_bytes()).await?;
-        let config = Self::decode(path, &raw)?;
-        let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
-        let extension_routes = crate::extensions::ExtensionState::load(
-            &crate::extensions::state_path(&config.identity_file),
-        )
-        .await?
-        .route_origins(crate::extensions::now_unix())?;
-        Self::resolve_routes(
-            config,
-            merge_route_origins(routes.routes, extension_routes)?,
-        )
+        Self::load_inner(path, true, None).await
     }
 
     pub async fn load_unsealed(path: &Path) -> Result<Self> {
-        let raw = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let config = Self::decode(path, &raw)?;
-        let routes = crate::routes::RouteRegistry::load(&config.route_registry_path()).await?;
-        let extension_routes = crate::extensions::ExtensionState::load(
-            &crate::extensions::state_path(&config.identity_file),
-        )
-        .await?
-        .route_origins(crate::extensions::now_unix())?;
-        Self::resolve_routes(
-            config,
-            merge_route_origins(routes.routes, extension_routes)?,
-        )
+        Self::load_inner(path, false, None).await
     }
 
     /// Load a sealed main configuration against an in-memory candidate route
@@ -811,20 +788,32 @@ impl Config {
         path: &Path,
         route_origins: Vec<RouteOriginConfig>,
     ) -> Result<Self> {
+        Self::load_inner(path, true, Some(route_origins)).await
+    }
+
+    async fn load_inner(
+        path: &Path,
+        sealed: bool,
+        operator_candidate: Option<Vec<RouteOriginConfig>>,
+    ) -> Result<Self> {
         let raw = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
-        verify_config_digest(path, raw.as_bytes()).await?;
+        if sealed {
+            verify_config_digest(path, raw.as_bytes()).await?;
+        }
         let config = Self::decode(path, &raw)?;
-        let extension_routes = crate::extensions::ExtensionState::load(
-            &crate::extensions::state_path(&config.identity_file),
-        )
-        .await?
-        .route_origins(crate::extensions::now_unix())?;
-        Self::resolve_routes(
-            config,
-            merge_route_origins(route_origins, extension_routes)?,
-        )
+        let route_sources = match operator_candidate {
+            Some(candidate) => {
+                crate::routes::RouteSources::load_with_operator_candidate(
+                    &config.identity_file,
+                    candidate,
+                )
+                .await?
+            }
+            None => crate::routes::RouteSources::load(&config.identity_file).await?,
+        };
+        route_sources.resolve_config(config)
     }
 
     /// Resolve the mutable route registry from a sealed main configuration
@@ -839,20 +828,6 @@ impl Config {
 
     fn decode(path: &Path, raw: &str) -> Result<Self> {
         toml::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))
-    }
-
-    fn resolve_routes(mut config: Self, external_routes: Vec<RouteOriginConfig>) -> Result<Self> {
-        if !external_routes.is_empty() {
-            let mut combined = crate::routes::RouteRegistry {
-                version: 1,
-                routes: std::mem::take(&mut config.route_origins),
-            };
-            combined.routes.extend(external_routes);
-            combined.normalize()?;
-            config.route_origins = combined.routes;
-        }
-        config.validate()?;
-        Ok(config)
     }
 
     pub fn route_registry_path(&self) -> PathBuf {
@@ -1285,19 +1260,6 @@ impl Config {
     }
 }
 
-fn merge_route_origins(
-    mut first: Vec<RouteOriginConfig>,
-    second: Vec<RouteOriginConfig>,
-) -> Result<Vec<RouteOriginConfig>> {
-    first.extend(second);
-    let mut registry = crate::routes::RouteRegistry {
-        version: 1,
-        routes: first,
-    };
-    registry.normalize()?;
-    Ok(registry.routes)
-}
-
 pub fn config_digest_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".blake3");
@@ -1474,7 +1436,48 @@ fn prefixes_overlap(left: IpNet, right: IpNet) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use iroh::SecretKey;
+    use ironet_extension_sdk::{
+        ApplyRoutesRequest, CONTROL_API_VERSION, DesiredRouteSpec, RouteApply,
+    };
+
     use super::*;
+
+    fn id(byte: u8) -> EndpointId {
+        SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    fn extension_state(endpoint_id: EndpointId, prefix: &str) -> crate::extensions::ExtensionState {
+        crate::extensions::ExtensionState::new()
+            .apply(
+                &ApplyRoutesRequest {
+                    routes: vec![RouteApply {
+                        api_version: CONTROL_API_VERSION,
+                        name: "office".into(),
+                        owner: "example.com/ipam".into(),
+                        revision: 1,
+                        ttl_seconds: None,
+                        spec: DesiredRouteSpec {
+                            endpoint_id: endpoint_id.to_string(),
+                            prefixes: vec![prefix.into()],
+                        },
+                    }],
+                    dry_run: false,
+                    idempotency_key: "config-route-sources-test".into(),
+                },
+                100,
+            )
+            .unwrap()
+            .state
+    }
+
+    fn contains_route(config: &Config, prefix: &str, endpoint_id: EndpointId) -> bool {
+        let prefix = prefix.parse::<IpNet>().unwrap();
+        config
+            .route_origins
+            .iter()
+            .any(|origin| origin.endpoint_id == endpoint_id && origin.prefixes.contains(&prefix))
+    }
 
     #[test]
     fn minimal_v2_config_uses_automatic_dataplane_defaults() {
@@ -1886,5 +1889,58 @@ forbidden_underlay_prefixes = ["200::/7"]
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[tokio::test]
+    async fn config_load_variants_keep_their_route_candidate_contracts() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_file = directory.path().join("identity.key");
+        let config_path = directory.path().join("config.toml");
+        let raw = format!(
+            "network_id = \"route-sources\"\nidentity_file = \"{}\"\n",
+            identity_file.display()
+        );
+        std::fs::write(&config_path, &raw).unwrap();
+        std::fs::write(
+            config_digest_path(&config_path),
+            blake3::hash(raw.as_bytes()).to_hex().to_string(),
+        )
+        .unwrap();
+
+        let disk_operator = id(20);
+        let extension_owner = id(21);
+        let candidate_operator = id(22);
+        crate::routes::RouteRegistry::parse_lines(&format!("{disk_operator} 10.20.0.0/24\n"))
+            .unwrap()
+            .write(&crate::routes::registry_path(&identity_file))
+            .unwrap();
+        extension_state(extension_owner, "10.21.0.0/24")
+            .write(&crate::extensions::state_path(&identity_file))
+            .unwrap();
+
+        let unsealed = Config::load_unsealed(&config_path).await.unwrap();
+        assert!(contains_route(&unsealed, "10.20.0.0/24", disk_operator));
+        assert!(contains_route(&unsealed, "10.21.0.0/24", extension_owner));
+
+        let sealed = Config::load(&config_path).await.unwrap();
+        assert!(contains_route(&sealed, "10.20.0.0/24", disk_operator));
+        assert!(contains_route(&sealed, "10.21.0.0/24", extension_owner));
+
+        let candidate = Config::load_with_route_origins(
+            &config_path,
+            vec![RouteOriginConfig {
+                endpoint_id: candidate_operator,
+                prefixes: vec!["10.22.0.0/24".parse().unwrap()],
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(contains_route(
+            &candidate,
+            "10.22.0.0/24",
+            candidate_operator
+        ));
+        assert!(contains_route(&candidate, "10.21.0.0/24", extension_owner));
+        assert!(!contains_route(&candidate, "10.20.0.0/24", disk_operator));
     }
 }

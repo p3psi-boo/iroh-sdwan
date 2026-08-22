@@ -58,7 +58,9 @@ nix develop -c scripts/build-policy-guest.sh --check
 
 脚本将 `ironet.manifest.v1` custom section 嵌入 component，生成未签名的
 `crates/ironet-policy-builtin/builtin.wasm` 以及
-`builtin.wasm.blake3`。部署前用宿主 CLI 把 manifest 保留在包中并签名：
+`builtin.wasm.blake3`。该 builtin 文件是与 daemon in-process core bit-exact
+的 guest fixture，也是可分发外部组件模板；daemon 默认不加载它。需要显式部署
+为外部 `.wasm` 时，用宿主 CLI 把 manifest 保留在包中并签名：
 
 ```bash
 ironet policy sign --key SIGNING_KEY \

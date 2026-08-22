@@ -43,9 +43,8 @@ use ironet_policy_core::{
 };
 
 use super::{
-    learner::{ContextKeyV2, LearnerModeV2, LearnerTraceV2, policy_spec_from_artifact},
+    learner::{ContextKeyV2, LearnerModeV2, LearnerTraceV2, policy_utility_weights},
     policy::{
-        PolicyArtifactV2,
         api::{
             Bbr3PresetV1, CandidateActionV1, ClampEntryV1, ClampFieldV1, ClampReasonV1,
             ClampReportV1, EffectiveActionV1, EffectiveHostExt, EgressAllocationViewV1,
@@ -55,6 +54,7 @@ use super::{
             PolicyIdentityV1, PolicyInputV1, PolicyLabelV1, PolicyOutputV1, PolicyTelemetryV1,
             TelemetryHostExt, UtilityHostExt,
         },
+        canonical_spec_digest,
         egress::EGRESS_ASSIGNMENT_FLOOR_BYTES_PER_SECOND,
         guardrails::GuardrailsV1,
         state::NATIVE_MODULE_DIGEST,
@@ -220,15 +220,15 @@ impl PolicyBackend for CorePolicyBackendV1 {
 /// Policy id of the host-native conservative rules backend.
 pub const NATIVE_RULES_POLICY_ID_V1: &str = "native-conservative@1";
 
-/// The `native` policy selection: host-side conservative rules with no
-/// learner (plan Phase 6: the bandit learner lives exclusively in
-/// `ironet-policy-core` and runs as `builtin.wasm`).
+/// The explicit `native` policy selection: host-side conservative rules with
+/// no learner.
 ///
 /// It proposes nothing: the empty overlay leaves the tick's host baseline —
 /// the reactive `NativePolicyV1` rules that already ran through the
 /// guardrails — as the effective action. It is stateless and never faults,
-/// which makes it the dependency-free fallback when the WASM engine is
-/// unavailable or a configured policy cannot be loaded.
+/// which makes it the dependency-free baseline for an explicit `native`
+/// selection and for a genuinely faulted/quarantined slot.  Rejected external
+/// components instead fall back to the native-core `builtin` policy.
 #[derive(Debug)]
 pub struct NativeRulesBackendV1 {
     identity: PolicyIdentityV1,
@@ -868,20 +868,19 @@ pub struct ShadowEvaluatorV2 {
 }
 
 impl ShadowEvaluatorV2 {
-    /// Shadow-evaluate a JSON policy artifact through the native core
-    /// backend (learner in shadow mode, as before).
-    pub fn new(policy: PolicyArtifactV2, objective: Objective, seed: u64) -> Self {
-        let slot = PolicySlotV1::core(
-            policy_spec_from_artifact(&policy),
-            LearnerModeV2::Shadow,
-            policy.digest.clone(),
-        );
+    /// Shadow-evaluate a canonical policy spec through the native core
+    /// backend. This is tooling/test support; production shadow policies use
+    /// their loaded WASM backend directly.
+    pub fn new(policy: PolicySpecV1, objective: Objective, seed: u64) -> Self {
+        let digest = canonical_spec_digest(&policy)
+            .expect("canonical policy spec passed to a shadow evaluator must validate");
+        let slot = PolicySlotV1::core(policy.clone(), LearnerModeV2::Shadow, digest.clone());
         let mut evaluator = Self::from_slot(
             slot,
-            policy.utility_weights(objective),
+            policy_utility_weights(&policy, objective),
             objective,
             policy.id.clone(),
-            policy.digest.clone(),
+            digest,
         );
         evaluator.seed_override = Some(seed);
         evaluator
@@ -948,19 +947,21 @@ impl ShadowEvaluatorV2 {
         }
     }
 
-    /// Hot-switch to another JSON artifact (state per plan section 8.2).
-    pub fn replace_policy(&mut self, policy: PolicyArtifactV2, objective: Objective) {
-        if policy.digest == self.digest {
+    /// Hot-switch to another canonical policy spec (state per plan section
+    /// 8.2). The spec digest is derived from its canonical JSON bytes.
+    pub fn replace_policy(&mut self, policy: PolicySpecV1, objective: Objective) {
+        let digest = canonical_spec_digest(&policy)
+            .expect("canonical policy spec passed to a shadow evaluator must validate");
+        if digest == self.digest {
             return;
         }
-        let (backend, probe) =
-            CorePolicyBackendV1::boxed(policy_spec_from_artifact(&policy), LearnerModeV2::Shadow);
-        self.slot
-            .replace(backend, Some(probe), policy.digest.clone(), &[]);
-        self.utility.set_weights(policy.utility_weights(objective));
+        let (backend, probe) = CorePolicyBackendV1::boxed(policy.clone(), LearnerModeV2::Shadow);
+        self.slot.replace(backend, Some(probe), digest.clone(), &[]);
+        self.utility
+            .set_weights(policy_utility_weights(&policy, objective));
         self.objective = objective;
         self.policy_id = policy.id;
-        self.digest = policy.digest;
+        self.digest = digest;
     }
 
     /// Hot-switch to another backend slot.
@@ -1332,28 +1333,27 @@ impl PolicyTickV1 {
     }
 }
 
-/// Resolve `autotune.policy` into a live backend slot plus the utility
-/// weights of the artifact it came from.
+/// Build an in-process core slot from a validated canonical spec.
 ///
-/// Phase 1: `native`, `builtin` and a JSON path all run the core learner
-/// natively. `native` uses `PolicySpecV1::builtin()` and records
-/// [`NATIVE_MODULE_DIGEST`]; the others record the artifact digest. A
-/// `.wasm` path is not loadable yet and is reported as an error by the
-/// caller (which falls back to `builtin`).
-pub fn core_slot_from_artifact(
-    artifact: &PolicyArtifactV2,
-    mode: LearnerModeV2,
-    native: bool,
-) -> PolicySlotV1 {
-    if native {
-        PolicySlotV1::core(PolicySpecV1::builtin(), mode, NATIVE_MODULE_DIGEST)
-    } else {
-        PolicySlotV1::core(
-            policy_spec_from_artifact(artifact),
-            mode,
-            artifact.digest.clone(),
-        )
-    }
+/// Its `module_digest` identifies the canonical [`PolicySpecV1`], not a
+/// WASM package.  The explicit `native` rules slot is constructed separately
+/// with [`PolicySlotV1::native_rules`].
+pub fn core_slot_from_spec(spec: &PolicySpecV1, mode: LearnerModeV2) -> PolicySlotV1 {
+    let digest = canonical_spec_digest(spec)
+        .expect("canonical policy spec passed to a core slot must validate");
+    PolicySlotV1::core(spec.clone(), mode, digest)
+}
+
+/// Build the default `builtin` policy slot without creating a WASM engine.
+///
+/// The backend reports `backend=native` because it is the in-process
+/// [`CorePolicyBackendV1`], while its id, version, state schema and digest
+/// remain those of `PolicySpecV1::builtin()`.
+pub fn builtin_core_slot(mode: LearnerModeV2) -> PolicySlotV1 {
+    let spec = PolicySpecV1::builtin();
+    let digest =
+        canonical_spec_digest(&spec).expect("embedded builtin PolicySpecV1 must always validate");
+    PolicySlotV1::core(spec, mode, digest)
 }
 
 #[cfg(test)]
@@ -1365,7 +1365,7 @@ mod tests {
     use super::*;
     use crate::protocol::v2::{
         learner::LearnerMemoryV2,
-        policy::{api::PolicyDecisionKindV1, builtin},
+        policy::{api::PolicyDecisionKindV1, canonical_spec_digest},
         replay::{ReplayGoldenV2, ReplayTapSampleV2, decision_golden, memory_golden},
         tuning::{AutoTuneBoundsV2, tests_fixture},
     };
@@ -1375,16 +1375,31 @@ mod tests {
     }
 
     fn builtin_tick(mode: LearnerModeV2, seed: Option<u64>) -> PolicyTickV1 {
-        let policy = builtin().unwrap();
-        let slot = core_slot_from_artifact(&policy, mode, false);
+        let policy = PolicySpecV1::builtin();
+        let slot = core_slot_from_spec(&policy, mode);
         let mut config = PolicyTickConfigV1::new(Objective::Balanced, mode);
         config.seed_override = seed;
         PolicyTickV1::new(
             AutoTunerV2::new(AutoTuneBoundsV2::default(), 1),
             slot,
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             config,
         )
+    }
+
+    #[test]
+    fn builtin_core_slot_is_native_and_canonically_identified() {
+        let spec = PolicySpecV1::builtin();
+        let digest = canonical_spec_digest(&spec).unwrap();
+        let slot = builtin_core_slot(LearnerModeV2::Shadow);
+        let status = slot.status();
+
+        assert_eq!(status.backend, "native");
+        assert_eq!(status.policy_id, spec.id);
+        assert_eq!(status.policy_version, spec.version);
+        assert_eq!(status.state_schema, ironet_policy_core::STATE_SCHEMA_V1);
+        assert_eq!(status.module_digest, digest);
+        assert!(status.signer_id.is_empty());
     }
 
     /// The pipeline reproduces `tests/fixtures/autotune-golden-v1.json`
@@ -1405,8 +1420,7 @@ mod tests {
         assert_eq!(golden.learner_mode, "shadow");
         assert_eq!(golden.objective, "balanced");
         let seed = golden.seed;
-        let policy = builtin().unwrap();
-        assert_eq!(golden.policy_digest, policy.digest);
+        let policy = PolicySpecV1::builtin();
 
         let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(seed));
         tick.set_shadow(Some(ShadowEvaluatorV2::new(
@@ -1502,15 +1516,15 @@ mod tests {
         // evaluates arms; every effective action must equal what the
         // guardrails make of the candidate over the baseline, and the node
         // egress cap must bind the pacing cap.
-        let policy = builtin().unwrap();
-        let slot = core_slot_from_artifact(&policy, LearnerModeV2::On, false);
+        let policy = PolicySpecV1::builtin();
+        let slot = core_slot_from_spec(&policy, LearnerModeV2::On);
         let mut config = PolicyTickConfigV1::new(Objective::Balanced, LearnerModeV2::On);
         config.seed_override = Some(3);
         config.max_egress_bytes_per_second = Some(5_000_000);
         let mut tick = PolicyTickV1::new(
             AutoTunerV2::new(AutoTuneBoundsV2::default(), 1),
             slot,
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             config,
         );
         let start = Instant::now();
@@ -1544,15 +1558,15 @@ mod tests {
         // Plan section 9.1 merge: the coordinator-assigned rate clamps the
         // effective pacing cap below the static node cap, reported as an
         // EgressArbitration clamp entry.
-        let policy = builtin().unwrap();
-        let slot = core_slot_from_artifact(&policy, LearnerModeV2::On, false);
+        let policy = PolicySpecV1::builtin();
+        let slot = core_slot_from_spec(&policy, LearnerModeV2::On);
         let mut config = PolicyTickConfigV1::new(Objective::Balanced, LearnerModeV2::On);
         config.seed_override = Some(3);
         config.max_egress_bytes_per_second = Some(5_000_000);
         let mut tick = PolicyTickV1::new(
             AutoTunerV2::new(AutoTuneBoundsV2::default(), 1),
             slot,
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             config,
         );
         tick.set_egress_view(EgressAllocationViewV1 {
@@ -1594,7 +1608,7 @@ mod tests {
 
     #[test]
     fn shadow_counterfactual_is_the_proposed_arm_and_never_the_live_decision() {
-        let mut policy = builtin().unwrap();
+        let mut policy = PolicySpecV1::builtin();
         let t = telemetry();
         let context = ContextKeyV2::classify_with(&t, &policy.contexts);
         policy.priors.insert(
@@ -1611,13 +1625,12 @@ mod tests {
             ),
             std::collections::BTreeMap::from([(
                 "private-aggressive".to_owned(),
-                crate::protocol::v2::policy::PosteriorSpecV2 {
+                ironet_policy_core::PosteriorSpecV1 {
                     observations: 100,
                     mean: 100.0,
                 },
             )]),
         );
-        policy.digest = policy.calculated_digest().unwrap();
         let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(1));
         tick.set_shadow(Some(ShadowEvaluatorV2::new(
             policy,
@@ -1780,7 +1793,7 @@ mod tests {
 
     #[test]
     fn hot_switch_keeps_state_only_for_the_same_policy_id_and_schema() {
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(1));
         let start = Instant::now();
         tick.run(telemetry(), &WireCostV2::default(), start);
@@ -1790,14 +1803,12 @@ mod tests {
         // Same id + schema, different digest: state continues.
         let mut same = policy.clone();
         same.priors.clear();
-        same.digest = same.calculated_digest().unwrap();
-        let (backend, probe) =
-            CorePolicyBackendV1::boxed(policy_spec_from_artifact(&same), LearnerModeV2::Shadow);
+        let (backend, probe) = CorePolicyBackendV1::boxed(same.clone(), LearnerModeV2::Shadow);
         assert!(tick.replace_live(
             backend,
             Some(probe),
-            same.digest.clone(),
-            same.utility_weights(Objective::Balanced),
+            canonical_spec_digest(&same).unwrap(),
+            policy_utility_weights(&same, Objective::Balanced),
             &[]
         ));
         assert_eq!(tick.live().state(), state.as_slice());
@@ -1806,14 +1817,12 @@ mod tests {
         // Different id: empty state.
         let mut other = policy;
         other.id = "bandit-vivace@2".to_owned();
-        other.digest = other.calculated_digest().unwrap();
-        let (backend, probe) =
-            CorePolicyBackendV1::boxed(policy_spec_from_artifact(&other), LearnerModeV2::Shadow);
+        let (backend, probe) = CorePolicyBackendV1::boxed(other.clone(), LearnerModeV2::Shadow);
         assert!(!tick.replace_live(
             backend,
             Some(probe),
-            other.digest.clone(),
-            other.utility_weights(Objective::Balanced),
+            canonical_spec_digest(&other).unwrap(),
+            policy_utility_weights(&other, Objective::Balanced),
             &[]
         ));
         assert!(tick.live().state().is_empty());
@@ -1832,19 +1841,19 @@ mod tests {
         // A candidate that survived shadow warmup is promoted by moving its
         // backend into the live slot unchanged; the warmup state is discarded
         // and the section 8.2 rules decide which live state survives.
-        let policy = builtin().unwrap();
+        let policy = PolicySpecV1::builtin();
         let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(1));
         let start = Instant::now();
         tick.run(telemetry(), &WireCostV2::default(), start);
         assert!(!tick.live().state().is_empty());
 
-        let slot = core_slot_from_artifact(&policy, LearnerModeV2::Shadow, false);
+        let slot = core_slot_from_spec(&policy, LearnerModeV2::Shadow);
         let mut warmup = ShadowEvaluatorV2::from_slot(
             slot,
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             Objective::Balanced,
             policy.id.clone(),
-            policy.digest.clone(),
+            canonical_spec_digest(&policy).unwrap(),
         );
         let baseline = tick
             .run(telemetry(), &WireCostV2::default(), start)
@@ -1860,19 +1869,22 @@ mod tests {
         assert_eq!(evaluation.fault, None);
 
         let (backend, probe, digest) = warmup.into_slot().into_backend();
-        assert_eq!(digest, policy.digest);
+        assert_eq!(digest, canonical_spec_digest(&policy).unwrap());
         let kept = tick.replace_live(
             backend,
             probe,
             digest,
-            policy.utility_weights(Objective::Balanced),
+            policy_utility_weights(&policy, Objective::Balanced),
             &[],
         );
         // Same policy_id + schema: the live state is kept, and the promoted
         // backend is the warmed-up instance (module generation advanced).
         assert!(kept);
         assert_eq!(tick.live().state(), live_state.as_slice());
-        assert_eq!(tick.live().module_digest(), policy.digest);
+        assert_eq!(
+            tick.live().module_digest(),
+            canonical_spec_digest(&policy).unwrap()
+        );
         assert_eq!(tick.live().identity().module_generation, 1);
         let outcome = tick.run(
             telemetry(),

@@ -102,7 +102,7 @@ sudo ironet reload
 在守护进程运行时会自动 reload；`--dry-run` 可预览，维护窗口可加 `--defer`
 延后应用。
 
-`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。`metrics` 从同一份实时 V2 snapshot 输出 `ironet_v2_*` Prometheus 文本指标。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。`tui` 是交互式运维台，`Tab` 可切换 Peer、Routes、Diagnostics 三个视图：查看实时链路，在 Routes 中按 `a` 接受或按两次 `x` 移除持久路由，在 Diagnostics 中直接对所选节点执行 ping/trace；任意视图按两次 `R` 可校验并 reload 守护进程。原 `top` 命令保留为兼容别名。
+`status`、`peers`、`ping` 与 `trace` 支持 `--output human|json|jsonl`（`status` 也保留 `--json`）。`metrics` 从同一份实时 V2 snapshot 输出 `ironet_v2_*` Prometheus 文本指标。Human 输出会按量级展示时间、字节数和速率（例如 `1m30s`、`1.5MB/s`、`1.5Mbit/s`）；JSON/JSONL 始终保留原始基础单位，适合脚本处理。0.1 的 Peer status JSON 将计数归入 `traffic`，策略归入 `policy.live` 与可空的 `policy.shadow`，例如 `.peers[0].traffic.tx_bytes` 与 `.peers[0].policy.live.policy_id`。`tui` 是交互式运维台，`Tab` 可切换 Peer、Routes、Diagnostics 三个视图：查看实时链路，在 Routes 中按 `a` 接受或按两次 `x` 移除持久路由，在 Diagnostics 中直接对所选节点执行 ping/trace；任意视图按两次 `R` 可校验并 reload 守护进程。原 `top` 命令保留为兼容别名。
 
 服务、监控、配置更新、备份与排障命令见 [运行与运维](docs/运行与运维.md)。
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "policy_id": "bandit-vivace@1",
-  "policy_digest": "557c102ccc0b85a1b3c749912ca6c5568b51abfe12543728a0f37db8ab36b7c3",
+  "policy_digest": "5815f7e50fe161a94643b56cd4067e288cd7aa4e120c836844279bd6e410a036",
   "objective": "balanced",
   "seed": 7,
   "samples": 8,

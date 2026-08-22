@@ -1195,6 +1195,22 @@ impl Bbr3 {
     fn set_pacing_rate_with_gain(&mut self, gain: f64) {
         let mut rate = gain * self.bw * (100.0 - self.pacing_margin_percent) / 100.0
             * self.policer_pacing_scale;
+        // A runtime cwnd floor represents host-authoritative evidence that
+        // the delivery-rate model is trapped below a queued flow's usable
+        // BDP.  Raising only cwnd cannot escape that trap because the pacer
+        // continues feeding the old low bandwidth estimate.  Keep the two
+        // controls coherent by pacing at least one gain-adjusted floor BDP
+        // per minimum RTT; the explicit pacing cap remains authoritative.
+        if self.params.cwnd_floor_bytes > 0
+            && !self.min_rtt.is_zero()
+            && self.min_rtt != Duration::from_secs(u64::MAX)
+        {
+            let floor_rate = self.params.cwnd_floor_bytes as f64
+                / self.cwnd_gain.max(1.0)
+                / self.min_rtt.as_secs_f64()
+                * self.policer_pacing_scale;
+            rate = rate.max(floor_rate);
+        }
         if self.params.pacing_rate_cap_bytes_per_second > 0 {
             rate = rate.min(self.params.pacing_rate_cap_bytes_per_second as f64);
         }
@@ -2727,6 +2743,21 @@ mod test {
         bbr3.cwnd = 100_000;
         bbr3.set_cwnd();
         assert_eq!(bbr3.cwnd, 24_000);
+    }
+
+    #[test]
+    fn runtime_cwnd_floor_also_unsticks_a_low_pacing_model() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.params.cwnd_floor_bytes = 200_000;
+        bbr3.min_rtt = Duration::from_millis(20);
+        bbr3.cwnd_gain = 2.0;
+        bbr3.full_bw_reached = true;
+        bbr3.bw = 100_000.0;
+        bbr3.pacing_rate = 100_000.0;
+
+        bbr3.set_pacing_rate_with_gain(1.0);
+
+        assert_eq!(bbr3.pacing_rate, 5_000_000.0);
     }
 
     #[test]

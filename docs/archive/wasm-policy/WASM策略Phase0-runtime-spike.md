@@ -1,10 +1,9 @@
-# WASM 策略 Phase 0：Wasmtime runtime spike 报告
+# WASM 策略 Phase 0：Wasmtime runtime spike 报告（历史）
 
-> 对应《WASM策略模块化实施计划》Phase 0 "用 Pulley 与 Cranelift 两种 Wasmtime 配置各做一次 spike" 一项。
-> 日期：2026-08-21。执行机：NixOS（Linux 6.18.43，16 核，23 GiB 内存），Rust 1.91.0（flake devShell）。
-> spike 全部源码与原始测量输出保留在
-> `/tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/`
-> （目录结构见第 10 节）。本报告是本次 spike 唯一写入仓库的文件。
+> **归档状态（2026-08-22）**：本报告记录 Rust 1.91 / Wasmtime 43 的一次选型测量。当前仓库已使用 Rust 1.98 / Wasmtime 48；现行运行时契约见[策略运行时架构](../../策略运行时架构.md)。
+> 对应[WASM 策略模块化实施计划](WASM策略模块化实施计划.md)的 Phase 0 “用 Pulley 与 Cranelift 两种 Wasmtime 配置各做一次 spike”。
+> 日期：2026-08-21。执行机：NixOS（Linux 6.18.43，16 核，23 GiB 内存），Rust 1.91.0（独立 flake devShell）。
+> 可复现源码保留在 [`tools/phase0-spike`](../../../tools/phase0-spike/README.md)。生成的二进制、`.cwasm`、构建日志和原始文本输出已从仓库移除；按第 10 节命令可重新生成到本地忽略目录。
 
 ## 1. 环境与工具链可用性
 
@@ -16,9 +15,9 @@
 | `rustc --print target-list \| grep wasm32` | 列出 `wasm32-unknown-unknown`、`wasm32-wasip1`、`wasm32-wasip2`、`wasm32v1-none` 等（编译器认识，但缺 std 库） |
 | `rustup target add` | 不可用（无 rustup）。替代方案：rust-overlay 的 `targets = [ "wasm32-unknown-unknown" ]`，验证可行（见下） |
 | `wasm-tools` / `wit-bindgen` / `wasm-opt` | 裸 shell 与 devShell 中均不存在 |
-| 通过 nixpkgs 获取 | 用 scratchpad 中的独立 flake（`phase0-spike/nix-wasm-shell/flake.nix`，复用仓库 `flake.lock` 的 nixpkgs/rust-overlay 锁定版本）加入 `pkgs.wasm-tools`、`pkgs.wit-bindgen` 并给 rust 加 `wasm32-unknown-unknown` target：**首次进入 27 s 完成**（从 cache.nixos.org 拉取 `wasm-tools 1.254.0`、`wit-bindgen-cli 0.60.0`，从 static.rust-lang.org 拉取 `rust-std-1.91.0-wasm32-unknown-unknown`） |
+| 通过 nixpkgs 获取 | 用仓库保留的独立 flake（`tools/phase0-spike/nix-wasm-shell/flake.nix`，含自身锁文件）加入 `pkgs.wasm-tools`、`pkgs.wit-bindgen` 并给 rust 加 `wasm32-unknown-unknown` target：**首次进入 27 s 完成**（从 cache.nixos.org 拉取 `wasm-tools 1.254.0`、`wit-bindgen-cli 0.60.0`，从 static.rust-lang.org 拉取 `rust-std-1.91.0-wasm32-unknown-unknown`） |
 | 其他工具 | `bc`、`file` 不在 devShell（测量脚本改用 GNU `time`）；`strip` 来自 binutils 2.46 |
-| 磁盘 | `/tmp` 是 2 GiB tmpfs，三个 Cranelift target 目录（每个 0.6–0.7 GiB）会把它写满，后半段构建把 `--target-dir` 放到 `/home/bubu/.cache/ironet-phase0-spike/`（构建完已删） |
+| 磁盘 | 原始测量机的临时文件系统容量不足以容纳三个 Cranelift target 目录；当前复现脚本将所有输出写入可配置的 `OUT` 目录 |
 
 仓库 `flake.nix` 未做任何修改；建议改法见第 8 节。
 
@@ -97,7 +96,7 @@ guest 侧：`wasm32-unknown-unknown` cdylib（`opt-level="s"`, lto fat, panic ab
 - guest：WIT world `decide: func(input: list<u8>) -> list<u8>`（`wit/policy.wit`），Rust 实现做 f64 EWMA + 8 个候选动作各 32 轮打分（纯计算，无 import、无 WASI、无分配热点），用 wit-bindgen 0.60 `generate!` + `wasm-tools component new` 打包成 component。
 - host：`wasmtime::component::bindgen!` 绑定，Engine 打开 `consume_fuel(true)`、`epoch_interruption(true)`（后台线程每 10 ms `increment_epoch`，每次调用 `set_epoch_deadline(2)`）、`StoreLimits`（memory 8 MiB、1 instance）、`max_wasm_stack(512 KiB)`、`memory_reservation(8 MiB)`、nan canonicalization on、relaxed-simd/simd/memory64/multi-memory/tail-call 全关。
 - 每次调用前 `set_fuel(1e9)`，调用后 `get_fuel()` 差值即 fuel 消耗；先 1 次首调 + 100 次预热，再计时 1000 次；实例化用 100 次全新 `Store` 计时。输入默认 1 KiB（64 个 (rtt, loss) f64 样本）。
-- 每个后端重复跑 4 次取区间。原始输出在 `phase0-spike/results/*.txt`。
+- 每个后端重复跑 4 次取区间。原始输出未保留；可用 `tools/phase0-spike/run.sh` 重新生成可比输出。
 
 ### 5.2 主表（输入 1 KiB，1000 次）
 
@@ -209,33 +208,29 @@ strip = true
 
 ## 10. spike 源码与复现
 
-根目录 `/tmp/claude-1000/-home-bubu-sdwan/fe40b113-ed0e-4412-8c20-485019d29277/scratchpad/phase0-spike/`：
+仓库目录 `tools/phase0-spike/`：
 
 ```text
-nix-wasm-shell/flake.nix, flake.lock   # 带 wasm32 target + wasm-tools + wit-bindgen 的 devShell（复用仓库 lock）
+nix-wasm-shell/flake.nix, flake.lock   # Rust 1.91 + wasm32 + wasm-tools 的历史复现 shell
 wit/policy.wit                         # world policy { export decide: func(input: list<u8>) -> list<u8>; }
 guest/                                 # wasm32-unknown-unknown cdylib，wit-bindgen generate!
 host/                                  # phase0-host：features pulley / cranelift；modes run | precompile | load
-baseline-empty/                        # 空 bin 基线
-build-hosts.sh, build-hosts-2.sh       # 冷构建 + strip + 体积记录脚本（日志 build-hosts*.log）
-bin/                                   # 六个宿主二进制（stripped/unstripped, 两种 profile）
-bin-guest-component.wasm               # guest component（11,486 B）
-results/                               # run-native / run-pulley64 / load-* / precompile-* / input-scaling 原始输出，guest-*.cwasm
+run.sh                                 # 构建 guest、运行 JIT/Pulley/AOT 组合并写入 OUT
+out/                                   # 本地生成目录，受 .gitignore 保护
 ```
 
 复现要点：
 
 ```sh
-nix develop path:$SPIKE/nix-wasm-shell           # guest 构建 + wasm-tools
-(cd guest && cargo build --release && wasm-tools component new target/wasm32-unknown-unknown/release/phase0_guest.wasm -o ../bin-guest-component.wasm)
-nix develop /home/bubu/sdwan                      # 宿主构建（Rust 1.91 devShell）
-(cd host && cargo build --release --no-default-features --features cranelift,pulley)
-host run bin-guest-component.wasm                          # Cranelift JIT
-host run bin-guest-component.wasm --target pulley64        # Pulley，进程内编译
-host precompile bin-guest-component.wasm g.cwasm --target pulley64
-(cd host && cargo build --release --no-default-features --features pulley)
-host load g.cwasm --target pulley64                        # 无编译器宿主 AOT 加载
+# 从仓库根目录运行；输出默认写到 tools/phase0-spike/out/
+nix develop ./tools/phase0-spike/nix-wasm-shell -c ./tools/phase0-spike/run.sh
+
+# 或将生成的 target、component、.cwasm 与文本输出置于其他位置
+OUT=/var/tmp/ironet-phase0 \
+  nix develop ./tools/phase0-spike/nix-wasm-shell -c ./tools/phase0-spike/run.sh
 ```
+
+脚本使用该目录的锁文件和 `--locked` Cargo 构建；它重新生成的是可比的本地测量，不试图复现当日机器负载、内核、缓存或精确的微秒数。
 
 ## 11. 阻塞与注意事项
 

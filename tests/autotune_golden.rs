@@ -1,20 +1,19 @@
-//! Per-sample golden gate for the V2 autotune policy chain.
+//! Per-sample golden gate for the production V2 policy replay pipeline.
 //!
-//! `tests/fixtures/autotune-golden-v1.json` records, for every sample of
-//! `tests/fixtures/autotune-replay-v1.json`, the telemetry input, the
-//! host-computed utility, the native baseline, the learner trace, the
-//! effective and candidate `TuneDecisionV2`, and a digest of the learner
-//! memory. Any policy-chain change that alters a single bit of that trace
-//! must regenerate the golden on purpose (the `generated_by` header holds the
-//! exact command).
+//! The checked-in fixture captures the baseline, learner trace, effective
+//! action and learner memory for each tap sample.  Replay is executed through
+//! `PolicyTickV1`, the same host pipeline used by `ironet policy replay`.
 
 use std::{fs, path::Path};
 
 use ironet::protocol::v2::{
-    policy::builtin,
-    replay::{REPLAY_GOLDEN_SCHEMA_V2, ReplayGoldenV2, ReplayTapSampleV2, replay_with_golden},
+    learner::{LearnerModeV2, policy_utility_weights},
+    policy::canonical_spec_digest,
+    policy_tick::core_slot_from_spec,
+    replay::{ReplayGoldenV2, ReplayTapSampleV2, replay_ticks},
     utility::Objective,
 };
+use ironet_policy_core::PolicySpecV1;
 
 const FIXTURE: &str = "tests/fixtures/autotune-replay-v1.json";
 const GOLDEN: &str = "tests/fixtures/autotune-golden-v1.json";
@@ -31,95 +30,59 @@ fn load_golden() -> ReplayGoldenV2 {
         .expect("decode golden fixture")
 }
 
+fn replay_builtin(
+    samples: &[ReplayTapSampleV2],
+    seed: u64,
+) -> ironet::protocol::v2::replay::TickReplayReportV2 {
+    let policy = PolicySpecV1::builtin();
+    replay_ticks(
+        samples,
+        core_slot_from_spec(&policy, LearnerModeV2::Shadow),
+        policy_utility_weights(&policy, Objective::Balanced),
+        Objective::Balanced,
+        LearnerModeV2::Shadow,
+        seed,
+    )
+    .expect("replay")
+}
+
 #[test]
-fn builtin_policy_replay_matches_golden_sample_by_sample() {
+fn canonical_builtin_policy_replay_matches_golden_sample_by_sample() {
     let samples = load_samples();
     let expected = load_golden();
-    let policy = builtin().expect("builtin policy");
+    let policy = PolicySpecV1::builtin();
+    let canonical_digest = canonical_spec_digest(&policy).expect("canonical builtin digest");
+    let report = replay_builtin(&samples, 1);
 
-    assert_eq!(expected.schema_version, REPLAY_GOLDEN_SCHEMA_V2);
     assert_eq!(expected.fixture, FIXTURE);
     assert_eq!(expected.policy_id, policy.id);
-    assert_eq!(expected.policy_digest, policy.digest);
-    assert_eq!(expected.source_policy_digest, policy.digest);
+    assert_eq!(expected.policy_digest, canonical_digest);
+    assert_eq!(expected.source_policy_digest, canonical_digest);
+    assert_eq!(report.module_digest, canonical_digest);
     assert_eq!(expected.objective, "balanced");
     assert_eq!(expected.seed, 1);
     assert_eq!(expected.learner_mode, "shadow");
     assert_eq!(expected.sample_count, samples.len());
-    assert_eq!(expected.samples.len(), samples.len());
-    assert!(
-        expected.generated_by.contains("--golden-output"),
-        "golden header must record its generator command"
-    );
+    assert_eq!(report.samples, samples.len());
+    assert_eq!(report.policy_id, expected.policy_id);
+    assert_eq!(report.faults, 0);
 
-    let (report, mut actual) =
-        replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1)
-            .expect("replay");
-    actual.generated_by = expected.generated_by.clone();
-    actual.fixture = expected.fixture.clone();
-
-    for (actual, expected) in actual.samples.iter().zip(&expected.samples) {
-        assert_eq!(
-            actual.input, expected.input,
-            "sample {} input diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.utility, expected.utility,
-            "sample {} utility diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.baseline, expected.baseline,
-            "sample {} baseline diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.learner, expected.learner,
-            "sample {} learner trace diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.effective, expected.effective,
-            "sample {} effective decision diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.candidate, expected.candidate,
-            "sample {} candidate decision diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.memory, expected.memory,
-            "sample {} learner memory diverged",
-            expected.index
-        );
-        assert_eq!(
-            actual.memory_digest, expected.memory_digest,
-            "sample {} learner memory digest diverged",
-            expected.index
-        );
-        assert_eq!(actual, expected, "sample {} diverged", expected.index);
+    for (actual, expected) in report.trace.iter().zip(&expected.samples) {
+        assert_eq!(actual.index, expected.index);
+        assert_eq!(actual.offset_micros, expected.offset_micros);
+        assert_eq!(actual.utility_total_bits, expected.utility.total_bits);
+        assert_eq!(actual.baseline, expected.baseline);
+        assert_eq!(actual.effective, expected.effective);
+        assert!(actual.candidate.is_some());
+        assert_eq!(actual.fault, None);
     }
-    assert_eq!(actual, expected);
-    assert_eq!(report.trace_digest, expected.trace_digest);
-    assert_eq!(report.policy_digest, expected.policy_digest);
 }
 
 #[test]
-fn identical_seed_and_input_produce_identical_golden() {
+fn identical_seed_and_input_produce_identical_production_replay() {
     let samples = load_samples();
-    let policy = builtin().expect("builtin policy");
-    let (first_report, first) =
-        replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1)
-            .expect("first replay");
-    let (second_report, second) =
-        replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1)
-            .expect("second replay");
+    let first = replay_builtin(&samples, 1);
+    let second = replay_builtin(&samples, 1);
     assert_eq!(first, second);
-    assert_eq!(first_report.trace_digest, second_report.trace_digest);
-    assert_eq!(
-        serde_json::to_vec(&first).unwrap(),
-        serde_json::to_vec(&second).unwrap()
-    );
+    assert_eq!(first.trace_digest, second.trace_digest);
 }

@@ -7,13 +7,14 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use ironet::protocol::v2::{
-    learner::{ContextKeyV2, preset_is_eligible},
-    policy::{PolicyArtifactV2, load},
+    learner::{ContextKeyV2, ensure_policy_objective, preset_is_eligible},
+    policy::{canonical_spec_digest, load_canonical_spec},
     policy_train::{OracleActionV2, context_name, oracle_action_matches_preset},
     promotion::{HoldoutMeasurementV2, PromotionThresholdsV2, evaluate_promotion},
     tuning::Bbr3PresetV2,
     utility::Objective,
 };
+use ironet_policy_core::PolicySpecV1;
 use serde::Deserialize;
 
 #[derive(Debug, Parser)]
@@ -115,18 +116,18 @@ fn main() -> Result<()> {
     ] {
         ensure!(value <= 1_000, "{name} must be in 0..=1000 per mille");
     }
-    let policy = load(&args.policy)?;
+    let policy = load_canonical_spec(&args.policy)?;
     let preset = Bbr3PresetV2::from(args.preset);
     let preset_name = policy
         .presets
         .iter()
-        .find(|candidate| candidate.proposal.preset == preset)
+        .find(|candidate| candidate.proposal.preset == preset.into())
         .map(|candidate| candidate.name.clone())
         .context("policy does not contain requested preset")?;
     let measurements = load_measurements(&args.holdout, &policy, preset, &preset_name)?;
     let report = evaluate_promotion(
         policy.id.clone(),
-        policy.digest.clone(),
+        canonical_spec_digest(&policy)?,
         preset_name,
         PromotionThresholdsV2 {
             minimum_utility_delta: args.minimum_utility_delta,
@@ -160,7 +161,7 @@ fn main() -> Result<()> {
 
 fn load_measurements(
     paths: &[PathBuf],
-    policy: &PolicyArtifactV2,
+    policy: &PolicySpecV1,
     preset: Bbr3PresetV2,
     preset_name: &str,
 ) -> Result<Vec<HoldoutMeasurementV2>> {
@@ -187,12 +188,7 @@ fn load_measurements(
             "holdouts mix autotune objectives"
         );
         measured_objective = Some(oracle_objective);
-        ensure!(
-            policy.objective == Some(oracle_objective),
-            "policy objective {:?} does not match holdout objective {:?}",
-            policy.objective,
-            oracle_objective
-        );
+        ensure_policy_objective(policy, oracle_objective)?;
         for (scenario, value) in oracle.scenarios {
             let candidates: Vec<CandidateV1> = serde_json::from_value(
                 value
@@ -302,7 +298,7 @@ fn read_summary(output: &Path) -> Result<SummaryV2> {
 
 fn context_coverage(
     summary: &serde_json::Value,
-    policy: &PolicyArtifactV2,
+    policy: &PolicySpecV1,
     preset: Bbr3PresetV2,
     preset_name: &str,
 ) -> Result<u16> {

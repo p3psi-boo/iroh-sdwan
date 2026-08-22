@@ -351,9 +351,10 @@ import sys
 for name in sys.argv[1:]:
     status = json.loads(pathlib.Path(name).read_text())
     for peer in status.get("peers", []):
-        if peer.get("packet_train_queue_bytes", 0) != 0:
+        traffic = peer.get("traffic") or {}
+        if traffic.get("packet_train_queue_bytes", 0) != 0:
             raise SystemExit(1)
-        if peer.get("latency_queue_bytes", 0) != 0:
+        if traffic.get("latency_queue_bytes", 0) != 0:
             raise SystemExit(1)
 PY
 }
@@ -733,8 +734,8 @@ def lost_samples(side):
 def final_class_queues(side):
     data = json.loads((out / f"{side}-final-status.json").read_text())
     peers = data.get("peers", [])
-    train = sum(int(peer.get("packet_train_queue_bytes", 0)) for peer in peers)
-    latency = sum(int(peer.get("latency_queue_bytes", 0)) for peer in peers)
+    train = sum(int((peer.get("traffic") or {}).get("packet_train_queue_bytes", 0)) for peer in peers)
+    latency = sum(int((peer.get("traffic") or {}).get("latency_queue_bytes", 0)) for peer in peers)
     return {
         "peers": len(peers),
         "packet_train_queue_bytes": train,

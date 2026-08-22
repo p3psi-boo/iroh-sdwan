@@ -50,11 +50,12 @@ nat_enabled = true
 # objective = "balanced"  # balanced | throughput | latency
 # memory = true
 # policy = "builtin"      # native | builtin | absolute .wasm path
-#                         #   native  = host conservative fallback (no learner)
-#                         #   builtin = builtin.wasm embedded in this binary,
-#                         #             executed by the WASM runtime (default)
-#                         #   path    = external signed .wasm component;
-#                         #             external JSON artifacts were removed
+#                         #   native  = explicit host conservative rules (no learner)
+#                         #   builtin = default in-process CorePolicy; no Wasmtime
+#                         #   path    = external signed .wasm component; failures
+#                         #             fall back to the builtin core
+# builtin.wasm is a bit-exact guest fixture and external package template,
+# not the daemon's default execution path. External JSON artifacts were removed.
 # shadow_policy = "/etc/ironet/policy.candidate.wasm"
 
 # WASM policy trust store and resource budget. Only consulted when policy or

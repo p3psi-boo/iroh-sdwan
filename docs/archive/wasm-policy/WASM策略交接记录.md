@@ -1,12 +1,14 @@
-# WASM 策略模块化：实施交接记录
+# WASM 策略模块化：实施交接记录（历史）
 
-记录时间：2026-08-21。对应计划：`docs/WASM策略模块化实施计划.md`（已按评审修订过一轮）。
+> **归档状态（2026-08-22）**：这是一次性实施交接。Phase 0–6 已落地，文中的工作区状态、未提交改动和“下一步”均不再代表当前仓库。当前规范见[策略运行时架构](../../策略运行时架构.md)、[配置参考](../../配置参考.md)和[开发与测试](../../开发与测试.md)。
+
+记录时间：2026-08-21。对应计划：[WASM 策略模块化实施计划](WASM策略模块化实施计划.md)（已按评审修订过一轮）。
 
 本记录写于第二波 agent 仍在运行时，"进行中"小节的内容以各文件落地后的测试结果为准。**所有改动均未 git commit**，工作区本来就有大量未提交改动（iroh-v2/noq 子 crate、V1 清理等），请勿把本次改动与其混为一次提交。
 
 ## 0. 环境备忘
 
-- **toolchain 已升级到 Rust 1.98.0**（第三波完成）：`flake.nix`（`rust-bin.stable."1.98.0"`，targets 含 `wasm32-unknown-unknown`，devShell 加 `wasm-tools`/`wit-bindgen`/`bc`/`file`）、`flake.lock`（只更新 `rust-overlay`）、`rust-toolchain.toml`、根与各 crate `rust-version = "1.98"`、`.forgejo`/`.github` CI 的 toolchain 版本、`docs/开发与测试.md`。新 clippy lint 只出现 3 处（`fec.rs`/`repair.rs`/`routing.rs` 的 `chunks_exact`→`as_chunks`），已修。`cargo check -p ironet-policy-abi --target wasm32-unknown-unknown` 通过。
+- **toolchain 已升级到 Rust 1.98.0**（第三波完成）：`flake.nix`（`rust-bin.stable."1.98.0"`，targets 含 `wasm32-unknown-unknown`，devShell 加 `wasm-tools`/`wit-bindgen`/`bc`/`file`）、`flake.lock`（只更新 `rust-overlay`）、`rust-toolchain.toml`、根与各 crate `rust-version = "1.98"`、`.forgejo`/`.github` CI 的 toolchain 版本、[开发与测试](../../开发与测试.md)。新 clippy lint 只出现 3 处（`fec.rs`/`repair.rs`/`routing.rs` 的 `chunks_exact`→`as_chunks`），已修。`cargo check -p ironet-policy-abi --target wasm32-unknown-unknown` 通过。
 - 统一用 `nix develop -c cargo ...` 运行（首次进入要从 static.rust-lang.org 下 1.98 tarball，可能很慢）。旧的 nix store 1.91/1.94 路径不再适用；若仍用它们需加 `--ignore-rust-version`。
 - **磁盘**：`/home` 与 `/nix` 同分区，曾被打满触发 ENOSPC；`target/` 约 187 GB，其中 `target/debug/deps` ~60 GB、`incremental` ~21 GB 是可再生 cargo 缓存，其余是实验数据目录（netns/profile 结果），**不要整体 `cargo clean` 以外的方式误删**。已清理 2 天以上的 incremental；当前约 22 GB 可用。
 - 汇总验证命令（全部应通过）：
@@ -46,14 +48,14 @@ python3 scripts/check-doc-links.py
 
 ### 1.4 配置层（完成，已测试）
 
-- `src/config.rs`：`autotune.policy` 接受 `native`/`builtin`/绝对路径；新增 `AutotuneWasmConfig { require_signature=true, maximum_module_bytes=8 MiB, maximum_memory_bytes=8 MiB, maximum_state_bytes=64 KiB, deadline_millis=10, state_flush_interval_secs=60, signers: Vec<AutotuneSignerConfig{signer_id, public_key: "ed25519:<hex|base32>", minimum_policy_version, expires_at}>, digest_pins: Vec<"blake3:<64hex>"> }`，挂在 `AutotuneConfig.wasm`；校验规则 10 条（见 `docs/配置参考.md` 的 `[autotune.wasm]` 小节）；`AutotuneConfig::uses_wasm_artifact()`。22 个 config 测试通过。
+- `src/config.rs`：`autotune.policy` 接受 `native`/`builtin`/绝对路径；新增 `AutotuneWasmConfig { require_signature=true, maximum_module_bytes=8 MiB, maximum_memory_bytes=8 MiB, maximum_state_bytes=64 KiB, deadline_millis=10, state_flush_interval_secs=60, signers: Vec<AutotuneSignerConfig{signer_id, public_key: "ed25519:<hex|base32>", minimum_policy_version, expires_at}>, digest_pins: Vec<"blake3:<64hex>"> }`，挂在 `AutotuneConfig.wasm`；校验规则 10 条（见 [配置参考](../../配置参考.md) 的 `[autotune.wasm]` 小节）；`AutotuneConfig::uses_wasm_artifact()`。22 个 config 测试通过。
 - seal 是对整个配置文件的 BLAKE3，`autotune.wasm` 自动纳入。
-- `config/example.toml`、`docs/配置参考.md` 已更新。
+- `config/example.toml`、[配置参考](../../配置参考.md) 已更新。
 - `src/v2_runtime.rs`：仅新增本地 `fn load_autotune_policy`（`native` 暂时加载内置 JSON artifact，`policy_source="native"`），移除了 `policy::load_or_builtin as load_autotune_policy` 的 use 别名。**已知跟进**：`tuner_loop` 约 6365 行的 5 秒热重载判断仍是 `policy != "builtin"`，`native` 会触发一次无害的 dedup warn；接线 `tuner_loop` 时改为同时排除 `native`。
 
 ### 1.5 Phase 0 runtime spike（完成）
 
-报告：`docs/WASM策略Phase0-runtime-spike.md`。spike 源码已存档进仓库 `tools/phase0-spike/`（2026-08-21，已剔除构建产物）。
+报告：[Phase 0 runtime spike](WASM策略Phase0-runtime-spike.md)。可复现源码保留在 [`tools/phase0-spike`](../../../tools/phase0-spike/README.md)；生成的构建产物、日志和原始输出已移出仓库。
 
 - 工具链：裸 shell 无 cargo；仓库 `nix develop` 有 Rust 1.91 但**无 wasm32 rust-std**。用复用仓库 flake.lock 的独立 flake（rust-overlay `targets += wasm32-unknown-unknown` + `pkgs.wasm-tools` 1.254 + `pkgs.wit-bindgen` 0.60）可用，报告给出 `flake.nix` diff 建议（未改）。网络正常。
 - wasmtime：48.0.0 需 Rust 1.95；Rust 1.91 下最新可用 **43.0.2**（实测），36.x 为 LTS。**已决策（2026-08-21，用户）**：升 toolchain ≥1.95，用 wasmtime 48 LTS。
@@ -111,7 +113,7 @@ python3 scripts/check-doc-links.py
    - **热切换**：每 5 s 对文件做整体 BLAKE3；变化则 `spawn_blocking` 后台跑完整加载管线（含自检），完成后在 1 s 采样边界 `replace_live` 原子切换；切换前 flush 脏状态；任何失败只记 error（去重 warn）保留 last-known-good；不重建 QUIC、不在 tick 路径编译。加载前记录 hash，坏文件不每 5 s 重试。
    - **8.2 迁移语义**：`PolicySlotV1::replace`/`replace_live`/`ShadowEvaluatorV2::replace_slot` 新增 `state_schema_accepts: &[u32]`——`policy_id` 相同且（schema 不变或新模块 accepts 声明接受旧 schema）时保留状态，guest 自行转换；JSON/native 调用点传 `&[]`（行为不变）。新增测试 `hot_switch_state_schema_accepts_allows_guest_side_migration`。
    - **builtin digest 固定测试**：`package.rs::tests::committed_builtin_wasm_matches_its_digest_sidecar`（`include_bytes!` + sidecar 比对 + package 解析）。
-   - 文档：`docs/配置参考.md` 的 `autotune.policy` 三层取值与热切换段落已更新为 wasm 已支持。
+   - 文档：[配置参考](../../配置参考.md) 的 `autotune.policy` 三层取值与热切换段落已更新为 wasm 已支持。
    - **8.3 shadow warmup（补齐，2026-08-21，kimi）**：候选组件加载（含自检）成功后不再直接切换，而是挂成独立 `WasmWarmupV1`（`ShadowEvaluatorV2` 包装候选 slot），每拍用 `observe()` 观察实时输入（不写出线），连续 5 拍（`WASM_WARMUP_TICKS`）无故障才在采样边界晋升 `replace_live`；任何一拍 fault 即中止、保留 LKG（文件 hash 已记录，不变不重试）。晋升时把热身 backend 原样移入 live slot（新增 `PolicySlotV1::into_backend`/`ShadowEvaluatorV2::into_slot`），热身状态丢弃，状态去留按 8.2 规则对 live 现状态判定。warmup 期间不发起新的加载。新增测试 `warmup_promotion_moves_the_backend_and_applies_live_state_rules`。启动初次加载仍自检后直接上线（无 LKG 可保护）。
    - **`ironet policy replay` 子命令（补齐，2026-08-21，kimi）**：`replay.rs::replay_ticks` 让 fixture 走生产 `PolicyTickV1`（PolicyBackend/guardrail）管线——`builtin`/`native`/JSON artifact 走 core slot，`.wasm` 走 `PolicyLoader` 验签加载（信任源：默认 sealed config 的 `[autotune.wasm]`，或 `--signer-pubkey`/`--digest-pin` 覆盖）。输出 `TickReplayReportV2`（逐样本 baseline/effective/candidate/clamps/fault/utility bits + trace_digest，全确定性，不含墙钟）；`--golden REPORT` 与先前报告逐样本比对，首个分歧样本即非零退出（deterministic assert）。`--objective/--mode/--seed/--side/--output` 齐备。测试：`tick_replay_matches_the_checked_in_golden`（builtin 逐样本复现已入库 golden 的 baseline/effective/utility bits）、确定性+时间倒流拒绝、wasm backend（echo fixture + digest pin）。CLI 已端到端人工验证：golden 匹配/分歧退出/未签名拒绝。Phase 3 至此全部完成。
 7. ~~**Phase 4**~~ **（完成，2026-08-21，kimi 直接实现）**，见第 8 项。Phase 5/6 亦已完成，见第 9/10 项。
@@ -137,7 +139,7 @@ python3 scripts/check-doc-links.py
     - **6.3 builtin 晋升 WASM**：`runtime.rs` 新增 `BUILTIN_WASM_V1`/`BUILTIN_WASM_BLAKE3_V1`（include_bytes/include_str committed 组件+sidecar）+ `PolicyLoader::load_builtin`（parse → sidecar digest 一致性校验 → digest pin 信任，强制 require_signature=false，预算取 config）；core `spec.rs` 加 `BANDIT_POLICY_ID_V1 = "bandit-vivace@1"`。`v2_runtime.rs` 的 `tuner_loop` 选择逻辑：`native`→native_rules；`builtin`→load_builtin（失败→native_rules，policy_source 降级 `native`）；`.wasm` 路径→load_wasm_live_slot（失败→builtin_or_native_slot 回退链）。utility 权重一律 `objective.weights()`（已验证与旧 artifact 权重逐字段相等，golden 不变）。legacy memory warm start 条件放宽为 `state_schema==1 && policy_id==bandit-vivace@1`——builtin.wasm 可继承旧 JSON memory。
     - **6.4 删除 JSON 双路径**：`load_autotune_policy`/`live_policy_reload_path`/JSON 5 秒 reload 块全删；`config.rs` 校验——`policy`/`shadow_policy` 绝对路径必须 `.wasm`，否则报含 "JSON" 的明确迁移错误。`shadow_policy` 支持 `.wasm`：启动同步加载 + 5 秒整文件 hash 检查 + 后台加载 + 采样边界 `set_shadow` 热切换（无 warmup，shadow 本不上线），失败保留 LKG。**shadow 热切换不保留旧 shadow 状态（fresh start，仅观测面无影响）**。
     - **6.5 replay CLI**：`policy replay` 的 `native`→native_rules slot、`builtin`→`load_builtin`、`.wasm` 不变、其他绝对路径 bail 迁移错误。端到端手工验证全过（builtin=wasm/bandit-vivace@1/faults=0；native=native-conservative@1；--golden 自比对；JSON 拒绝；digest pin 放行 echo fixture）。**行为变化**：Shadow 模式 live slot 的 `TickReplaySampleV2.candidate` 现在是反事实候选（仅观测面）。
-    - **6.6 可观测性（计划 §13）**：`PolicyBackend` trait 加默认方法 `fuel_consumed()`（WasmPolicyBackend 覆盖）；`BackendHealthV1` 加 `timeouts_total`（fault==Timeout 时计数）；`PolicySlotStatusV1`/`PeerStatus` 补齐 `module_digest`/`signer_id`/`module_generation`/`fuel_consumed`/`timeouts_total`/`quarantines_total`（live+shadow 全套，serde default 兼容旧快照）+ egress requested/assigned（来自 coordinator view 与 effective egress request）；Prometheus 新增 `ironet_v2_autotune_policy_{fuel_consumed,timeouts_total,quarantines_total,module_generation}`、`ironet_v2_peer_egress_{requested,assigned}_bytes_per_second` 和 `ironet_v2_autotune_policy_info`（label 仅 endpoint/name/backend/module_digest/signer_id，无任意 guest 字符串）；TUI peer 详情加 module/egress 两行。打包：builtin.wasm 经 include_bytes 内嵌进 musl 静态二进制，deb/CI（build-policy-guest --check + musl 构建）已覆盖，发布门禁满足。
+    - **6.6 可观测性（计划 §13）**：`PolicyBackend` trait 加默认方法 `fuel_consumed()`（WasmPolicyBackend 覆盖）；`BackendHealthV1` 加 `timeouts_total`（fault==Timeout 时计数）；`PolicySlotStatusV1` 投影到 `PeerStatus.policy.live` 与可空 `PeerStatus.policy.shadow`，统一报告 `module_digest`/`signer_id`/`module_generation`/`fuel_consumed`/`timeouts_total`/`quarantines_total`，egress requested/assigned 来自 coordinator view 与 effective egress request；Prometheus 新增 `ironet_v2_autotune_policy_{fuel_consumed,timeouts_total,quarantines_total,module_generation}`、`ironet_v2_peer_egress_{requested,assigned}_bytes_per_second` 和 `ironet_v2_autotune_policy_info`（label 仅 endpoint/name/backend/module_digest/signer_id，无任意 guest 字符串）；TUI peer 详情加 module/egress 两行。打包：builtin.wasm 经 include_bytes 内嵌进 musl 静态二进制，deb/CI（build-policy-guest --check + musl 构建）已覆盖，发布门禁满足。
     - **6.7 遗留（环境受限，非 blocked）**：`scripts/autotune-oracle.sh`/`profile-v2-netns-matrix.sh` 需要 root 建 netns（本机 UID 1000 无权限，`ip netns add` 被拒），且 `target/profiling/` 二进制是 Phase 6 之前的旧构建；native vs WASM 的完整动态矩阵、shadow 整周期观察和 RSS/火焰图基线对比留给有 root 的 CI/机器。脚本本身与新语义兼容（默认 `builtin`，绝对路径交 daemon 校验）。
     - **保留而非 shim**：`policy::load`/`load_or_builtin`/`PolicyArtifactV2`/`core_slot_from_artifact`/`PolicySlotV1::core` 仅被 examples（`autotune_train`/`autotune_replay`/`autotune_promote`）与测试引用——这是 oracle→训练→replay 的命名工具链，生产路径不再引用。
     - `policy_source` 状态字段取值现在是 `native`/`builtin`/具体 `.wasm` 路径。
