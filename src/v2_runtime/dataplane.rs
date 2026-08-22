@@ -61,6 +61,48 @@ pub(super) const TX_ADMISSION_BATCH_BYTES: usize = 128 * 1024;
 pub(super) const MAX_CLASSIFIERS: usize = 65_536;
 pub(super) const CLASSIFIER_IDLE: Duration = Duration::from_secs(60);
 
+/// Bounds the number of scheduler sends that may overtake a ready strict
+/// priority admission. `tokio::select! { biased; }` otherwise lets either
+/// always-ready future starve the other during a sustained recovery burst.
+const MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS: u8 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrioritySendTurnV2 {
+    PriorityAdmission,
+    Send,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrioritySendArbiterV2 {
+    sends_since_priority: u8,
+}
+
+impl Default for PrioritySendArbiterV2 {
+    fn default() -> Self {
+        Self {
+            sends_since_priority: MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS,
+        }
+    }
+}
+
+impl PrioritySendArbiterV2 {
+    pub(super) fn next(&self) -> PrioritySendTurnV2 {
+        if self.sends_since_priority >= MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS {
+            PrioritySendTurnV2::PriorityAdmission
+        } else {
+            PrioritySendTurnV2::Send
+        }
+    }
+
+    pub(super) fn admitted_priority(&mut self) {
+        self.sends_since_priority = 0;
+    }
+
+    pub(super) fn completed_send(&mut self) {
+        self.sends_since_priority = self.sends_since_priority.saturating_add(1);
+    }
+}
+
 /// A raw TUN record plus its byte-budget ownership. Slot-bounded channels are
 /// insufficient here because one slot may hold either a 60-byte ACK or a
 /// 65-KiB GSO record. The permit remains attached until the dispatcher
@@ -389,6 +431,7 @@ pub(super) async fn tx_loop(
     let mut applied_tuning = None::<TuneDecisionV2>;
     let mut cover_shaper = CoverShaperV2::default();
     let mut deferred_input = VecDeque::<TunIngressRecordV2>::new();
+    let mut priority_send = PrioritySendArbiterV2::default();
     loop {
         // Preserve a bounded receive burst as one aggregation opportunity.
         // The scheduler still owns hard memory admission, while the local
@@ -417,27 +460,54 @@ pub(super) async fn tx_loop(
         }
         let depth = tx.depth();
         let event = if tx.has_pending() && admission_saturated(depth, high_water) {
-            tokio::select! {
-                biased;
-                record = input.priority.recv() => Event::PriorityInput(record),
-                changed = tuning.changed() => {
-                    changed.context("V2 tuner stopped")?;
-                    Event::Tuned
+            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 tuner stopped")?;
+                        Event::Tuned
+                    }
+                    record = input.priority.recv() => Event::PriorityInput(record),
+                    sent = tx.send_next() => Event::Sent(sent),
+                    command = control.recv() => Event::Control(command),
                 }
-                sent = tx.send_next() => Event::Sent(sent),
-                command = control.recv() => Event::Control(command),
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 tuner stopped")?;
+                        Event::Tuned
+                    }
+                    sent = tx.send_next() => Event::Sent(sent),
+                    record = input.priority.recv() => Event::PriorityInput(record),
+                    command = control.recv() => Event::Control(command),
+                }
             }
         } else if tx.has_pending() || !deferred_input.is_empty() {
-            tokio::select! {
-                biased;
-                record = input.priority.recv() => Event::PriorityInput(record),
-                changed = tuning.changed() => {
-                    changed.context("V2 tuner stopped")?;
-                    Event::Tuned
+            if tx.has_pending() && priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 tuner stopped")?;
+                        Event::Tuned
+                    }
+                    record = input.priority.recv() => Event::PriorityInput(record),
+                    sent = tx.send_next() => Event::Sent(sent),
+                    record = input.regular.recv() => Event::Input(record),
+                    command = control.recv() => Event::Control(command),
                 }
-                record = input.regular.recv() => Event::Input(record),
-                sent = tx.send_next() => Event::Sent(sent),
-                command = control.recv() => Event::Control(command),
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 tuner stopped")?;
+                        Event::Tuned
+                    }
+                    sent = tx.send_next() => Event::Sent(sent),
+                    record = input.priority.recv() => Event::PriorityInput(record),
+                    record = input.regular.recv() => Event::Input(record),
+                    command = control.recv() => Event::Control(command),
+                }
             }
         } else {
             tokio::select! {
@@ -481,6 +551,7 @@ pub(super) async fn tx_loop(
             Event::Input(None) => bail!("all V2 TUN readers stopped"),
             Event::PriorityInput(None) => bail!("all V2 priority TUN readers stopped"),
             Event::PriorityInput(Some(first)) => {
+                priority_send.admitted_priority();
                 let mut batch = Vec::with_capacity(receive_batch);
                 batch.push(first);
                 while batch.len() < receive_batch {
@@ -528,6 +599,7 @@ pub(super) async fn tx_loop(
                 }
             }
             Event::Sent(result) => {
+                priority_send.completed_send();
                 if let Some(progress) = result? {
                     metrics.observe_send(progress);
                     let sent_real = progress.class.is_some();
@@ -1384,6 +1456,32 @@ mod tests {
         assert_eq!(budget.available_permits(), 0);
         drop(admitted);
         assert_eq!(budget.available_permits(), 100);
+    }
+
+    #[test]
+    fn priority_ready_race_forces_a_send_after_each_priority_admission() {
+        let mut arbiter = PrioritySendArbiterV2::default();
+        for _ in 0..8 {
+            assert_eq!(arbiter.next(), PrioritySendTurnV2::PriorityAdmission);
+            arbiter.admitted_priority();
+            assert_eq!(arbiter.next(), PrioritySendTurnV2::Send);
+            for _ in 0..MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS {
+                arbiter.completed_send();
+            }
+        }
+    }
+
+    #[test]
+    fn send_ready_race_forces_a_priority_admission_after_a_bounded_send_burst() {
+        let mut arbiter = PrioritySendArbiterV2::default();
+        arbiter.admitted_priority();
+        for _ in 0..MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS - 1 {
+            assert_eq!(arbiter.next(), PrioritySendTurnV2::Send);
+            arbiter.completed_send();
+        }
+        assert_eq!(arbiter.next(), PrioritySendTurnV2::Send);
+        arbiter.completed_send();
+        assert_eq!(arbiter.next(), PrioritySendTurnV2::PriorityAdmission);
     }
 
     #[test]

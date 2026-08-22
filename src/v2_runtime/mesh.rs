@@ -30,9 +30,10 @@ use super::{
     connection::{PeerSessionV2, establish_mesh_adjacencies},
     cpu_sampler_loop,
     dataplane::{
-        CLASSIFIER_IDLE, CoverShaperV2, MAX_CLASSIFIERS, TUN_INPUT_SLOTS, TUN_PRIORITY_INPUT_SLOTS,
-        TX_ADMISSION_BATCH_BYTES, TX_LATENCY_ADMISSION_HIGH_WATER_BYTES, TunIngressRecordV2,
-        TxControl, adaptive_repair_minimum_age, admission_saturated, apply_receive_buffer_target,
+        CLASSIFIER_IDLE, CoverShaperV2, MAX_CLASSIFIERS, PrioritySendArbiterV2, PrioritySendTurnV2,
+        TUN_INPUT_SLOTS, TUN_PRIORITY_INPUT_SLOTS, TX_ADMISSION_BATCH_BYTES,
+        TX_LATENCY_ADMISSION_HIGH_WATER_BYTES, TunIngressRecordV2, TxControl,
+        adaptive_repair_minimum_age, admission_saturated, apply_receive_buffer_target,
         drain_tun_ingress_batch, effective_tx_tuning, flow_id, minimum_receive_buffer_bytes,
         prioritized_tun_reader, route_loop, tx_admission_high_water, unix_secs, write_reassembled,
     },
@@ -610,130 +611,172 @@ async fn mesh_tx_loop(
     )?;
     let mut applied_tuning = None::<TuneDecisionV2>;
     let mut cover_shaper = CoverShaperV2::default();
+    let mut priority_send = PrioritySendArbiterV2::default();
     loop {
         enum Event {
-            Command(Option<MeshTxCommandV2>),
+            Command {
+                command: Option<MeshTxCommandV2>,
+                priority_admission: bool,
+            },
             Tuned,
             Sent(Result<Option<crate::protocol::v2::dataplane::SendProgress>>),
         }
-        let event =
-            if tx.has_pending() && admission_saturated(tx.depth(), tx_admission_high_water(&tx)) {
+        let event = if tx.has_pending()
+            && admission_saturated(tx.depth(), tx_admission_high_water(&tx))
+        {
+            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
                 tokio::select! {
                     biased;
-                    command = priority_commands.recv() => Event::Command(command),
                     changed = tuning.changed() => {
                         changed.context("V2 mesh tuner stopped")?;
                         Event::Tuned
                     }
-                    sent = tx.send_next() => Event::Sent(sent),
-                }
-            } else if tx.has_pending() {
-                tokio::select! {
-                    biased;
-                    command = priority_commands.recv() => Event::Command(command),
-                    changed = tuning.changed() => {
-                        changed.context("V2 mesh tuner stopped")?;
-                        Event::Tuned
-                    }
-                    command = commands.recv() => Event::Command(command),
+                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
                     sent = tx.send_next() => Event::Sent(sent),
                 }
             } else {
                 tokio::select! {
                     biased;
-                    command = priority_commands.recv() => Event::Command(command),
                     changed = tuning.changed() => {
                         changed.context("V2 mesh tuner stopped")?;
                         Event::Tuned
                     }
-                    command = commands.recv() => Event::Command(command),
-                }
-            };
-        match event {
-            Event::Command(None) => bail!("V2 mesh adjacency command channel stopped"),
-            Event::Command(Some(MeshTxCommandV2::Records {
-                flow_id,
-                class,
-                priority,
-                route,
-                overlay_hop_limit,
-                records,
-                trace_probe,
-                ingress_permits: _ingress_permits,
-            })) => {
-                let admitted = tx.enqueue_routed_records_auto_with_priority(
-                    flow_id,
-                    class,
-                    route,
-                    overlay_hop_limit,
-                    records,
-                    priority,
-                )?;
-                ensure!(!admitted.is_empty(), "V2 mesh rejected PacketTrain");
-                if let Some(trace_probe) = trace_probe {
-                    // A normal trace hop is one 1 KiB record and one train. If
-                    // a crafted/GSO group spans trains, correlate every train;
-                    // the first authenticated OAM response retires the group.
-                    for train_id in admitted {
-                        runtime_state.register_trace_train(route, train_id, trace_probe);
-                    }
+                    sent = tx.send_next() => Event::Sent(sent),
+                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
                 }
             }
-            Event::Command(Some(MeshTxCommandV2::Forward { flow_id, cells })) => {
-                match tx.admit_forwarded_cells(flow_id, cells)? {
-                    ForwardAdmissionV2::Admitted => {}
-                    ForwardAdmissionV2::QueueFull => {
-                        warn!(
-                            adjacency = adjacency.id.0,
-                            "dropped V2 transit batch at queue limit"
+        } else if tx.has_pending() {
+            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 mesh tuner stopped")?;
+                        Event::Tuned
+                    }
+                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
+                    sent = tx.send_next() => Event::Sent(sent),
+                    command = commands.recv() => Event::Command { command, priority_admission: false },
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = tuning.changed() => {
+                        changed.context("V2 mesh tuner stopped")?;
+                        Event::Tuned
+                    }
+                    sent = tx.send_next() => Event::Sent(sent),
+                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
+                    command = commands.recv() => Event::Command { command, priority_admission: false },
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                command = priority_commands.recv() => Event::Command { command, priority_admission: true },
+                changed = tuning.changed() => {
+                    changed.context("V2 mesh tuner stopped")?;
+                    Event::Tuned
+                }
+                command = commands.recv() => Event::Command { command, priority_admission: false },
+            }
+        };
+        match event {
+            Event::Command { command: None, .. } => {
+                bail!("V2 mesh adjacency command channel stopped")
+            }
+            Event::Command {
+                command: Some(command),
+                priority_admission,
+            } => {
+                if priority_admission {
+                    priority_send.admitted_priority();
+                }
+                match command {
+                    MeshTxCommandV2::Records {
+                        flow_id,
+                        class,
+                        priority,
+                        route,
+                        overlay_hop_limit,
+                        records,
+                        trace_probe,
+                        ingress_permits: _ingress_permits,
+                    } => {
+                        let admitted = tx.enqueue_routed_records_auto_with_priority(
+                            flow_id,
+                            class,
+                            route,
+                            overlay_hop_limit,
+                            records,
+                            priority,
+                        )?;
+                        ensure!(!admitted.is_empty(), "V2 mesh rejected PacketTrain");
+                        if let Some(trace_probe) = trace_probe {
+                            // A normal trace hop is one 1 KiB record and one train. If
+                            // a crafted/GSO group spans trains, correlate every train;
+                            // the first authenticated OAM response retires the group.
+                            for train_id in admitted {
+                                runtime_state.register_trace_train(route, train_id, trace_probe);
+                            }
+                        }
+                    }
+                    MeshTxCommandV2::Forward { flow_id, cells } => {
+                        match tx.admit_forwarded_cells(flow_id, cells)? {
+                            ForwardAdmissionV2::Admitted => {}
+                            ForwardAdmissionV2::QueueFull => {
+                                warn!(
+                                    adjacency = adjacency.id.0,
+                                    "dropped V2 transit batch at queue limit"
+                                );
+                            }
+                            ForwardAdmissionV2::PathMtuExceeded {
+                                header,
+                                observed_datagram_size,
+                                maximum_datagram_size,
+                            } => {
+                                let observed_datagram_size = u16::try_from(observed_datagram_size)
+                                    .context("V2 forwarded Cell exceeds wire range")?;
+                                let maximum_datagram_size = u16::try_from(maximum_datagram_size)
+                                    .context("V2 live adjacency PMTU exceeds wire range")?;
+                                let incoming = header_incoming_adjacency(
+                                    header.route_label,
+                                    header.session_epoch,
+                                    adjacency.id,
+                                    &snapshots,
+                                )?;
+                                path_mtu_events
+                                    .send(MeshPathMtuEventV2 {
+                                        incoming,
+                                        oam: OamPathMtuExceededV2 {
+                                            snapshot_generation: snapshots.load().generation(),
+                                            route_epoch: header.session_epoch,
+                                            route_label: RouteLabelV2::new(header.route_label)?,
+                                            train_id: header.train_id,
+                                            cell_sequence: header.cell_sequence,
+                                            observed_datagram_size,
+                                            maximum_datagram_size,
+                                            incoming,
+                                            reporter: *local_id.as_bytes(),
+                                        },
+                                    })
+                                    .await
+                                    .context("V2 mesh path-MTU event manager stopped")?;
+                            }
+                        }
+                    }
+                    MeshTxCommandV2::Control(TxControl::Send(record)) => {
+                        metrics.observe_control_tx(&record);
+                        ensure!(tx.enqueue_control(record)?, "V2 mesh control queue is full");
+                    }
+                    MeshTxCommandV2::Control(TxControl::Respond(request)) => {
+                        let response = tx.repair_response(&request).encode()?;
+                        metrics.observe_control_tx(&response);
+                        ensure!(
+                            tx.enqueue_control(response)?,
+                            "V2 mesh control queue is full"
                         );
                     }
-                    ForwardAdmissionV2::PathMtuExceeded {
-                        header,
-                        observed_datagram_size,
-                        maximum_datagram_size,
-                    } => {
-                        let observed_datagram_size = u16::try_from(observed_datagram_size)
-                            .context("V2 forwarded Cell exceeds wire range")?;
-                        let maximum_datagram_size = u16::try_from(maximum_datagram_size)
-                            .context("V2 live adjacency PMTU exceeds wire range")?;
-                        let incoming = header_incoming_adjacency(
-                            header.route_label,
-                            header.session_epoch,
-                            adjacency.id,
-                            &snapshots,
-                        )?;
-                        path_mtu_events
-                            .send(MeshPathMtuEventV2 {
-                                incoming,
-                                oam: OamPathMtuExceededV2 {
-                                    snapshot_generation: snapshots.load().generation(),
-                                    route_epoch: header.session_epoch,
-                                    route_label: RouteLabelV2::new(header.route_label)?,
-                                    train_id: header.train_id,
-                                    cell_sequence: header.cell_sequence,
-                                    observed_datagram_size,
-                                    maximum_datagram_size,
-                                    incoming,
-                                    reporter: *local_id.as_bytes(),
-                                },
-                            })
-                            .await
-                            .context("V2 mesh path-MTU event manager stopped")?;
-                    }
                 }
-            }
-            Event::Command(Some(MeshTxCommandV2::Control(TxControl::Send(record)))) => {
-                metrics.observe_control_tx(&record);
-                ensure!(tx.enqueue_control(record)?, "V2 mesh control queue is full");
-            }
-            Event::Command(Some(MeshTxCommandV2::Control(TxControl::Respond(request)))) => {
-                let response = tx.repair_response(&request).encode()?;
-                metrics.observe_control_tx(&response);
-                ensure!(
-                    tx.enqueue_control(response)?,
-                    "V2 mesh control queue is full"
-                );
             }
             Event::Tuned => {
                 if let Some(decision) = *tuning.borrow_and_update()
@@ -764,6 +807,7 @@ async fn mesh_tx_loop(
                 }
             }
             Event::Sent(result) => {
+                priority_send.completed_send();
                 if let Some(progress) = result? {
                     metrics.observe_send(progress);
                     let sent_real = progress.class.is_some();
